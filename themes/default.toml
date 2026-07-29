@@ -1,0 +1,282 @@
+version = 1
+
+[palette]
+text = "#cdd6f4"
+path = "#89b4fa"
+muted = "#7f849c"
+git = "#cba6f7"
+accent = "#f9e2af"
+success = "#a6e3a1"
+warning = "#fab387"
+error = "#f38ba8"
+
+[input]
+autosuggestion = { foreground = "muted" }
+completion = { foreground = "accent" }
+
+[input.syntax]
+alias = { foreground = "success" }
+arg0 = { foreground = "success" }
+arithmetic-expansion = { foreground = "accent" }
+autodirectory = { foreground = "path", underline = true }
+back-dollar-quoted-argument = { foreground = "accent" }
+back-double-quoted-argument = { foreground = "accent" }
+back-quoted-argument = { foreground = "warning" }
+back-quoted-argument-delimiter = { foreground = "accent" }
+back-quoted-argument-unclosed = { foreground = "error" }
+bracket-error = { foreground = "error", bold = true }
+bracket-level-1 = { foreground = "path", bold = true }
+bracket-level-2 = { foreground = "success", bold = true }
+bracket-level-3 = { foreground = "git", bold = true }
+bracket-level-4 = { foreground = "warning", bold = true }
+bracket-level-5 = { foreground = "accent", bold = true }
+builtin = { foreground = "success" }
+command = { foreground = "success" }
+command-substitution = { foreground = "text" }
+command-substitution-delimiter = { foreground = "accent" }
+command-substitution-delimiter-quoted = { foreground = "accent" }
+command-substitution-delimiter-unquoted = { foreground = "accent" }
+command-substitution-quoted = { foreground = "text" }
+command-substitution-unquoted = { foreground = "text" }
+commandseparator = { foreground = "accent" }
+comment = { foreground = "muted" }
+cursor = { standout = true }
+cursor-matchingbracket = { standout = true }
+default = { foreground = "text" }
+dollar-double-quoted-argument = { foreground = "accent" }
+dollar-quoted-argument = { foreground = "warning" }
+dollar-quoted-argument-unclosed = { foreground = "error" }
+double-hyphen-option = { foreground = "text" }
+double-quoted-argument = { foreground = "warning" }
+double-quoted-argument-unclosed = { foreground = "error" }
+function = { foreground = "success" }
+global-alias = { foreground = "accent" }
+globbing = { foreground = "git" }
+hashed-command = { foreground = "success" }
+history-expansion = { foreground = "accent" }
+line = "none"
+named-fd = { foreground = "warning" }
+numeric-fd = { foreground = "warning" }
+path = { foreground = "path", underline = true }
+path_pathseparator = { foreground = "path" }
+path_prefix = { foreground = "path", underline = true }
+path_prefix_pathseparator = { foreground = "path" }
+precommand = { foreground = "accent", underline = true }
+process-substitution = { foreground = "text" }
+process-substitution-delimiter = { foreground = "accent" }
+rc-quote = { foreground = "accent" }
+redirection = { foreground = "warning" }
+reserved-word = { foreground = "accent", bold = true }
+root = { foreground = "error", bold = true }
+single-hyphen-option = { foreground = "text" }
+single-quoted-argument = { foreground = "warning" }
+single-quoted-argument-unclosed = { foreground = "error" }
+suffix-alias = { foreground = "success", underline = true }
+unknown-token = { foreground = "error", bold = true }
+
+[layout]
+lines = [
+    [
+        "directory",
+        "git",
+        "python",
+        "perl",
+        "java",
+        "kotlin",
+        "scala",
+        "rust",
+        "go",
+        "bun",
+        "deno",
+        "node",
+        "ruby",
+        "php",
+        "dotnet",
+        "c",
+        "cpp",
+        "swift",
+        "lua",
+    ],
+    ["character"],
+]
+right = []
+separator = " "
+blank_line_before = true
+
+[segments.directory]
+home_symbol = "~"
+truncation_symbol = "…"
+style = { foreground = "path", bold = true }
+
+[segments.directory.width]
+percent = 45
+minimum = 24
+maximum = 72
+
+[segments.git]
+prefix = "on "
+symbol = " "
+action_prefix = " "
+changes_prefix = " "
+style = { foreground = "muted" }
+action_style = { foreground = "accent" }
+
+[segments.git.symbols]
+conflicted = "="
+staged = "+"
+modified = "!"
+deleted = "✘"
+untracked = "?"
+ahead = "⇡"
+behind = "⇣"
+diverged = "⇕"
+stash = "$"
+
+[segments.git.styles]
+conflicted = { foreground = "error", bold = true }
+staged = { foreground = "success", bold = true }
+modified = { foreground = "warning", bold = true }
+deleted = { foreground = "error", bold = true }
+untracked = { foreground = "git", bold = true }
+ahead = { foreground = "success" }
+behind = { foreground = "git" }
+diverged = { foreground = "git" }
+stash = { foreground = "accent" }
+
+[segments.character]
+success = "❯"
+error = "❯"
+suffix = " "
+success_style = { foreground = "git" }
+error_style = { foreground = "error" }
+
+[segments.status]
+show_success = false
+success_symbol = "0"
+style = { foreground = "error" }
+success_style = { foreground = "success" }
+
+[segments.python]
+prefix = "via "
+symbol = " "
+version_prefix = "v"
+style = { foreground = "accent" }
+
+[segments.python.environment]
+prefix = " ("
+suffix = ")"
+style = { foreground = "muted" }
+
+[segments.perl]
+prefix = "via "
+symbol = " "
+version_prefix = "v"
+style = { foreground = "accent" }
+
+[segments.perl.environment]
+prefix = " ("
+suffix = ")"
+style = { foreground = "muted" }
+
+[segments.java]
+prefix = "via "
+symbol = " "
+version_prefix = "v"
+style = { foreground = "accent" }
+
+[segments.kotlin]
+prefix = "via "
+symbol = " "
+version_prefix = "v"
+style = { foreground = "accent" }
+
+[segments.scala]
+prefix = "via "
+symbol = " "
+version_prefix = "v"
+style = { foreground = "accent" }
+
+[segments.scala.environment]
+prefix = " ("
+suffix = ")"
+style = { foreground = "muted" }
+
+[segments.rust]
+prefix = "via "
+symbol = " "
+version_prefix = "v"
+style = { foreground = "accent" }
+
+[segments.rust.environment]
+prefix = " ("
+suffix = ")"
+style = { foreground = "muted" }
+
+[segments.go]
+prefix = "via "
+symbol = " "
+version_prefix = "v"
+style = { foreground = "accent" }
+
+[segments.bun]
+prefix = "via "
+symbol = " "
+version_prefix = "v"
+style = { foreground = "accent" }
+
+[segments.deno]
+prefix = "via "
+symbol = " "
+version_prefix = "v"
+style = { foreground = "accent" }
+
+[segments.node]
+prefix = "via "
+symbol = " "
+version_prefix = "v"
+style = { foreground = "accent" }
+
+[segments.ruby]
+prefix = "via "
+symbol = " "
+version_prefix = "v"
+style = { foreground = "accent" }
+
+[segments.ruby.environment]
+prefix = " ("
+suffix = ")"
+style = { foreground = "muted" }
+
+[segments.php]
+prefix = "via "
+symbol = " "
+version_prefix = "v"
+style = { foreground = "accent" }
+
+[segments.dotnet]
+prefix = "via "
+symbol = "󰪮 "
+version_prefix = "v"
+style = { foreground = "accent" }
+
+[segments.c]
+prefix = "via "
+symbol = " "
+style = { foreground = "accent" }
+
+[segments.cpp]
+prefix = "via "
+symbol = " "
+style = { foreground = "accent" }
+
+[segments.swift]
+prefix = "via "
+symbol = " "
+version_prefix = "v"
+style = { foreground = "accent" }
+
+[segments.lua]
+prefix = "via "
+symbol = " "
+version_prefix = "v"
+style = { foreground = "accent" }

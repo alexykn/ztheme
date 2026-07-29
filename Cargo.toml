@@ -1,0 +1,20 @@
+[package]
+name = "ztheme"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.97"
+description = "Fast asynchronous Zsh prompt"
+license = "MIT"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+shell-words = "1.1"
+tokio = { version = "1", features = ["io-util", "macros", "net", "process", "rt", "sync", "time"] }
+toml = "0.9"
+
+[profile.release]
+codegen-units = 1
+lto = "thin"
+opt-level = 3
+panic = "abort"
+strip = "symbols"
