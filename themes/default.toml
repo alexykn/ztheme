@@ -17,25 +17,25 @@ completion = { foreground = "accent" }
 [input.syntax]
 alias = { foreground = "success" }
 arg0 = { foreground = "success" }
-arithmetic-expansion = { foreground = "accent" }
+arithmetic-expansion = { foreground = "text" }
 autodirectory = { foreground = "path", underline = true }
-back-dollar-quoted-argument = { foreground = "accent" }
-back-double-quoted-argument = { foreground = "accent" }
-back-quoted-argument = { foreground = "warning" }
-back-quoted-argument-delimiter = { foreground = "accent" }
+back-dollar-quoted-argument = { foreground = "muted" }
+back-double-quoted-argument = { foreground = "muted" }
+back-quoted-argument = { foreground = "text" }
+back-quoted-argument-delimiter = { foreground = "muted" }
 back-quoted-argument-unclosed = { foreground = "error" }
 bracket-error = { foreground = "error", bold = true }
-bracket-level-1 = { foreground = "path", bold = true }
-bracket-level-2 = { foreground = "success", bold = true }
-bracket-level-3 = { foreground = "git", bold = true }
-bracket-level-4 = { foreground = "warning", bold = true }
-bracket-level-5 = { foreground = "accent", bold = true }
+bracket-level-1 = { foreground = "path" }
+bracket-level-2 = { foreground = "success" }
+bracket-level-3 = { foreground = "git" }
+bracket-level-4 = { foreground = "warning" }
+bracket-level-5 = { foreground = "accent" }
 builtin = { foreground = "success" }
 command = { foreground = "success" }
 command-substitution = { foreground = "text" }
-command-substitution-delimiter = { foreground = "accent" }
-command-substitution-delimiter-quoted = { foreground = "accent" }
-command-substitution-delimiter-unquoted = { foreground = "accent" }
+command-substitution-delimiter = { foreground = "muted" }
+command-substitution-delimiter-quoted = { foreground = "muted" }
+command-substitution-delimiter-unquoted = { foreground = "muted" }
 command-substitution-quoted = { foreground = "text" }
 command-substitution-unquoted = { foreground = "text" }
 commandseparator = { foreground = "accent" }
@@ -44,34 +44,34 @@ cursor = { standout = true }
 cursor-matchingbracket = { standout = true }
 default = { foreground = "text" }
 dollar-double-quoted-argument = { foreground = "accent" }
-dollar-quoted-argument = { foreground = "warning" }
+dollar-quoted-argument = { foreground = "accent" }
 dollar-quoted-argument-unclosed = { foreground = "error" }
 double-hyphen-option = { foreground = "text" }
-double-quoted-argument = { foreground = "warning" }
+double-quoted-argument = { foreground = "accent" }
 double-quoted-argument-unclosed = { foreground = "error" }
 function = { foreground = "success" }
-global-alias = { foreground = "accent" }
-globbing = { foreground = "git" }
+global-alias = { foreground = "success" }
+globbing = { foreground = "accent" }
 hashed-command = { foreground = "success" }
 history-expansion = { foreground = "accent" }
 line = "none"
-named-fd = { foreground = "warning" }
-numeric-fd = { foreground = "warning" }
+named-fd = { foreground = "text" }
+numeric-fd = { foreground = "text" }
 path = { foreground = "path", underline = true }
-path_pathseparator = { foreground = "path" }
+path_pathseparator = { foreground = "muted", underline = true }
 path_prefix = { foreground = "path", underline = true }
-path_prefix_pathseparator = { foreground = "path" }
-precommand = { foreground = "accent", underline = true }
+path_prefix_pathseparator = { foreground = "muted", underline = true }
+precommand = { foreground = "accent" }
 process-substitution = { foreground = "text" }
-process-substitution-delimiter = { foreground = "accent" }
+process-substitution-delimiter = { foreground = "muted" }
 rc-quote = { foreground = "accent" }
-redirection = { foreground = "warning" }
-reserved-word = { foreground = "accent", bold = true }
+redirection = { foreground = "accent" }
+reserved-word = { foreground = "accent" }
 root = { foreground = "error", bold = true }
 single-hyphen-option = { foreground = "text" }
-single-quoted-argument = { foreground = "warning" }
+single-quoted-argument = { foreground = "accent" }
 single-quoted-argument-unclosed = { foreground = "error" }
-suffix-alias = { foreground = "success", underline = true }
+suffix-alias = { foreground = "success" }
 unknown-token = { foreground = "error", bold = true }
 
 [layout]
