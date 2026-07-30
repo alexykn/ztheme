@@ -386,6 +386,7 @@ _ztheme_focus_in() {
 
     builtin printf '\e[?25h'
     _ztheme_format_directory
+    (( ZTHEME_ASYNC_FD < 0 )) || return
     _ztheme_render_layout
     builtin zle reset-prompt
 }
