@@ -293,10 +293,11 @@ fn theme_management_lists_and_atomically_persists_valid_themes() {
     let listed = sandbox.command().args(["theme", "list"]).output().unwrap();
     assert_success(&listed);
     let listing = String::from_utf8(listed.stdout).unwrap();
-    let default = listing.find("\n○ default").unwrap();
-    let amber = listing.find("\n● amber  active").unwrap();
-    assert!(default < amber);
-    assert!(listing[amber..].contains("active"));
+    let catppuccin = listing
+        .find("\n○ catppuccin-mocha (default) - builtin")
+        .unwrap();
+    let amber = listing.find("\n● amber").unwrap();
+    assert!(catppuccin < amber);
     for section in ["palette", "layout", "symbols", "example"] {
         assert!(listing.contains(section));
     }

@@ -4,20 +4,18 @@ use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use crate::install::{
+use super::install::{
     InstallLock, TemporaryDirectory, data_root, download, require_command, run, verify_sha256,
 };
 
-const COMPONENT: &str = "zsh-autosuggestions";
-const VERSION: &str = "0.7.1";
-const UPSTREAM_VERSION: &str = "v0.7.1";
-const REVISION: &str = "e52ee8ca55bcc56a17c828767a3f98f22a68d4eb";
-const SHA256: &str = "166fad9326c99904fd3b16b5d770efb4f5df39a674599e72bba8fc41636ab065";
+const COMPONENT: &str = "zsh-syntax-highlighting";
+const VERSION: &str = "0.8.0";
+const REVISION: &str = "db085e4661f6aafd24e5acb5b2e17e4dd5dddf3e";
+const SHA256: &str = "874999413d147b7ad6776077e1b756d31d68284f9ef2ef240b33a4c842f0e1d8";
 const MAX_ARCHIVE_BYTES: u64 = 4 * 1024 * 1024;
-const REVISION_FILE: &str = ".ztheme-revision";
 
 pub fn managed_script() -> PathBuf {
-    managed_root().join("zsh-autosuggestions.zsh")
+    managed_root().join("zsh-syntax-highlighting.zsh")
 }
 
 pub fn ensure_installed(assume_yes: bool) -> io::Result<bool> {
@@ -31,7 +29,7 @@ pub fn ensure_installed(assume_yes: bool) -> io::Result<bool> {
 
     let parent = target
         .parent()
-        .ok_or_else(|| io::Error::other("autosuggestions destination has no parent"))?;
+        .ok_or_else(|| io::Error::other("syntax highlighter destination has no parent"))?;
     fs::create_dir_all(parent)?;
     fs::set_permissions(parent, fs::Permissions::from_mode(0o700))?;
 
@@ -50,7 +48,9 @@ pub fn ensure_installed(assume_yes: bool) -> io::Result<bool> {
 }
 
 fn managed_root() -> PathBuf {
-    data_root().join("ztheme/zsh-autosuggestions").join(VERSION)
+    data_root()
+        .join("ztheme/zsh-syntax-highlighting")
+        .join(VERSION)
 }
 
 fn confirm_install() -> io::Result<bool> {
@@ -59,8 +59,8 @@ fn confirm_install() -> io::Result<bool> {
     };
     write!(
         tty,
-        "ztheme can provide asynchronous command suggestions with \
-         zsh-autosuggestions {VERSION}.\n\
+        "ztheme can provide themed command-line syntax highlighting with \
+         zsh-syntax-highlighting {VERSION}.\n\
          Install the pinned managed copy now? [y/N] "
     )?;
     tty.flush()?;
@@ -73,10 +73,11 @@ fn install(target: &Path) -> io::Result<()> {
     require_command("tar", COMPONENT)?;
     let parent = target
         .parent()
-        .ok_or_else(|| io::Error::other("autosuggestions destination has no parent"))?;
+        .ok_or_else(|| io::Error::other("syntax highlighter destination has no parent"))?;
     let temporary = TemporaryDirectory::create(parent, COMPONENT)?;
     let archive = temporary.path().join("source.tar.gz");
-    let url = format!("https://github.com/zsh-users/zsh-autosuggestions/archive/{REVISION}.tar.gz");
+    let url =
+        format!("https://github.com/zsh-users/zsh-syntax-highlighting/archive/{REVISION}.tar.gz");
 
     download(&url, &archive, MAX_ARCHIVE_BYTES, COMPONENT)?;
     verify_sha256(&archive, SHA256, COMPONENT)?;
@@ -86,33 +87,29 @@ fn install(target: &Path) -> io::Result<()> {
             .arg(&archive)
             .arg("-C")
             .arg(temporary.path()),
-        "extract zsh-autosuggestions",
+        "extract zsh-syntax-highlighting",
     )?;
 
     let extracted = temporary
         .path()
-        .join(format!("zsh-autosuggestions-{REVISION}"));
-    if !archive_complete(&extracted) {
+        .join(format!("zsh-syntax-highlighting-{REVISION}"));
+    if !installed(&extracted) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            "downloaded zsh-autosuggestions archive is incomplete",
+            "downloaded zsh-syntax-highlighting archive is incomplete",
         ));
     }
-    fs::write(extracted.join(REVISION_FILE), format!("{REVISION}\n"))?;
     remove_existing(target)?;
     fs::rename(extracted, target)
 }
 
 fn installed(root: &Path) -> bool {
-    archive_complete(root) && has_contents(&root.join(REVISION_FILE), REVISION)
-}
-
-fn archive_complete(root: &Path) -> bool {
     is_directory(root)
-        && is_file(&root.join("zsh-autosuggestions.zsh"))
-        && is_file(&root.join("src/start.zsh"))
-        && is_file(&root.join("LICENSE"))
-        && has_contents(&root.join("VERSION"), UPSTREAM_VERSION)
+        && is_file(&root.join("zsh-syntax-highlighting.zsh"))
+        && is_file(&root.join("highlighters/main/main-highlighter.zsh"))
+        && is_file(&root.join("COPYING.md"))
+        && has_contents(&root.join(".version"), VERSION)
+        && has_contents(&root.join(".revision-hash"), REVISION)
 }
 
 fn is_directory(path: &Path) -> bool {

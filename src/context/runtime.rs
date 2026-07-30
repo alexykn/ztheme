@@ -10,8 +10,8 @@ use tokio::process::Command;
 use tokio::task::JoinSet;
 use tokio::time::timeout;
 
+use super::project::{Project, Runtime};
 use crate::cache::CacheKey;
-use crate::projects::{Project, Runtime};
 
 const COMMAND_TIMEOUT: Duration = Duration::from_millis(250);
 const OUTPUT_LIMIT: u64 = 4_097;
@@ -432,7 +432,7 @@ fn invalid_data(message: &'static str) -> io::Error {
 #[cfg(test)]
 mod tests {
     use super::{RuntimeValue, decode, encode, parse_version};
-    use crate::projects::Runtime;
+    use crate::context::Runtime;
 
     #[test]
     fn parses_supported_runtime_versions() {

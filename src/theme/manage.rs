@@ -6,11 +6,12 @@ use std::io::{self, IsTerminal, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::{self, Command};
 
-use crate::projects::Runtime;
+use crate::context::Runtime;
 
 use super::{
-    CompiledTheme, Config, SegmentId, Style, Theme, config_root, configured_theme, invalid,
-    resolve_color, theme_path, valid_identifier,
+    BUNDLED_THEMES, CompiledTheme, Config, DEFAULT_THEME_SELECTOR, SegmentId, Style, Theme,
+    bundled_theme, config_root, configured_theme, invalid, resolve_color, theme_path,
+    valid_identifier,
 };
 
 const PALETTE_ROLES: [&str; 7] = [
@@ -21,12 +22,15 @@ pub fn list() -> io::Result<String> {
     let root = config_root().ok_or_else(|| invalid("cannot determine config directory"))?;
     let directory = root.join("ztheme/themes");
     let (active, config_error) = match configured_theme() {
-        Ok(selector) => (Some(selector.unwrap_or_else(|| "default".to_owned())), None),
+        Ok(selector) => (
+            Some(selector.unwrap_or_else(|| DEFAULT_THEME_SELECTOR.to_owned())),
+            None,
+        ),
         Err(error) => (None, Some(error)),
     };
     let (mut selectors, ignored) = discover(&directory)?;
     if let Some(active) = active.as_ref()
-        && active != "default"
+        && bundled_theme(active).is_none()
         && !selectors.contains(active)
     {
         selectors.insert(active.clone());
@@ -38,7 +42,9 @@ pub fn list() -> io::Result<String> {
         let right_active = active.as_ref() == Some(right);
         right_active.cmp(&left_active).then_with(|| left.cmp(right))
     });
-    selectors.insert(0, "default".to_owned());
+    for theme in BUNDLED_THEMES.iter().rev() {
+        selectors.insert(0, theme.selector.to_owned());
+    }
 
     let color = use_color();
     let mut output = format!("Themes  {}\n", directory.display());
@@ -84,8 +90,10 @@ pub fn list() -> io::Result<String> {
 }
 
 pub fn edit(selector: &str) -> io::Result<String> {
-    if selector == "default" {
-        return Err(invalid("embedded theme `default` cannot be edited"));
+    if bundled_theme(selector).is_some() {
+        return Err(invalid(format!(
+            "bundled theme `{selector}` cannot be edited"
+        )));
     }
     let path = theme_path(selector)?;
     if !path.is_file() {
@@ -176,7 +184,10 @@ fn discover(directory: &Path) -> io::Result<(BTreeSet<String>, Vec<String>)> {
             ignored.push(entry.file_name().to_string_lossy().into_owned());
             continue;
         };
-        if name == "default" || !valid_identifier(name) {
+        if bundled_theme(name).is_some() {
+            continue;
+        }
+        if !valid_identifier(name) {
             ignored.push(entry.file_name().to_string_lossy().into_owned());
             continue;
         }
@@ -260,14 +271,22 @@ fn render_entry(
     color: bool,
 ) -> io::Result<()> {
     let marker = if active { '●' } else { '○' };
-    let qualifier = match (selector == "default", active) {
-        (true, true) => "  embedded · active",
-        (true, false) => "  embedded",
-        (false, true) => "  active",
-        (false, false) => "",
+    let qualifier = if bundled_theme(selector).is_some() {
+        " - builtin"
+    } else {
+        ""
     };
-    writeln!(output, "{marker} {}{qualifier}", safe_text(selector))
+    if selector == DEFAULT_THEME_SELECTOR {
+        writeln!(
+            output,
+            "{marker} {} (default){qualifier}",
+            safe_text(selector)
+        )
         .expect("writing to a String cannot fail");
+    } else {
+        writeln!(output, "{marker} {}{qualifier}", safe_text(selector))
+            .expect("writing to a String cannot fail");
+    }
     render_palette(output, &compiled.theme, color)?;
     render_layout(output, &compiled.layout);
     render_symbols(output, &compiled.theme);

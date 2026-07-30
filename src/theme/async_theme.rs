@@ -2,10 +2,9 @@ use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::io;
 
+use crate::context::{Runtime, RuntimeValue};
 use crate::gitstatus::{CONFLICTED, DELETED, STAGED, Snapshot, UNSTAGED, UNTRACKED};
-use crate::projects::Runtime;
-use crate::protocol::prompt_text;
-use crate::runtimes::RuntimeValue;
+use crate::prompt::prompt_text;
 
 use super::{RuntimeTheme, STYLE_RESET, SegmentId, Theme, invalid, prompt_literal, style_open};
 
@@ -472,13 +471,12 @@ mod tests {
     use std::path::PathBuf;
 
     use super::{AsyncTheme, compile};
+    use crate::context::{Runtime, RuntimeValue};
     use crate::gitstatus::{CONFLICTED, DELETED, STAGED, Snapshot, UNSTAGED, UNTRACKED};
-    use crate::projects::Runtime;
-    use crate::runtimes::RuntimeValue;
-    use crate::theme::{DEFAULT_THEME, SegmentId, Theme, parse_versioned, validate};
+    use crate::theme::{CATPPUCCIN_MOCHA_THEME, SegmentId, Theme, parse_versioned, validate};
 
     fn theme() -> Theme {
-        parse_versioned(DEFAULT_THEME, "default")
+        parse_versioned(CATPPUCCIN_MOCHA_THEME, "Catppuccin Mocha")
             .unwrap()
             .try_into()
             .unwrap()

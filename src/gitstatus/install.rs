@@ -5,7 +5,7 @@ use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-use crate::install::{
+use crate::setup::install::{
     InstallLock, TemporaryDirectory, data_root, download, require_command, run, verify_sha256,
 };
 
