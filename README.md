@@ -44,9 +44,10 @@ eval "$(ztheme init zsh)"
 ### Release archive
 
 Tagged releases provide native archives for Apple Silicon, Intel macOS, and
-Linux x86_64. Download the archive matching your platform from
+x86_64 or arm64 Linux. Download the archive matching your platform from
 [Releases](https://github.com/alexykn/ztheme/releases), verify it against
-`SHA256SUMS`, place `ztheme` in a directory on `PATH`, then run `ztheme setup`.
+`SHA256SUMS`, and extract it. Each archive contains `ztheme`, `LICENSE`, and
+`README.md`. Place `ztheme` in a directory on `PATH`, then run `ztheme setup`.
 
 `ztheme setup` downloads checksum-verified copies of gitstatusd and, when
 selected, zsh-syntax-highlighting and zsh-autosuggestions. Normal prompt use

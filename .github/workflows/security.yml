@@ -17,6 +17,8 @@ on:
 
 permissions:
   contents: read
+  checks: write
+  issues: write
 
 jobs:
   audit:
@@ -25,3 +27,5 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: rustsec/audit-check@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
