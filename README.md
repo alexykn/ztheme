@@ -19,18 +19,49 @@ theme format without plugins or an interpreted template language.
   <sub>Vesper theme with a two-line prompt and themed command input.</sub>
 </p>
 
-Build and install:
+## Installation
+
+ztheme supports Zsh on macOS and Linux. The default theme uses Nerd Font
+glyphs. Building from source requires Rust 1.97 or newer; managed dependency
+setup requires `curl`, `tar`, and `shasum` or `sha256sum`.
+
+### Build from source
 
 ```console
-cargo install --locked --path ~/github/ztheme --root ~/.local --force
+git clone https://github.com/alexykn/ztheme.git
+cd ztheme
+cargo install --locked --path . --root ~/.local
 ztheme setup
 ```
 
-Add the embedded integration to `.zshrc`:
+Ensure `~/.local/bin` is on `PATH`, then add the embedded integration to
+`.zshrc`:
 
 ```console
 eval "$(ztheme init zsh)"
 ```
+
+### Release archive
+
+Tagged releases provide native archives for Apple Silicon, Intel macOS, and
+Linux x86_64. Download the archive matching your platform from
+[Releases](https://github.com/alexykn/ztheme/releases), verify it against
+`SHA256SUMS`, place `ztheme` in a directory on `PATH`, then run `ztheme setup`.
+
+`ztheme setup` downloads checksum-verified copies of gitstatusd and, when
+selected, zsh-syntax-highlighting and zsh-autosuggestions. Normal prompt use
+does not make network requests or send telemetry.
+
+## Updating and removing
+
+For a source installation, pull the repository and repeat the install command.
+For a release archive, replace the installed executable with a newer verified
+archive. `ztheme clear` removes cached prompt data but preserves managed helper
+installations. To remove ztheme completely, remove the executable and the
+`${XDG_CACHE_HOME:-$HOME/.cache}/ztheme`,
+`${XDG_DATA_HOME:-$HOME/.local/share}/ztheme`, and
+`${XDG_CONFIG_HOME:-$HOME/.config}/ztheme` directories if you no longer need
+their cache, managed helpers, or themes.
 
 ## Shell defaults
 
