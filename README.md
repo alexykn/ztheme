@@ -160,12 +160,20 @@ highlighters use separate Zsh pattern maps and are not theme syntax styles.
 
 The input styles are applied through
 [zsh-syntax-highlighting](https://github.com/zsh-users/zsh-syntax-highlighting).
-`ztheme setup` offers to install a pinned, checksum-verified copy under
-`${XDG_DATA_HOME:-$HOME/.local/share}/ztheme/zsh-syntax-highlighting`.
-The shell integration loads it once, after `.zshrc` has finished and before the
-first interactive line. If another copy is already loaded, ztheme leaves it
-alone. Missing or declined syntax highlighting never prevents the prompt from
-starting and adds no recurring prompt work.
+Command suggestions are provided by
+[zsh-autosuggestions](https://github.com/zsh-users/zsh-autosuggestions).
+`ztheme setup` offers to install pinned, checksum-verified copies under
+`${XDG_DATA_HOME:-$HOME/.local/share}/ztheme/zsh-syntax-highlighting`
+and `${XDG_DATA_HOME:-$HOME/.local/share}/ztheme/zsh-autosuggestions`.
+The shell integration loads both once, after `.zshrc` has finished and before
+the first interactive line. If another copy is already loaded, ztheme leaves
+it alone.
+
+Autosuggestions use their asynchronous mode and documented manual-rebind mode,
+so widget wrapping happens once rather than during every prompt. Right Arrow,
+End, and Ctrl-Space accept the current suggestion. Missing or declined input
+helpers never prevent the prompt from starting and add no recurring prompt
+work.
 
 Every segment supports bounded unstyled outer spacing:
 
@@ -191,7 +199,7 @@ Git status is provided exclusively by
 pinned upstream binary. Installation downloads the official artifact, verifies
 its SHA-256 checksum, and stores it under
 `${XDG_DATA_HOME:-$HOME/.local/share}/ztheme/gitstatus/v1.5`. For unattended
-setup of both gitstatusd and syntax highlighting, run:
+setup of gitstatusd and both input helpers, run:
 
 ```console
 ztheme setup --yes

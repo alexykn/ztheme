@@ -1,3 +1,4 @@
+mod autosuggestions;
 mod cache;
 mod git;
 mod gitstatus;
@@ -461,6 +462,10 @@ fn init_zsh(instance: &cache::Instance, selector: Option<&str>) -> io::Result<St
         .replace("@ZTHEME_BIN@", &binary)
         .replace("@ZTHEME_INSTANCE_ARGS@", &instance_arguments)
         .replace(
+            "@ZTHEME_AUTOSUGGESTIONS@",
+            &shell_quote(&autosuggestions::managed_script().to_string_lossy()),
+        )
+        .replace(
             "@ZTHEME_SYNTAX_HIGHLIGHTING@",
             &shell_quote(&syntax_highlighting::managed_script().to_string_lossy()),
         )
@@ -480,6 +485,7 @@ fn setup(assume_yes: bool) -> io::Result<()> {
         return Err(io::Error::other("gitstatusd installation declined"));
     }
     let syntax_installed = syntax_highlighting::ensure_installed(assume_yes)?;
+    let autosuggestions_installed = autosuggestions::ensure_installed(assume_yes)?;
     println!("gitstatusd\t{}", gitstatus::managed_binary().display());
     if syntax_installed {
         println!(
@@ -488,6 +494,14 @@ fn setup(assume_yes: bool) -> io::Result<()> {
         );
     } else {
         println!("zsh-syntax-highlighting\tnot installed (optional)");
+    }
+    if autosuggestions_installed {
+        println!(
+            "zsh-autosuggestions\t{}",
+            autosuggestions::managed_script().display()
+        );
+    } else {
+        println!("zsh-autosuggestions\tnot installed (optional)");
     }
     Ok(())
 }

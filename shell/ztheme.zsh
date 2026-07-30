@@ -26,6 +26,7 @@ setopt PROMPT_SUBST
 
 typeset -g __ZTHEME_BIN=@ZTHEME_BIN@
 typeset -ga __ZTHEME_INSTANCE_ARGS=(@ZTHEME_INSTANCE_ARGS@)
+typeset -g __ZTHEME_AUTOSUGGESTIONS=@ZTHEME_AUTOSUGGESTIONS@
 typeset -g __ZTHEME_SYNTAX_HIGHLIGHTING=@ZTHEME_SYNTAX_HIGHLIGHTING@
 typeset -g ZTHEME_PROMPT=""
 typeset -g ZTHEME_RPROMPT=""
@@ -33,7 +34,9 @@ typeset -g ZTHEME_CONTEXT_KEY=""
 typeset -g ZTHEME_LAST_ERROR=""
 typeset -gi ZTHEME_GENERATION=0
 typeset -gi ZTHEME_ASYNC_FD=-1
+typeset -gi ZTHEME_AUTOSUGGESTIONS_WARNING_SHOWN=${ZTHEME_AUTOSUGGESTIONS_WARNING_SHOWN:-0}
 typeset -gi ZTHEME_SYNTAX_WARNING_SHOWN=${ZTHEME_SYNTAX_WARNING_SHOWN:-0}
+typeset -g ZSH_AUTOSUGGEST_MANUAL_REBIND=1
 
 _ztheme_close_worker() {
     emulate -L zsh
@@ -207,13 +210,29 @@ _ztheme_precmd() {
     _ztheme_start_worker
 }
 
-_ztheme_load_syntax_highlighting() {
+_ztheme_load_shell_plugins() {
     emulate -L zsh
     setopt localoptions no_shwordsplit
 
     precmd_functions=(
-        ${precmd_functions:#_ztheme_load_syntax_highlighting}
+        ${precmd_functions:#_ztheme_load_shell_plugins}
     )
+
+    if (( ! $+functions[_zsh_autosuggest_start] )); then
+        if [[ -r "$__ZTHEME_AUTOSUGGESTIONS" ]]; then
+            builtin source "$__ZTHEME_AUTOSUGGESTIONS"
+        fi
+    fi
+
+    if (( $+functions[_zsh_autosuggest_start] )); then
+        add-zle-hook-widget -D line-init \
+            _ztheme_initialize_autosuggestions 2>/dev/null
+        add-zle-hook-widget line-init _ztheme_initialize_autosuggestions
+    elif (( ! ZTHEME_AUTOSUGGESTIONS_WARNING_SHOWN )); then
+        builtin print -u2 -r -- \
+            "ztheme: autosuggestions are unavailable; run \`ztheme setup\` to install them."
+        ZTHEME_AUTOSUGGESTIONS_WARNING_SHOWN=1
+    fi
 
     if [[ -n "${ZSH_HIGHLIGHT_VERSION:-}" ]] ||
         (( $+functions[_zsh_highlight] ))
@@ -234,6 +253,27 @@ _ztheme_load_syntax_highlighting() {
         builtin print -u2 -r -- \
             "ztheme: syntax highlighting is unavailable; run \`ztheme setup\` to install it."
         ZTHEME_SYNTAX_WARNING_SHOWN=1
+    fi
+    return 0
+}
+
+_ztheme_initialize_autosuggestions() {
+    emulate -L zsh
+
+    add-zle-hook-widget -D line-init \
+        _ztheme_initialize_autosuggestions 2>/dev/null
+    _zsh_autosuggest_start
+
+    if (( $+widgets[autosuggest-accept] )); then
+        builtin bindkey '^ ' autosuggest-accept
+        builtin bindkey '^[[F' autosuggest-accept
+        return 0
+    fi
+
+    if (( ! ZTHEME_AUTOSUGGESTIONS_WARNING_SHOWN )); then
+        builtin zle -M \
+            "ztheme: autosuggestions failed to initialize; run \`ztheme setup\` to reinstall them."
+        ZTHEME_AUTOSUGGESTIONS_WARNING_SHOWN=1
     fi
     return 0
 }
@@ -336,9 +376,9 @@ _ztheme_zle_line_finish() {
 # ---------------------------------------------------------------------------
 
 precmd_functions=(${precmd_functions:#_ztheme_precmd})
-precmd_functions=(${precmd_functions:#_ztheme_load_syntax_highlighting})
+precmd_functions=(${precmd_functions:#_ztheme_load_shell_plugins})
 precmd_functions=(_ztheme_precmd $precmd_functions)
-precmd_functions+=(_ztheme_load_syntax_highlighting)
+precmd_functions+=(_ztheme_load_shell_plugins)
 
 for hook_spec in \
     preexec:_ztheme_preexec \
