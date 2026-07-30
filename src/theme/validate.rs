@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 use std::io;
 
-use crate::context::Runtime;
+use crate::runtime::Runtime;
 
 use super::{
     MAX_LAYOUT_LINES, MAX_LAYOUT_SEGMENTS, MAX_SEGMENT_SPACING, SegmentId, Spacing, Theme,

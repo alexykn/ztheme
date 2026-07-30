@@ -3,20 +3,15 @@ mod disk;
 mod wire;
 
 use std::env;
-use std::ffi::OsStr;
-use std::fs::Metadata;
 use std::io;
-use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::gitstatus::{Query, Snapshot};
+use crate::utils::HashBuilder;
 
-const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
-const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
 const CACHE_FILE_PREFIX: &str = "runtime-v1-";
 const CACHE_FILE_SUFFIX: &str = ".bin";
 const CACHE_FORMAT_VERSION: u16 = 1;
@@ -99,9 +94,9 @@ impl Instance {
         match self {
             Self::Production => directory.join("daemon.sock"),
             Self::Development(name) => {
-                let mut fingerprint = Fingerprint::new(b"ztheme-development-instance-v1");
-                fingerprint.add_bytes(b"name", name.as_bytes());
-                directory.join(format!("dev-{:016x}.sock", fingerprint.finish().value()))
+                let mut hash = HashBuilder::new(b"ztheme-development-instance-v1");
+                hash.add_bytes(b"name", name.as_bytes());
+                directory.join(format!("dev-{:016x}.sock", hash.finish()))
             }
         }
     }
@@ -123,90 +118,6 @@ impl CacheKey {
 
     pub const fn value(self) -> u64 {
         self.0
-    }
-}
-
-#[derive(Clone, Debug)]
-pub struct Fingerprint {
-    state: u64,
-}
-
-impl Fingerprint {
-    pub fn new(domain: &[u8]) -> Self {
-        let mut fingerprint = Self { state: FNV_OFFSET };
-        fingerprint.add_bytes(b"domain", domain);
-        fingerprint
-    }
-
-    pub fn add_bytes(&mut self, label: &[u8], value: &[u8]) {
-        self.add_raw(&u64_len(label).to_be_bytes());
-        self.add_raw(label);
-        self.add_raw(&u64_len(value).to_be_bytes());
-        self.add_raw(value);
-    }
-
-    pub fn add_os(&mut self, label: &[u8], value: &OsStr) {
-        self.add_bytes(label, value.as_bytes());
-    }
-
-    pub fn add_optional_os(&mut self, label: &[u8], value: Option<&OsStr>) {
-        match value {
-            Some(value) => {
-                self.add_bytes(b"present", b"1");
-                self.add_os(label, value);
-            }
-            None => self.add_bytes(b"present", b"0"),
-        }
-    }
-
-    pub fn add_path(&mut self, label: &[u8], value: &Path) {
-        self.add_os(label, value.as_os_str());
-    }
-
-    pub fn add_u64(&mut self, label: &[u8], value: u64) {
-        self.add_bytes(label, &value.to_be_bytes());
-    }
-
-    pub fn add_metadata(&mut self, label: &[u8], metadata: Option<&Metadata>) {
-        let Some(metadata) = metadata else {
-            self.add_bytes(label, b"missing");
-            return;
-        };
-
-        self.add_bytes(label, b"present");
-        self.add_u64(b"metadata-length", metadata.len());
-        self.add_u64(b"metadata-device", metadata.dev());
-        self.add_u64(b"metadata-inode", metadata.ino());
-        self.add_u64(b"metadata-mode", u64::from(metadata.mode()));
-        self.add_u64(
-            b"metadata-change-seconds",
-            u64::try_from(metadata.ctime()).unwrap_or(0),
-        );
-        self.add_u64(
-            b"metadata-change-nanos",
-            u64::try_from(metadata.ctime_nsec()).unwrap_or(0),
-        );
-        match metadata.modified().ok().and_then(epoch_duration) {
-            Some(modified) => {
-                self.add_u64(b"metadata-modified-seconds", modified.as_secs());
-                self.add_u64(
-                    b"metadata-modified-nanos",
-                    u64::from(modified.subsec_nanos()),
-                );
-            }
-            None => self.add_bytes(b"metadata-modified", b"unknown"),
-        }
-    }
-
-    pub fn finish(self) -> CacheKey {
-        CacheKey(self.state)
-    }
-
-    fn add_raw(&mut self, bytes: &[u8]) {
-        for byte in bytes {
-            self.state ^= u64::from(*byte);
-            self.state = self.state.wrapping_mul(FNV_PRIME);
-        }
     }
 }
 
@@ -348,14 +259,14 @@ fn cache_root() -> Option<PathBuf> {
 }
 
 fn cache_identity() -> String {
-    let mut fingerprint = Fingerprint::new(b"ztheme-cache-identity-v1");
-    fingerprint.add_bytes(b"package-version", env!("CARGO_PKG_VERSION").as_bytes());
-    fingerprint.add_u64(b"cache-format-version", u64::from(CACHE_FORMAT_VERSION));
-    fingerprint.add_u64(b"wire-version", u64::from(wire::VERSION));
+    let mut hash = HashBuilder::new(b"ztheme-cache-identity-v1");
+    hash.add_bytes(b"package-version", env!("CARGO_PKG_VERSION").as_bytes());
+    hash.add_u64(b"cache-format-version", u64::from(CACHE_FORMAT_VERSION));
+    hash.add_u64(b"wire-version", u64::from(wire::VERSION));
     if let Ok(executable) = env::current_exe() {
-        fingerprint.add_path(b"executable", &executable);
+        hash.add_path(b"executable", &executable);
     }
-    format!("{:016x}", fingerprint.finish().value())
+    format!("{:016x}", hash.finish())
 }
 
 fn lock_path(socket: &Path) -> PathBuf {
@@ -380,10 +291,6 @@ fn epoch_duration(time: SystemTime) -> Option<Duration> {
     time.duration_since(UNIX_EPOCH).ok()
 }
 
-fn u64_len(value: &[u8]) -> u64 {
-    u64::try_from(value.len()).unwrap_or(u64::MAX)
-}
-
 fn user_id() -> u32 {
     unsafe extern "C" {
         fn getuid() -> u32;
@@ -395,7 +302,7 @@ fn user_id() -> u32 {
 
 #[cfg(test)]
 mod tests {
-    use super::{Entry, Fingerprint, Instance, SAFETY_EXPIRY};
+    use super::{Entry, Instance, SAFETY_EXPIRY};
 
     #[test]
     fn development_instance_names_are_validated() {
@@ -423,19 +330,6 @@ mod tests {
                 .unwrap()
                 .socket_path()
         );
-    }
-
-    #[test]
-    fn fingerprints_separate_domains_labels_and_field_boundaries() {
-        let mut first = Fingerprint::new(b"one");
-        first.add_bytes(b"a", b"bc");
-        let mut second = Fingerprint::new(b"one");
-        second.add_bytes(b"ab", b"c");
-        let mut other_domain = Fingerprint::new(b"two");
-        other_domain.add_bytes(b"a", b"bc");
-
-        assert_ne!(first.finish(), second.finish());
-        assert_ne!(Fingerprint::new(b"one").finish(), other_domain.finish());
     }
 
     #[test]

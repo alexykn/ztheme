@@ -2,9 +2,9 @@ use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::io;
 
-use crate::context::{Runtime, RuntimeValue};
 use crate::gitstatus::{CONFLICTED, DELETED, STAGED, Snapshot, UNSTAGED, UNTRACKED};
 use crate::prompt::prompt_text;
+use crate::runtime::{Runtime, RuntimeValue};
 
 use super::{RuntimeTheme, STYLE_RESET, SegmentId, Theme, invalid, prompt_literal, style_open};
 
@@ -471,8 +471,8 @@ mod tests {
     use std::path::PathBuf;
 
     use super::{AsyncTheme, compile};
-    use crate::context::{Runtime, RuntimeValue};
     use crate::gitstatus::{CONFLICTED, DELETED, STAGED, Snapshot, UNSTAGED, UNTRACKED};
+    use crate::runtime::{Runtime, RuntimeValue};
     use crate::theme::{CATPPUCCIN_MOCHA_THEME, SegmentId, Theme, parse_versioned, validate};
 
     fn theme() -> Theme {

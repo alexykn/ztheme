@@ -10,35 +10,98 @@ use tokio::process::Command;
 use tokio::task::JoinSet;
 use tokio::time::timeout;
 
-use super::project::{Project, Runtime};
+mod detect;
+
+pub(crate) use detect::{Project, detect, worktree_root};
+
 use crate::cache::CacheKey;
 
 const COMMAND_TIMEOUT: Duration = Duration::from_millis(250);
 const OUTPUT_LIMIT: u64 = 4_097;
 const MAX_FIELD_BYTES: usize = 4_096;
 
-#[derive(Clone, Debug)]
-pub struct RuntimeValue {
-    pub runtime: Runtime,
-    pub version: String,
-    pub label: Option<String>,
-    pub environment: Option<String>,
+macro_rules! define_runtimes {
+    ($($variant:ident = $id:literal => $name:literal),+ $(,)?) => {
+        #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+        #[repr(u8)]
+        pub(crate) enum Runtime {
+            $($variant = $id),+
+        }
+
+        impl Runtime {
+            pub(crate) const ALL: [Self; [$(stringify!($variant)),+].len()] = [
+                $(Self::$variant),+
+            ];
+
+            pub(crate) const fn id(self) -> u8 {
+                self as u8
+            }
+
+            pub(crate) const fn name(self) -> &'static str {
+                match self {
+                    $(Self::$variant => $name),+
+                }
+            }
+
+            pub(crate) const fn from_id(value: u8) -> Option<Self> {
+                match value {
+                    $($id => Some(Self::$variant),)+
+                    _ => None,
+                }
+            }
+
+            pub(crate) fn from_name(value: &str) -> Option<Self> {
+                match value {
+                    $($name => Some(Self::$variant),)+
+                    _ => None,
+                }
+            }
+        }
+    };
 }
 
-pub async fn snapshot(project: Project, active: Vec<Runtime>) -> Vec<RuntimeValue> {
+define_runtimes! {
+    Python = 0 => "python",
+    Perl = 1 => "perl",
+    Java = 2 => "java",
+    Kotlin = 3 => "kotlin",
+    Scala = 4 => "scala",
+    Rust = 5 => "rust",
+    Go = 6 => "go",
+    Bun = 7 => "bun",
+    Deno = 8 => "deno",
+    Node = 9 => "node",
+    Ruby = 10 => "ruby",
+    Php = 11 => "php",
+    Dotnet = 12 => "dotnet",
+    C = 13 => "c",
+    Cpp = 14 => "cpp",
+    Swift = 15 => "swift",
+    Lua = 16 => "lua",
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct RuntimeValue {
+    pub(crate) runtime: Runtime,
+    pub(crate) version: String,
+    pub(crate) label: Option<String>,
+    pub(crate) environment: Option<String>,
+}
+
+pub(crate) async fn snapshot(project: Project, active: Vec<Runtime>) -> Vec<RuntimeValue> {
     let mut tasks = JoinSet::new();
 
     for runtime in active {
         let cwd = project.cwd.clone();
         tasks.spawn(async move {
-            let spec = command(runtime);
+            let spec = spec(runtime);
             let output = capture(&cwd, &spec).await?;
-            let version = parse_version(runtime, &output)?;
+            let version = (spec.parse_version)(&output)?;
             Some(RuntimeValue {
                 runtime,
                 version,
-                label: spec.compiler.map(str::to_owned),
-                environment: environment_name(runtime),
+                label: spec.label.map(str::to_owned),
+                environment: spec.environment.and_then(|environment| environment()),
             })
         });
     }
@@ -53,36 +116,36 @@ pub async fn snapshot(project: Project, active: Vec<Runtime>) -> Vec<RuntimeValu
     values
 }
 
-pub fn cache_key(project: &Project, active: &[Runtime]) -> CacheKey {
-    let mut fingerprint = project.fingerprint.clone();
-    fingerprint.add_u64(b"runtime-snapshot-version", 1);
+pub(crate) fn cache_key(project: &Project, active: &[Runtime]) -> CacheKey {
+    let mut hash = project.hash.clone();
+    hash.add_u64(b"runtime-snapshot-version", 1);
 
     for runtime in active {
-        fingerprint.add_u64(b"runtime-command", u64::from(runtime.id()));
-        let spec = command(*runtime);
-        fingerprint.add_os(b"runtime-program", &spec.program);
+        hash.add_u64(b"runtime-command", u64::from(runtime.id()));
+        let spec = spec(*runtime);
+        hash.add_os(b"runtime-program", &spec.program);
         let executable = resolve_program(&spec.program);
         if let Some(executable) = executable.as_deref() {
-            fingerprint.add_path(b"resolved-executable", executable);
+            hash.add_path(b"resolved-executable", executable);
             let link_metadata = executable.symlink_metadata().ok();
-            fingerprint.add_metadata(b"executable-link-metadata", link_metadata.as_ref());
+            hash.add_metadata(b"executable-link-metadata", link_metadata.as_ref());
 
             if let Ok(canonical) = executable.canonicalize() {
-                fingerprint.add_path(b"canonical-executable", &canonical);
+                hash.add_path(b"canonical-executable", &canonical);
                 let metadata = canonical.metadata().ok();
-                fingerprint.add_metadata(b"executable-metadata", metadata.as_ref());
+                hash.add_metadata(b"executable-metadata", metadata.as_ref());
             } else {
-                fingerprint.add_bytes(b"canonical-executable", b"unavailable");
+                hash.add_bytes(b"canonical-executable", b"unavailable");
             }
         } else {
-            fingerprint.add_bytes(b"resolved-executable", b"missing");
+            hash.add_bytes(b"resolved-executable", b"missing");
         }
     }
 
-    fingerprint.finish()
+    CacheKey::from_value(hash.finish())
 }
 
-pub fn encode(values: &[RuntimeValue]) -> io::Result<Vec<u8>> {
+pub(crate) fn encode(values: &[RuntimeValue]) -> io::Result<Vec<u8>> {
     let count = u8::try_from(values.len()).map_err(|_| invalid_data("too many runtime values"))?;
     let mut output = Vec::with_capacity(128);
     output.push(count);
@@ -95,7 +158,7 @@ pub fn encode(values: &[RuntimeValue]) -> io::Result<Vec<u8>> {
     Ok(output)
 }
 
-pub fn decode(bytes: &[u8]) -> io::Result<Vec<RuntimeValue>> {
+pub(crate) fn decode(bytes: &[u8]) -> io::Result<Vec<RuntimeValue>> {
     let mut decoder = Decoder::new(bytes);
     let count = usize::from(decoder.u8()?);
     if count > Runtime::ALL.len() {
@@ -125,69 +188,94 @@ pub fn decode(bytes: &[u8]) -> io::Result<Vec<RuntimeValue>> {
     Ok(values)
 }
 
-struct RuntimeCommand {
+struct RuntimeSpec {
     program: OsString,
     arguments: &'static [&'static str],
     merge_stderr: bool,
-    compiler: Option<&'static str>,
+    label: Option<&'static str>,
+    parse_version: fn(&str) -> Option<String>,
+    environment: Option<fn() -> Option<String>>,
 }
 
-fn command(runtime: Runtime) -> RuntimeCommand {
-    let (program, arguments, merge_stderr, compiler) = match runtime {
-        Runtime::Python => (python_program(), &["--version"][..], true, None),
-        Runtime::Perl => (
-            OsString::from("perl"),
-            &["-e", "printf \"%vd\\n\", $^V"][..],
-            false,
-            None,
-        ),
-        Runtime::Java => (OsString::from("java"), &["-version"][..], true, None),
-        Runtime::Kotlin => (OsString::from("kotlinc"), &["-version"][..], true, None),
-        Runtime::Scala => (OsString::from("scala"), &["-version"][..], true, None),
-        Runtime::Rust => (OsString::from("rustc"), &["--version"][..], false, None),
-        Runtime::Go => (OsString::from("go"), &["version"][..], false, None),
-        Runtime::Bun => (OsString::from("bun"), &["--version"][..], false, None),
-        Runtime::Deno => (OsString::from("deno"), &["--version"][..], false, None),
-        Runtime::Node => (OsString::from("node"), &["--version"][..], false, None),
-        Runtime::Ruby => (OsString::from("ruby"), &["--version"][..], false, None),
-        Runtime::Php => (OsString::from("php"), &["--version"][..], false, None),
-        Runtime::Dotnet => (OsString::from("dotnet"), &["--version"][..], false, None),
-        Runtime::C => compiler_command(false),
-        Runtime::Cpp => compiler_command(true),
-        Runtime::Swift => (OsString::from("swift"), &["--version"][..], false, None),
-        Runtime::Lua => (OsString::from("lua"), &["-v"][..], true, None),
-    };
-
-    RuntimeCommand {
-        program,
-        arguments,
-        merge_stderr,
-        compiler,
+fn spec(runtime: Runtime) -> RuntimeSpec {
+    match runtime {
+        Runtime::Python => RuntimeSpec {
+            program: python_program(),
+            arguments: &["--version"],
+            merge_stderr: true,
+            label: None,
+            parse_version: parse_python,
+            environment: Some(python_environment),
+        },
+        Runtime::Perl => RuntimeSpec {
+            program: OsString::from("perl"),
+            arguments: &["-e", "printf \"%vd\\n\", $^V"],
+            merge_stderr: false,
+            label: None,
+            parse_version: parse_line,
+            environment: Some(perl_environment),
+        },
+        Runtime::Java => static_spec("java", &["-version"], true, parse_java),
+        Runtime::Kotlin => static_spec("kotlinc", &["-version"], true, parse_numeric),
+        Runtime::Scala => static_spec("scala", &["-version"], true, parse_numeric),
+        Runtime::Rust => RuntimeSpec {
+            environment: Some(rust_environment),
+            ..static_spec("rustc", &["--version"], false, parse_second_word)
+        },
+        Runtime::Go => static_spec("go", &["version"], false, parse_go),
+        Runtime::Bun => static_spec("bun", &["--version"], false, parse_line),
+        Runtime::Deno => static_spec("deno", &["--version"], false, parse_second_word),
+        Runtime::Node => static_spec("node", &["--version"], false, parse_node),
+        Runtime::Ruby => RuntimeSpec {
+            environment: Some(ruby_environment),
+            ..static_spec("ruby", &["--version"], false, parse_second_word)
+        },
+        Runtime::Php => static_spec("php", &["--version"], false, parse_second_word),
+        Runtime::Dotnet => static_spec("dotnet", &["--version"], false, parse_line),
+        Runtime::C => compiler_spec(false),
+        Runtime::Cpp => compiler_spec(true),
+        Runtime::Swift => static_spec("swift", &["--version"], false, parse_numeric),
+        Runtime::Lua => static_spec("lua", &["-v"], true, parse_second_word),
     }
 }
 
-fn compiler_command(
-    cpp: bool,
-) -> (
-    OsString,
-    &'static [&'static str],
-    bool,
-    Option<&'static str>,
-) {
+fn static_spec(
+    program: &'static str,
+    arguments: &'static [&'static str],
+    merge_stderr: bool,
+    parse_version: fn(&str) -> Option<String>,
+) -> RuntimeSpec {
+    RuntimeSpec {
+        program: OsString::from(program),
+        arguments,
+        merge_stderr,
+        label: None,
+        parse_version,
+        environment: None,
+    }
+}
+
+fn compiler_spec(cpp: bool) -> RuntimeSpec {
     let path = env::var_os("PATH").unwrap_or_default();
     let clang = if cpp { "clang++" } else { "clang" };
     let gcc = if cpp { "g++" } else { "gcc" };
 
     if executable_on_path(clang, &path) {
-        return (OsString::from(clang), &["--version"], false, Some("clang"));
+        return RuntimeSpec {
+            label: Some("clang"),
+            ..static_spec(clang, &["--version"], false, parse_numeric)
+        };
     }
 
-    (
-        OsString::from(gcc),
-        &["-dumpfullversion", "-dumpversion"],
-        false,
-        Some("gcc"),
-    )
+    RuntimeSpec {
+        label: Some("gcc"),
+        ..static_spec(
+            gcc,
+            &["-dumpfullversion", "-dumpversion"],
+            false,
+            parse_numeric,
+        )
+    }
 }
 
 fn python_program() -> OsString {
@@ -225,7 +313,7 @@ fn resolve_program(program: &OsString) -> Option<PathBuf> {
         .find(|candidate| candidate.is_file())
 }
 
-async fn capture(cwd: &Path, spec: &RuntimeCommand) -> Option<String> {
+async fn capture(cwd: &Path, spec: &RuntimeSpec) -> Option<String> {
     let mut command = Command::new(&spec.program);
     command
         .args(spec.arguments)
@@ -287,28 +375,51 @@ async fn capture(cwd: &Path, spec: &RuntimeCommand) -> Option<String> {
     String::from_utf8(bytes).ok()
 }
 
-fn parse_version(runtime: Runtime, output: &str) -> Option<String> {
-    let line = output.lines().find(|line| !line.trim().is_empty())?.trim();
-    let version = match runtime {
-        Runtime::Python => line.strip_prefix("Python ")?.to_owned(),
-        Runtime::Perl | Runtime::Bun | Runtime::Dotnet => line.to_owned(),
-        Runtime::Java => line.split('"').nth(1)?.to_owned(),
-        Runtime::Kotlin | Runtime::Scala | Runtime::C | Runtime::Cpp | Runtime::Swift => {
-            numeric_word(line)?
-        }
-        Runtime::Rust | Runtime::Ruby | Runtime::Php | Runtime::Lua => {
-            line.split_whitespace().nth(1)?.to_owned()
-        }
-        Runtime::Go => line
-            .split_whitespace()
-            .nth(2)?
-            .strip_prefix("go")?
-            .to_owned(),
-        Runtime::Deno => line.split_whitespace().nth(1)?.to_owned(),
-        Runtime::Node => line.strip_prefix('v').unwrap_or(line).to_owned(),
-    };
+fn first_line(output: &str) -> Option<&str> {
+    output
+        .lines()
+        .find(|line| !line.trim().is_empty())
+        .map(str::trim)
+}
 
-    (!version.is_empty()).then_some(version)
+fn parse_python(output: &str) -> Option<String> {
+    first_line(output)?
+        .strip_prefix("Python ")
+        .map(str::to_owned)
+}
+
+fn parse_line(output: &str) -> Option<String> {
+    let value = first_line(output)?;
+    (!value.is_empty()).then(|| value.to_owned())
+}
+
+fn parse_java(output: &str) -> Option<String> {
+    first_line(output)?.split('"').nth(1).map(str::to_owned)
+}
+
+fn parse_numeric(output: &str) -> Option<String> {
+    numeric_word(first_line(output)?)
+}
+
+fn parse_second_word(output: &str) -> Option<String> {
+    first_line(output)?
+        .split_whitespace()
+        .nth(1)
+        .map(str::to_owned)
+}
+
+fn parse_go(output: &str) -> Option<String> {
+    first_line(output)?
+        .split_whitespace()
+        .nth(2)?
+        .strip_prefix("go")
+        .map(str::to_owned)
+}
+
+fn parse_node(output: &str) -> Option<String> {
+    let line = first_line(output)?;
+    let value = line.strip_prefix('v').unwrap_or(line);
+    (!value.is_empty()).then(|| value.to_owned())
 }
 
 fn numeric_word(line: &str) -> Option<String> {
@@ -321,28 +432,31 @@ fn numeric_word(line: &str) -> Option<String> {
     })
 }
 
-fn environment_name(runtime: Runtime) -> Option<String> {
-    let value = match runtime {
-        Runtime::Python => env::var_os("VIRTUAL_ENV")
-            .and_then(|path| {
-                std::path::PathBuf::from(path)
-                    .file_name()
-                    .map(OsString::from)
-            })
-            .or_else(|| env::var_os("CONDA_DEFAULT_ENV"))
-            .or_else(|| {
-                env::var_os("CONDA_PREFIX").and_then(|path| {
-                    std::path::PathBuf::from(path)
-                        .file_name()
-                        .map(OsString::from)
-                })
-            }),
-        Runtime::Perl => env::var_os("PERLBREW_PERL").or_else(|| env::var_os("PLENV_VERSION")),
-        Runtime::Rust => env::var_os("RUSTUP_TOOLCHAIN"),
-        Runtime::Ruby => env::var_os("RBENV_VERSION").or_else(|| env::var_os("RUBY_VERSION")),
-        _ => None,
-    }?;
-    value.into_string().ok()
+fn python_environment() -> Option<String> {
+    env::var_os("VIRTUAL_ENV")
+        .and_then(|path| PathBuf::from(path).file_name().map(OsString::from))
+        .or_else(|| env::var_os("CONDA_DEFAULT_ENV"))
+        .or_else(|| {
+            env::var_os("CONDA_PREFIX")
+                .and_then(|path| PathBuf::from(path).file_name().map(OsString::from))
+        })
+        .and_then(|value| value.into_string().ok())
+}
+
+fn perl_environment() -> Option<String> {
+    env::var_os("PERLBREW_PERL")
+        .or_else(|| env::var_os("PLENV_VERSION"))
+        .and_then(|value| value.into_string().ok())
+}
+
+fn rust_environment() -> Option<String> {
+    env::var_os("RUSTUP_TOOLCHAIN").and_then(|value| value.into_string().ok())
+}
+
+fn ruby_environment() -> Option<String> {
+    env::var_os("RBENV_VERSION")
+        .or_else(|| env::var_os("RUBY_VERSION"))
+        .and_then(|value| value.into_string().ok())
 }
 
 fn write_text(output: &mut Vec<u8>, value: &str) -> io::Result<()> {
@@ -431,8 +545,32 @@ fn invalid_data(message: &'static str) -> io::Error {
 
 #[cfg(test)]
 mod tests {
-    use super::{RuntimeValue, decode, encode, parse_version};
-    use crate::context::Runtime;
+    use std::collections::HashSet;
+
+    use super::{Runtime, RuntimeValue, decode, encode, spec};
+
+    fn parse_version(runtime: Runtime, output: &str) -> Option<String> {
+        (spec(runtime).parse_version)(output)
+    }
+
+    #[test]
+    fn runtime_identities_are_unique_and_round_trip() {
+        let ids = Runtime::ALL
+            .into_iter()
+            .map(Runtime::id)
+            .collect::<HashSet<_>>();
+        let names = Runtime::ALL
+            .into_iter()
+            .map(Runtime::name)
+            .collect::<HashSet<_>>();
+
+        assert_eq!(ids.len(), Runtime::ALL.len());
+        assert_eq!(names.len(), Runtime::ALL.len());
+        for runtime in Runtime::ALL {
+            assert_eq!(Runtime::from_id(runtime.id()), Some(runtime));
+            assert_eq!(Runtime::from_name(runtime.name()), Some(runtime));
+        }
+    }
 
     #[test]
     fn parses_supported_runtime_versions() {

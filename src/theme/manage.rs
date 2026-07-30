@@ -6,7 +6,7 @@ use std::io::{self, IsTerminal, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::{self, Command};
 
-use crate::context::Runtime;
+use crate::runtime::Runtime;
 
 use super::{
     BUNDLED_THEMES, CompiledTheme, Config, DEFAULT_THEME_SELECTOR, SegmentId, Style, Theme,

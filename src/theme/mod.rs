@@ -10,7 +10,7 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use crate::context::Runtime;
+use crate::runtime::Runtime;
 
 pub use async_theme::AsyncTheme;
 pub(crate) use manage::{apply, edit, list, persist};
