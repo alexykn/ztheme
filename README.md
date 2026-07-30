@@ -207,7 +207,7 @@ ztheme provides a practical interactive baseline:
 - persistent, deduplicated shared history
 - cached, case-insensitive completion with hidden files
 - prefix-aware Up and Down history search
-- common Home, End, Delete, word, and arrow-key bindings
+- terminal-aware Home, End, Delete, word, and arrow-key bindings
 - directory-stack navigation and interactive comments
 - asynchronous autosuggestions with Right Arrow, End, or Ctrl-Space to accept
 
@@ -230,8 +230,17 @@ eval "$(ztheme init zsh)"
 ```
 
 Set `ZTHEME_HISTORY_DEFAULTS=0` instead to disable only history defaults.
-ztheme does not manage `PATH`, aliases, editor selection, terminal integration,
-or application environment variables.
+Set `ZTHEME_KEY_BINDINGS=0` before initialization to disable ztheme's
+navigation and autosuggestion bindings. Set `ZTHEME_FOCUS_REPORTING=0` to
+disable terminal focus tracking.
+
+ztheme uses the active terminal's terminfo entry and supports both Emacs and Vi
+keymaps. On macOS, Option-based word movement and deletion require the terminal
+to send Option as Alt/Escape; this is usually named **Esc+** in iTerm2 and
+**Option as Alt** in other terminals.
+
+ztheme does not manage `PATH`, aliases, editor selection, terminal-emulator
+preferences, or application environment variables.
 
 ## Commands
 

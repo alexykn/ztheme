@@ -39,6 +39,17 @@ typeset -gi ZTHEME_ASYNC_FD=-1
 typeset -gi ZTHEME_AUTOSUGGESTIONS_WARNING_SHOWN=${ZTHEME_AUTOSUGGESTIONS_WARNING_SHOWN:-0}
 typeset -gi ZTHEME_SYNTAX_WARNING_SHOWN=${ZTHEME_SYNTAX_WARNING_SHOWN:-0}
 typeset -g ZSH_AUTOSUGGEST_MANUAL_REBIND=1
+typeset -g __ZTHEME_TERM_ENTER="${__ZTHEME_TERM_ENTER:-}"
+typeset -g __ZTHEME_TERM_LEAVE="${__ZTHEME_TERM_LEAVE:-}"
+typeset -g __ZTHEME_FOCUS_ENTER=""
+typeset -g __ZTHEME_FOCUS_LEAVE=""
+
+if [[ "${ZTHEME_FOCUS_REPORTING:-1}" != 0 &&
+      "${TERM:-dumb}" != dumb ]]
+then
+    __ZTHEME_FOCUS_ENTER=$'\e[?1004h\e[?25h'
+    __ZTHEME_FOCUS_LEAVE=$'\e[?1004l\e[?25h'
+fi
 
 @ZTHEME_SHELL_DEFAULTS@
 
@@ -301,7 +312,15 @@ _ztheme_chpwd() {
 }
 
 _ztheme_zshexit() {
+    emulate -L zsh
+
     _ztheme_close_worker
+    if [[ -o interactive &&
+          -n "$__ZTHEME_TERM_LEAVE$__ZTHEME_FOCUS_LEAVE" ]]
+    then
+        builtin printf '%s%s' \
+            "$__ZTHEME_TERM_LEAVE" "$__ZTHEME_FOCUS_LEAVE"
+    fi
 }
 
 # ---------------------------------------------------------------------------
@@ -350,7 +369,7 @@ ztheme() {
 }
 
 # ---------------------------------------------------------------------------
-# Ghostty focus integration
+# Terminal state
 # ---------------------------------------------------------------------------
 
 _ztheme_focus_in() {
@@ -369,12 +388,14 @@ _ztheme_focus_out() {
 
 _ztheme_zle_line_init() {
     emulate -L zsh
-    builtin printf '\e[?1004h\e[?25h'
+    builtin printf '%s%s' \
+        "$__ZTHEME_TERM_ENTER" "$__ZTHEME_FOCUS_ENTER"
 }
 
 _ztheme_zle_line_finish() {
     emulate -L zsh
-    builtin printf '\e[?1004l\e[?25h'
+    builtin printf '%s%s' \
+        "$__ZTHEME_TERM_LEAVE" "$__ZTHEME_FOCUS_LEAVE"
 }
 
 # ---------------------------------------------------------------------------
@@ -398,15 +419,30 @@ do
 done
 unset hook_spec hook function
 
-builtin zle -N _ztheme_focus_in
-builtin zle -N _ztheme_focus_out
-bindkey $'\e[I' _ztheme_focus_in
-bindkey $'\e[O' _ztheme_focus_out
+if [[ -n "$__ZTHEME_FOCUS_ENTER" &&
+      ! ${ZTHEME_FOCUS_BINDINGS_INITIALIZED:-0} -eq 1 ]]
+then
+    typeset -gi ZTHEME_FOCUS_BINDINGS_INITIALIZED=1
+    builtin zle -N _ztheme_focus_in
+    builtin zle -N _ztheme_focus_out
+
+    local ztheme_focus_keymap
+    for ztheme_focus_keymap in emacs viins vicmd; do
+        builtin bindkey -M "$ztheme_focus_keymap" \
+            $'\e[I' _ztheme_focus_in \
+            $'\e[O' _ztheme_focus_out
+    done
+    unset ztheme_focus_keymap
+fi
 
 add-zle-hook-widget -D line-init _ztheme_zle_line_init 2>/dev/null
-add-zle-hook-widget line-init _ztheme_zle_line_init
 add-zle-hook-widget -D line-finish _ztheme_zle_line_finish 2>/dev/null
-add-zle-hook-widget line-finish _ztheme_zle_line_finish
+if [[ -n "$__ZTHEME_TERM_ENTER$__ZTHEME_FOCUS_ENTER" ]]; then
+    add-zle-hook-widget line-init _ztheme_zle_line_init
+fi
+if [[ -n "$__ZTHEME_TERM_LEAVE$__ZTHEME_FOCUS_LEAVE" ]]; then
+    add-zle-hook-widget line-finish _ztheme_zle_line_finish
+fi
 
 PROMPT='${ZTHEME_PROMPT}'
 RPROMPT='${ZTHEME_RPROMPT}'
