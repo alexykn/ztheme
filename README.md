@@ -7,6 +7,18 @@ into the active prompt.
 It has one user-local daemon, no Git writes or implicit fetches, and a typed
 theme format without plugins or an interpreted template language.
 
+<p align="center">
+  <img src="img/image-two.png" alt="Default ztheme prompt with Git status, Rust version, and syntax highlighting">
+  <br>
+  <sub>Default theme with asynchronous Git and runtime context.</sub>
+</p>
+
+<p align="center">
+  <img src="img/image-one.png" alt="Vesper ztheme prompt with syntax highlighting">
+  <br>
+  <sub>Vesper theme with a two-line prompt and themed command input.</sub>
+</p>
+
 Build and install:
 
 ```console
@@ -46,6 +58,10 @@ ztheme theme edit vesper
 ztheme theme apply vesper
 ztheme theme reload
 ```
+
+<p align="center">
+  <img src="img/image-big.png" alt="ztheme theme list showing palettes, layouts, symbols, and prompt previews" width="900">
+</p>
 
 `theme list` always shows the embedded default first, followed by custom themes
 from `${XDG_CONFIG_HOME:-$HOME/.config}/ztheme/themes`. It renders each theme's
