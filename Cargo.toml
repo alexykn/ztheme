@@ -11,6 +11,7 @@ keywords = ["zsh", "prompt", "terminal", "shell", "theme"]
 categories = ["command-line-interface", "command-line-utilities"]
 
 [dependencies]
+clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 shell-words = "1.1"
 tokio = { version = "1", features = ["io-util", "macros", "net", "process", "rt", "sync", "time"] }

@@ -1,14 +1,124 @@
-use std::env;
-use std::io::{self, Write};
+use std::io::{self, Write as _};
 use std::path::PathBuf;
 
+use clap::{Args, CommandFactory as _, Parser, Subcommand, error::ErrorKind};
 use tokio::runtime::Builder;
 
 use crate::{daemon, prompt, setup, theme};
 
+#[derive(Parser)]
+#[command(name = "ztheme", version, about = "Fast asynchronous Zsh prompt")]
+struct Cli {
+    #[command(subcommand)]
+    command: Option<Command>,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    /// Generate shell initialization code.
+    Init(InitArgs),
+    /// Install or repair prompt helpers.
+    Setup(SetupArgs),
+    /// List, edit, apply, or reload themes.
+    Theme(ThemeArgs),
+    /// Clear cached runtime values and reset Git status.
+    Clear(InstanceArgs),
+
+    #[command(name = "__daemon", hide = true)]
+    Daemon(InstanceArgs),
+
+    #[command(name = "__snapshot", hide = true)]
+    Snapshot(SnapshotArgs),
+
+    #[command(name = "__theme-apply-zsh", hide = true)]
+    ThemeApplyZsh(InternalThemeArgs),
+
+    #[command(name = "__theme-reload-zsh", hide = true)]
+    ThemeReloadZsh(InternalThemeArgs),
+}
+
+#[derive(Args)]
+struct InitArgs {
+    #[command(subcommand)]
+    shell: InitCommand,
+}
+
+#[derive(Subcommand)]
+enum InitCommand {
+    /// Generate Zsh initialization code.
+    Zsh(InitZshArgs),
+}
+
+#[derive(Args)]
+struct InitZshArgs {
+    #[arg(long, value_name = "THEME")]
+    theme: Option<String>,
+
+    #[command(flatten)]
+    instance: InstanceArgs,
+}
+
+#[derive(Args)]
+struct SetupArgs {
+    #[arg(long)]
+    yes: bool,
+}
+
+#[derive(Args)]
+struct ThemeArgs {
+    #[command(subcommand)]
+    command: ThemeCommand,
+}
+
+#[derive(Subcommand)]
+enum ThemeCommand {
+    /// Preview available themes.
+    List,
+    /// Open a theme in the configured editor.
+    Edit(ThemeSelector),
+    /// Select a theme for future shells.
+    Apply(ThemeSelector),
+    /// Reload the selected theme through the active shell wrapper.
+    Reload,
+}
+
+#[derive(Args)]
+struct ThemeSelector {
+    #[arg(value_name = "THEME")]
+    selector: String,
+}
+
+#[derive(Args, Default)]
+struct InstanceArgs {
+    #[arg(long, value_name = "NAME")]
+    dev: Option<String>,
+}
+
+#[derive(Args)]
+struct SnapshotArgs {
+    #[arg(long)]
+    generation: u64,
+
+    #[arg(long, value_name = "PATH")]
+    cwd: PathBuf,
+
+    #[arg(long, value_name = "HEX")]
+    theme: String,
+
+    #[command(flatten)]
+    instance: InstanceArgs,
+}
+
+#[derive(Args)]
+struct InternalThemeArgs {
+    #[arg(long, value_name = "THEME")]
+    theme: String,
+
+    #[command(flatten)]
+    instance: InstanceArgs,
+}
+
 enum Request {
-    Help,
-    Version,
     InitZsh {
         instance: daemon::Instance,
         theme: Option<String>,
@@ -43,8 +153,21 @@ enum Request {
     },
 }
 
-pub fn run() {
-    let request = match arguments() {
+pub(crate) fn run() {
+    let cli = match Cli::try_parse() {
+        Ok(cli) => cli,
+        Err(error) => {
+            print_parser_result(&error);
+            return;
+        }
+    };
+    let Some(command) = cli.command else {
+        let mut help = Cli::command().render_long_help().to_string();
+        help.push('\n');
+        finish(write_stdout(&help));
+        return;
+    };
+    let request = match request(command) {
         Ok(request) => request,
         Err(message) => {
             eprintln!("ztheme: {message}\nTry `ztheme --help` for usage.");
@@ -53,8 +176,6 @@ pub fn run() {
     };
 
     let result = match request {
-        Request::Help => write_stdout(help()),
-        Request::Version => write_stdout(concat!("ztheme ", env!("CARGO_PKG_VERSION"), "\n")),
         Request::InitZsh { instance, theme } => {
             prompt::init_zsh(&instance, theme.as_deref()).and_then(|script| write_stdout(&script))
         }
@@ -65,7 +186,8 @@ pub fn run() {
         }
         Request::ThemeApply { selector } => theme::apply(&selector).and_then(|path| {
             write_stdout(&format!(
-                "Saved the theme selection to {}.\nThe current shell was not changed because the ztheme shell wrapper was bypassed.\n",
+                "Saved the theme selection to {}.\n\
+                 The current shell was not changed because the ztheme shell wrapper was bypassed.\n",
                 path.display()
             ))
         }),
@@ -87,212 +209,95 @@ pub fn run() {
         } => run_async(prompt::snapshot(generation, cwd, instance, theme)),
         Request::Daemon { instance } => run_async(daemon::serve(&instance)),
     };
+    finish(result);
+}
 
+fn request(command: Command) -> Result<Request, &'static str> {
+    match command {
+        Command::Init(InitArgs {
+            shell: InitCommand::Zsh(arguments),
+        }) => Ok(Request::InitZsh {
+            instance: instance(arguments.instance)?,
+            theme: arguments.theme,
+        }),
+        Command::Setup(arguments) => Ok(Request::Setup {
+            assume_yes: arguments.yes,
+        }),
+        Command::Theme(ThemeArgs { command }) => match command {
+            ThemeCommand::List => Ok(Request::ThemeList),
+            ThemeCommand::Edit(arguments) => Ok(Request::ThemeEdit {
+                selector: arguments.selector,
+            }),
+            ThemeCommand::Apply(arguments) => Ok(Request::ThemeApply {
+                selector: arguments.selector,
+            }),
+            ThemeCommand::Reload => Ok(Request::ThemeReload),
+        },
+        Command::Clear(arguments) => Ok(Request::Clear {
+            instance: instance(arguments)?,
+        }),
+        Command::Daemon(arguments) => Ok(Request::Daemon {
+            instance: instance(arguments)?,
+        }),
+        Command::Snapshot(arguments) => {
+            if !arguments.cwd.is_absolute() || !arguments.cwd.is_dir() {
+                return Err("cwd must be an existing absolute directory");
+            }
+            let theme = theme::AsyncTheme::decode_hex(&arguments.theme)
+                .map_err(|_| "invalid compiled theme")?;
+            Ok(Request::Snapshot {
+                generation: arguments.generation,
+                cwd: arguments.cwd,
+                instance: instance(arguments.instance)?,
+                theme: Box::new(theme),
+            })
+        }
+        Command::ThemeApplyZsh(arguments) => Ok(Request::ThemeZsh {
+            instance: instance(arguments.instance)?,
+            selector: arguments.theme,
+            persist: true,
+        }),
+        Command::ThemeReloadZsh(arguments) => Ok(Request::ThemeZsh {
+            instance: instance(arguments.instance)?,
+            selector: arguments.theme,
+            persist: false,
+        }),
+    }
+}
+
+fn instance(arguments: InstanceArgs) -> Result<daemon::Instance, &'static str> {
+    arguments
+        .dev
+        .map_or(Ok(daemon::Instance::Production), |name| {
+            daemon::Instance::development(name)
+        })
+}
+
+fn print_parser_result(error: &clap::Error) {
+    let code = error.exit_code();
+    if matches!(
+        error.kind(),
+        ErrorKind::DisplayHelp | ErrorKind::DisplayVersion
+    ) {
+        if let Err(write_error) = write_stdout(&error.to_string())
+            && write_error.kind() != io::ErrorKind::BrokenPipe
+        {
+            eprintln!("ztheme: {write_error}");
+            std::process::exit(1);
+        }
+        return;
+    }
+    eprint!("{error}");
+    std::process::exit(code);
+}
+
+fn finish(result: io::Result<()>) {
     if let Err(error) = result
         && error.kind() != io::ErrorKind::BrokenPipe
     {
         eprintln!("ztheme: {error}");
         std::process::exit(1);
     }
-}
-
-fn arguments() -> Result<Request, &'static str> {
-    let mut arguments = env::args_os();
-    let _program = arguments.next();
-    let Some(command) = arguments.next() else {
-        return Ok(Request::Help);
-    };
-
-    if command == "--help" || command == "-h" || command == "help" {
-        return no_more(arguments, Request::Help);
-    }
-    if command == "--version" || command == "-V" {
-        return no_more(arguments, Request::Version);
-    }
-    if command == "init" {
-        if arguments.next().as_deref() != Some(std::ffi::OsStr::new("zsh")) {
-            return Err("expected `ztheme init zsh`");
-        }
-        let (instance, theme) = init_arguments(arguments)?;
-        return Ok(Request::InitZsh { instance, theme });
-    }
-    if command == "setup" {
-        let assume_yes = match arguments.next() {
-            None => false,
-            Some(argument) if argument == "--yes" => true,
-            Some(_) => return Err("expected `ztheme setup [--yes]`"),
-        };
-        return no_more(arguments, Request::Setup { assume_yes });
-    }
-    if command == "theme" {
-        return theme_arguments(arguments);
-    }
-    if command == "clear" {
-        let instance = instance_argument(arguments)?;
-        return Ok(Request::Clear { instance });
-    }
-    if command == "__daemon" {
-        let instance = instance_argument(arguments)?;
-        return Ok(Request::Daemon { instance });
-    }
-    if command == "__theme-apply-zsh" || command == "__theme-reload-zsh" {
-        let persist = command == "__theme-apply-zsh";
-        let (selector, instance) = theme_zsh_arguments(arguments)?;
-        return Ok(Request::ThemeZsh {
-            instance,
-            selector,
-            persist,
-        });
-    }
-    if command != "__snapshot" {
-        return Err("unknown command");
-    }
-
-    if arguments.next().as_deref() != Some(std::ffi::OsStr::new("--generation")) {
-        return Err("missing --generation");
-    }
-    let generation = arguments
-        .next()
-        .and_then(|value| value.into_string().ok())
-        .and_then(|value| value.parse().ok())
-        .ok_or("invalid generation")?;
-
-    if arguments.next().as_deref() != Some(std::ffi::OsStr::new("--cwd")) {
-        return Err("missing --cwd");
-    }
-    let cwd = arguments.next().map(PathBuf::from).ok_or("missing cwd")?;
-    if !cwd.is_absolute() || !cwd.is_dir() {
-        return Err("cwd must be an existing absolute directory");
-    }
-    if arguments.next().as_deref() != Some(std::ffi::OsStr::new("--theme")) {
-        return Err("missing --theme");
-    }
-    let theme = arguments
-        .next()
-        .and_then(|value| value.into_string().ok())
-        .ok_or("missing or non-UTF-8 compiled theme")
-        .and_then(|value| {
-            theme::AsyncTheme::decode_hex(&value).map_err(|_| "invalid compiled theme")
-        })
-        .map(Box::new)?;
-    let instance = instance_argument(arguments)?;
-
-    Ok(Request::Snapshot {
-        generation,
-        cwd,
-        instance,
-        theme,
-    })
-}
-
-fn theme_arguments(
-    mut arguments: impl Iterator<Item = std::ffi::OsString>,
-) -> Result<Request, &'static str> {
-    let Some(command) = arguments.next() else {
-        return Err("expected `ztheme theme list|edit|apply|reload`");
-    };
-    if command == "list" {
-        return no_more(arguments, Request::ThemeList);
-    }
-    if command == "reload" {
-        return no_more(arguments, Request::ThemeReload);
-    }
-    if command != "edit" && command != "apply" {
-        return Err("expected `ztheme theme list|edit|apply|reload`");
-    }
-    let selector = arguments
-        .next()
-        .and_then(|value| value.into_string().ok())
-        .ok_or("missing or non-UTF-8 theme selector")?;
-    if arguments.next().is_some() {
-        return Err("unexpected argument");
-    }
-    if command == "edit" {
-        return Ok(Request::ThemeEdit { selector });
-    }
-    Ok(Request::ThemeApply { selector })
-}
-
-fn theme_zsh_arguments(
-    mut arguments: impl Iterator<Item = std::ffi::OsString>,
-) -> Result<(String, daemon::Instance), &'static str> {
-    if arguments.next().as_deref() != Some(std::ffi::OsStr::new("--theme")) {
-        return Err("missing --theme");
-    }
-    let selector = arguments
-        .next()
-        .and_then(|value| value.into_string().ok())
-        .ok_or("missing or non-UTF-8 theme selector")?;
-    let instance = instance_argument(arguments)?;
-    Ok((selector, instance))
-}
-
-fn init_arguments(
-    mut arguments: impl Iterator<Item = std::ffi::OsString>,
-) -> Result<(daemon::Instance, Option<String>), &'static str> {
-    let mut development = None;
-    let mut theme = None;
-    while let Some(argument) = arguments.next() {
-        if argument == "--dev" {
-            if development.is_some() {
-                return Err("--dev may only be specified once");
-            }
-            development = Some(
-                arguments
-                    .next()
-                    .and_then(|value| value.into_string().ok())
-                    .ok_or("missing or non-UTF-8 development instance name")?,
-            );
-            continue;
-        }
-        if argument == "--theme" {
-            if theme.is_some() {
-                return Err("--theme may only be specified once");
-            }
-            theme = Some(
-                arguments
-                    .next()
-                    .and_then(|value| value.into_string().ok())
-                    .ok_or("missing or non-UTF-8 theme selector")?,
-            );
-            continue;
-        }
-        return Err("expected `--dev NAME` or `--theme THEME`");
-    }
-    let instance = match development {
-        Some(name) => daemon::Instance::development(name)?,
-        None => daemon::Instance::Production,
-    };
-    Ok((instance, theme))
-}
-
-fn instance_argument(
-    mut arguments: impl Iterator<Item = std::ffi::OsString>,
-) -> Result<daemon::Instance, &'static str> {
-    let Some(argument) = arguments.next() else {
-        return Ok(daemon::Instance::Production);
-    };
-    if argument != "--dev" {
-        return Err("expected `--dev NAME`");
-    }
-    let name = arguments
-        .next()
-        .and_then(|value| value.into_string().ok())
-        .ok_or("missing or non-UTF-8 development instance name")?;
-    if arguments.next().is_some() {
-        return Err("unexpected argument");
-    }
-    daemon::Instance::development(name)
-}
-
-fn no_more(
-    mut arguments: impl Iterator<Item = std::ffi::OsString>,
-    request: Request,
-) -> Result<Request, &'static str> {
-    if arguments.next().is_some() {
-        return Err("unexpected argument");
-    }
-    Ok(request)
 }
 
 fn write_stdout(value: &str) -> io::Result<()> {
@@ -309,21 +314,98 @@ fn run_async(future: impl Future<Output = io::Result<()>>) -> io::Result<()> {
         .block_on(future)
 }
 
-const fn help() -> &'static str {
-    "Fast asynchronous Zsh prompt
+#[cfg(test)]
+mod tests {
+    use clap::{CommandFactory as _, Parser as _};
 
-Usage:
-  ztheme init zsh [--theme THEME] [--dev NAME]
-  ztheme theme list
-  ztheme theme edit THEME
-  ztheme theme apply THEME
-  ztheme theme reload
-  ztheme setup [--yes]
-  ztheme clear [--dev NAME]
-  ztheme --help
-  ztheme --version
+    use super::{Cli, Command, InitCommand, ThemeCommand};
 
-Install the shell integration with:
-  eval \"$(ztheme init zsh)\"
-"
+    #[test]
+    fn public_and_internal_commands_parse() {
+        let cases = [
+            vec![
+                "ztheme", "init", "zsh", "--theme", "vesper", "--dev", "test",
+            ],
+            vec!["ztheme", "setup", "--yes"],
+            vec!["ztheme", "theme", "list"],
+            vec!["ztheme", "theme", "edit", "vesper"],
+            vec!["ztheme", "theme", "apply", "vesper"],
+            vec!["ztheme", "theme", "reload"],
+            vec!["ztheme", "clear", "--dev", "test"],
+            vec!["ztheme", "__daemon", "--dev", "test"],
+            vec![
+                "ztheme",
+                "__snapshot",
+                "--generation",
+                "4",
+                "--cwd",
+                "/",
+                "--theme",
+                "0000",
+                "--dev",
+                "test",
+            ],
+            vec![
+                "ztheme",
+                "__theme-apply-zsh",
+                "--theme",
+                "vesper",
+                "--dev",
+                "test",
+            ],
+            vec![
+                "ztheme",
+                "__theme-reload-zsh",
+                "--theme",
+                "vesper",
+                "--dev",
+                "test",
+            ],
+        ];
+
+        for arguments in cases {
+            assert!(Cli::try_parse_from(&arguments).is_ok(), "{arguments:?}");
+        }
+    }
+
+    #[test]
+    fn command_shapes_are_nested_as_expected() {
+        let cli = Cli::try_parse_from(["ztheme", "init", "zsh"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Init(super::InitArgs {
+                shell: InitCommand::Zsh(_)
+            }))
+        ));
+        let cli = Cli::try_parse_from(["ztheme", "theme", "reload"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Theme(super::ThemeArgs {
+                command: ThemeCommand::Reload
+            }))
+        ));
+    }
+
+    #[test]
+    fn invalid_commands_and_duplicate_flags_are_rejected() {
+        for arguments in [
+            &["ztheme", "unknown"][..],
+            &["ztheme", "theme", "unknown"],
+            &["ztheme", "clear", "--dev"],
+            &["ztheme", "clear", "--dev", "one", "--dev", "two"],
+            &["ztheme", "__snapshot", "--generation", "x"],
+        ] {
+            assert!(Cli::try_parse_from(arguments).is_err(), "{arguments:?}");
+        }
+    }
+
+    #[test]
+    fn internal_commands_are_hidden_from_public_help() {
+        let help = Cli::command().render_long_help().to_string();
+        assert!(help.contains("init"));
+        assert!(help.contains("theme"));
+        assert!(!help.contains("__daemon"));
+        assert!(!help.contains("__snapshot"));
+        assert!(!help.contains("__theme-apply-zsh"));
+    }
 }

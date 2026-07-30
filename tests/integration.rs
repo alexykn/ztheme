@@ -267,11 +267,22 @@ fn cli_help_version_and_invalid_arguments_have_stable_exit_classes() {
 
     let help = sandbox.command().arg("--help").output().unwrap();
     assert_success(&help);
-    assert!(String::from_utf8_lossy(&help.stdout).contains("ztheme init zsh"));
+    let help = String::from_utf8_lossy(&help.stdout);
+    assert!(help.contains("Usage: ztheme [COMMAND]"));
+    assert!(help.contains("Commands:"));
+    assert!(!help.contains("__daemon"));
+
+    let no_command = sandbox.command().output().unwrap();
+    assert_success(&no_command);
+    assert!(String::from_utf8_lossy(&no_command.stdout).contains("Usage: ztheme [COMMAND]"));
+
+    let help_command = sandbox.command().arg("help").output().unwrap();
+    assert_success(&help_command);
+    assert!(String::from_utf8_lossy(&help_command.stdout).contains("Commands:"));
 
     let invalid = sandbox.command().arg("unknown").output().unwrap();
     assert_eq!(invalid.status.code(), Some(2));
-    assert!(String::from_utf8_lossy(&invalid.stderr).contains("unknown command"));
+    assert!(String::from_utf8_lossy(&invalid.stderr).contains("unrecognized subcommand"));
 }
 
 #[test]
