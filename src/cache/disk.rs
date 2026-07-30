@@ -61,8 +61,8 @@ pub fn save(path: &Path, entries: &HashMap<CacheKey, Entry>) -> io::Result<()> {
     result
 }
 
-pub fn clear_all() -> io::Result<()> {
-    let Some(path) = super::cache_path() else {
+pub fn clear_all(path: Option<&Path>) -> io::Result<()> {
+    let Some(path) = path else {
         return Ok(());
     };
     let Some(directory) = path.parent() else {
