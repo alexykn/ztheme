@@ -4,13 +4,13 @@ use std::path::PathBuf;
 
 use tokio::runtime::Builder;
 
-use crate::{cache, prompt, setup, theme};
+use crate::{daemon, prompt, setup, theme};
 
 enum Request {
     Help,
     Version,
     InitZsh {
-        instance: cache::Instance,
+        instance: daemon::Instance,
         theme: Option<String>,
     },
     Setup {
@@ -25,21 +25,21 @@ enum Request {
     },
     ThemeReload,
     ThemeZsh {
-        instance: cache::Instance,
+        instance: daemon::Instance,
         selector: String,
         persist: bool,
     },
     Clear {
-        instance: cache::Instance,
+        instance: daemon::Instance,
     },
     Snapshot {
         generation: u64,
         cwd: PathBuf,
-        instance: cache::Instance,
+        instance: daemon::Instance,
         theme: Box<theme::AsyncTheme>,
     },
     Daemon {
-        instance: cache::Instance,
+        instance: daemon::Instance,
     },
 }
 
@@ -78,14 +78,14 @@ pub fn run() {
             persist,
         } => prompt::theme_zsh(&instance, &selector, persist)
             .and_then(|script| write_stdout(&script)),
-        Request::Clear { instance } => run_async(cache::clear(&instance)),
+        Request::Clear { instance } => run_async(daemon::reset(&instance)),
         Request::Snapshot {
             generation,
             cwd,
             instance,
             theme,
         } => run_async(prompt::snapshot(generation, cwd, instance, theme)),
-        Request::Daemon { instance } => run_async(cache::serve(&instance)),
+        Request::Daemon { instance } => run_async(daemon::serve(&instance)),
     };
 
     if let Err(error) = result
@@ -215,7 +215,7 @@ fn theme_arguments(
 
 fn theme_zsh_arguments(
     mut arguments: impl Iterator<Item = std::ffi::OsString>,
-) -> Result<(String, cache::Instance), &'static str> {
+) -> Result<(String, daemon::Instance), &'static str> {
     if arguments.next().as_deref() != Some(std::ffi::OsStr::new("--theme")) {
         return Err("missing --theme");
     }
@@ -229,7 +229,7 @@ fn theme_zsh_arguments(
 
 fn init_arguments(
     mut arguments: impl Iterator<Item = std::ffi::OsString>,
-) -> Result<(cache::Instance, Option<String>), &'static str> {
+) -> Result<(daemon::Instance, Option<String>), &'static str> {
     let mut development = None;
     let mut theme = None;
     while let Some(argument) = arguments.next() {
@@ -260,17 +260,17 @@ fn init_arguments(
         return Err("expected `--dev NAME` or `--theme THEME`");
     }
     let instance = match development {
-        Some(name) => cache::Instance::development(name)?,
-        None => cache::Instance::Production,
+        Some(name) => daemon::Instance::development(name)?,
+        None => daemon::Instance::Production,
     };
     Ok((instance, theme))
 }
 
 fn instance_argument(
     mut arguments: impl Iterator<Item = std::ffi::OsString>,
-) -> Result<cache::Instance, &'static str> {
+) -> Result<daemon::Instance, &'static str> {
     let Some(argument) = arguments.next() else {
-        return Ok(cache::Instance::Production);
+        return Ok(daemon::Instance::Production);
     };
     if argument != "--dev" {
         return Err("expected `--dev NAME`");
@@ -282,7 +282,7 @@ fn instance_argument(
     if arguments.next().is_some() {
         return Err("unexpected argument");
     }
-    cache::Instance::development(name)
+    daemon::Instance::development(name)
 }
 
 fn no_more(

@@ -9,7 +9,7 @@ use tokio::task::JoinSet;
 use tokio::time::{Instant, timeout_at};
 
 use crate::runtime::{self, Runtime, RuntimeValue};
-use crate::{cache, gitstatus, setup, theme};
+use crate::{daemon, gitstatus, setup, theme};
 
 pub(crate) use protocol::prompt_text;
 
@@ -20,7 +20,7 @@ const ZSH_INTEGRATION: &str = include_str!("../../shell/ztheme.zsh");
 pub async fn snapshot(
     generation: u64,
     cwd: PathBuf,
-    instance: cache::Instance,
+    instance: daemon::Instance,
     theme: Box<theme::AsyncTheme>,
 ) -> io::Result<()> {
     let git_enabled = theme.git_enabled();
@@ -32,7 +32,7 @@ pub async fn snapshot(
         let git_cwd = cwd.clone();
         tasks.spawn(async move {
             let result = match gitstatus::Query::from_environment(&git_cwd) {
-                Ok(query) => cache::git(&git_instance, &query).await,
+                Ok(query) => daemon::git_status(&git_instance, &query).await,
                 Err(error) => Err(error),
             };
             SnapshotResult::Git(result)
@@ -95,7 +95,7 @@ pub async fn snapshot(
     protocol::write_done(&mut output, generation)
 }
 
-pub fn init_zsh(instance: &cache::Instance, selector: Option<&str>) -> io::Result<String> {
+pub fn init_zsh(instance: &daemon::Instance, selector: Option<&str>) -> io::Result<String> {
     let theme = theme::CompiledTheme::load(selector)?;
     let theme_zsh = theme.zsh()?;
     if !gitstatus::ensure_installed(false)? {
@@ -123,7 +123,7 @@ pub fn init_zsh(instance: &cache::Instance, selector: Option<&str>) -> io::Resul
         .replace("@ZTHEME_COMPILED_THEME@", &theme_zsh))
 }
 
-pub fn theme_zsh(instance: &cache::Instance, selector: &str, persist: bool) -> io::Result<String> {
+pub fn theme_zsh(instance: &daemon::Instance, selector: &str, persist: bool) -> io::Result<String> {
     let script = init_zsh(instance, Some(selector))?;
     if persist {
         theme::persist(selector)?;
@@ -137,7 +137,7 @@ enum SnapshotResult {
 }
 
 async fn runtime_values(
-    instance: &cache::Instance,
+    instance: &daemon::Instance,
     cwd: PathBuf,
     active: Vec<Runtime>,
 ) -> io::Result<Vec<RuntimeValue>> {
@@ -149,24 +149,18 @@ async fn runtime_values(
         .collect::<Vec<_>>();
     let key = runtime::cache_key(&project, &detected);
 
-    match cache::get(instance, key).await {
+    match daemon::runtime_cache_get(instance, key).await {
         Ok(Some(value)) => match runtime::decode(&value) {
             Ok(values) => return Ok(values),
             Err(error) => eprintln!("ztheme: invalid runtime cache entry: {error}"),
         },
         Ok(None) => {}
-        Err(error) => {
-            if let Err(start_error) = cache::spawn_daemon(instance) {
-                eprintln!("ztheme: runtime cache daemon failed to start: {start_error}");
-            } else {
-                eprintln!("ztheme: runtime cache unavailable: {error}");
-            }
-        }
+        Err(error) => eprintln!("ztheme: runtime cache unavailable: {error}"),
     }
 
     let values = runtime::snapshot(project, detected).await;
     let encoded = runtime::encode(&values)?;
-    if let Err(error) = cache::put(instance, key, &encoded).await {
+    if let Err(error) = daemon::runtime_cache_put(instance, key, &encoded).await {
         eprintln!("ztheme: runtime cache write failed: {error}");
     }
     Ok(values)

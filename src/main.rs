@@ -1,5 +1,6 @@
 mod cache;
 mod cli;
+mod daemon;
 mod gitstatus;
 mod prompt;
 mod runtime;

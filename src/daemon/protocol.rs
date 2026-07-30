@@ -8,14 +8,14 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
 use tokio::time::timeout;
 
-use super::{CacheKey, MAX_VALUE_BYTES};
+use crate::cache::{CacheKey, MAX_VALUE_BYTES, validate_value};
 use crate::gitstatus::{Query, Snapshot};
 
 pub const VERSION: u16 = 1;
-pub const GET: u8 = 1;
-pub const PUT: u8 = 2;
-pub const CLEAR: u8 = 4;
-pub const GIT: u8 = 5;
+pub const RUNTIME_CACHE_GET: u8 = 1;
+pub const RUNTIME_CACHE_PUT: u8 = 2;
+pub const RESET: u8 = 4;
+pub const GIT_STATUS: u8 = 5;
 pub const MISS: u8 = 0;
 pub const HIT: u8 = 1;
 pub const OK: u8 = 2;
@@ -56,9 +56,9 @@ impl From<io::Error> for Error {
     }
 }
 
-pub async fn get(socket: &Path, key: CacheKey) -> Result<Option<Vec<u8>>> {
+pub async fn runtime_cache_get(socket: &Path, key: CacheKey) -> Result<Option<Vec<u8>>> {
     exchange(socket, async |stream| {
-        write_request(stream, GET, Some(key)).await?;
+        write_request(stream, RUNTIME_CACHE_GET, Some(key)).await?;
         match read_response(stream).await? {
             MISS => Ok(None),
             HIT => {
@@ -69,7 +69,7 @@ pub async fn get(socket: &Path, key: CacheKey) -> Result<Option<Vec<u8>>> {
                 }
                 let mut bytes = vec![0; length];
                 stream.read_exact(&mut bytes).await?;
-                super::validate_value(&bytes)?;
+                validate_value(&bytes)?;
                 Ok(Some(bytes))
             }
             _ => Err(invalid_data("invalid cache response").into()),
@@ -78,9 +78,9 @@ pub async fn get(socket: &Path, key: CacheKey) -> Result<Option<Vec<u8>>> {
     .await
 }
 
-pub async fn put(socket: &Path, key: CacheKey, value: &[u8]) -> Result<()> {
+pub async fn runtime_cache_put(socket: &Path, key: CacheKey, value: &[u8]) -> Result<()> {
     exchange(socket, async |stream| {
-        write_request(stream, PUT, Some(key)).await?;
+        write_request(stream, RUNTIME_CACHE_PUT, Some(key)).await?;
         stream.write_u32(u32_len(value)?).await?;
         stream.write_all(value).await?;
         expect_ok(stream).await
@@ -88,17 +88,17 @@ pub async fn put(socket: &Path, key: CacheKey, value: &[u8]) -> Result<()> {
     .await
 }
 
-pub async fn clear(socket: &Path) -> Result<()> {
+pub async fn reset(socket: &Path) -> Result<()> {
     exchange(socket, async |stream| {
-        write_request(stream, CLEAR, None).await?;
+        write_request(stream, RESET, None).await?;
         expect_ok(stream).await
     })
     .await
 }
 
-pub async fn git(socket: &Path, query: &Query) -> Result<Option<Snapshot>> {
+pub async fn git_status(socket: &Path, query: &Query) -> Result<Option<Snapshot>> {
     exchange_with_timeout(socket, GIT_TIMEOUT, async |stream| {
-        write_request(stream, GIT, None).await?;
+        write_request(stream, GIT_STATUS, None).await?;
         write_query(stream, query).await?;
         match read_response(stream).await? {
             GIT_NONE => Ok(None),
@@ -117,7 +117,7 @@ pub async fn read_header(stream: &mut UnixStream) -> io::Result<RequestHeader> {
     let mut magic = [0; MAGIC.len()];
     stream.read_exact(&mut magic).await?;
     if magic != MAGIC {
-        return Err(invalid_data("invalid cache protocol"));
+        return Err(invalid_data("invalid daemon protocol"));
     }
     match stream.read_u16().await?.cmp(&VERSION) {
         std::cmp::Ordering::Less => Ok(RequestHeader::ClientOutdated),
@@ -149,7 +149,7 @@ pub async fn read_value(stream: &mut UnixStream) -> io::Result<Vec<u8>> {
     }
     let mut bytes = vec![0; length];
     stream.read_exact(&mut bytes).await?;
-    super::validate_value(&bytes)?;
+    validate_value(&bytes)?;
     Ok(bytes)
 }
 
@@ -234,7 +234,7 @@ async fn expect_ok(stream: &mut UnixStream) -> Result<()> {
     if read_response(stream).await? == OK {
         return Ok(());
     }
-    Err(invalid_data("cache operation failed").into())
+    Err(invalid_data("daemon operation failed").into())
 }
 
 async fn read_response(stream: &mut UnixStream) -> Result<u8> {
