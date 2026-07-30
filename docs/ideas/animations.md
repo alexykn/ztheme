@@ -50,3 +50,13 @@ broken would have to play nicely with:
 
 It is doable, especially with AI nowadays. However, it is not clear to me that
 it's worth the effort.
+
+## Result of the experiment
+
+Instead of animating the late Git update, we now start the Git request first,
+start language detection right after it, and wait until the snapshot is done
+before replacing the prompt. While that happens, the previous complete prompt
+stays on screen. This removes the flicker without needing an animation system.
+
+It gives up the immediate first render, but the result feels much calmer and is
+good enough for now.

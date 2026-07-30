@@ -76,6 +76,8 @@ _ztheme_async_callback() {
     if ! IFS=$'\t' read -r -u "$fd" \
         protocol generation kind segment fragment; then
         _ztheme_close_worker
+        _ztheme_render_layout
+        builtin zle reset-prompt
         return
     fi
 
@@ -90,7 +92,7 @@ _ztheme_async_callback() {
             ZTHEME_LAST_ERROR=""
             _ztheme_assign_async_segment "$segment" "$fragment"
             case $? in
-                0) redraw=1 ;;
+                0) ;;
                 1) ;;
                 *)
                     _ztheme_close_worker
@@ -100,7 +102,6 @@ _ztheme_async_callback() {
             ;;
         error)
             _ztheme_clear_async_segments
-            redraw=1
             if [[ -n "$fragment" && "$fragment" != "$ZTHEME_LAST_ERROR" ]]; then
                 ZTHEME_LAST_ERROR="$fragment"
                 builtin zle -M "ztheme: $fragment"
@@ -108,6 +109,7 @@ _ztheme_async_callback() {
             ;;
         done)
             _ztheme_close_worker
+            redraw=1
             ;;
         *)
             _ztheme_close_worker
@@ -127,8 +129,9 @@ _ztheme_start_worker() {
 
     _ztheme_close_worker
     (( ++ZTHEME_GENERATION ))
-    (( __ZTHEME_HAS_ASYNC )) || return
-    [[ -x "$__ZTHEME_BIN" ]] || return
+    _ztheme_clear_async_segments
+    (( __ZTHEME_HAS_ASYNC )) || return 1
+    [[ -x "$__ZTHEME_BIN" ]] || return 1
 
     local -i generation=$ZTHEME_GENERATION
     local cwd="$PWD"
@@ -140,14 +143,16 @@ _ztheme_start_worker() {
             "${__ZTHEME_INSTANCE_ARGS[@]}" 2>/dev/null
     ); then
         ZTHEME_ASYNC_FD=-1
-        return 0
+        return 1
     fi
 
     if ! builtin zle -F "$ZTHEME_ASYNC_FD" \
         _ztheme_async_callback 2>/dev/null
     then
         _ztheme_close_worker
+        return 1
     fi
+    return 0
 }
 
 # ---------------------------------------------------------------------------
@@ -209,6 +214,9 @@ _ztheme_precmd() {
     emulate -L zsh
     setopt localoptions no_shwordsplit
 
+    local -i worker_started=0
+    _ztheme_start_worker && worker_started=1
+
     _ztheme_format_directory
     _ztheme_format_status "$last_status"
 
@@ -225,8 +233,9 @@ _ztheme_precmd() {
         ZTHEME_LAST_ERROR=""
     fi
 
-    _ztheme_render_layout
-    _ztheme_start_worker
+    if (( ! worker_started )); then
+        _ztheme_render_layout
+    fi
 }
 
 _ztheme_load_shell_plugins() {

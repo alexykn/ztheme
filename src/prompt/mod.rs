@@ -5,6 +5,7 @@ use std::io;
 use std::path::PathBuf;
 use std::time::Duration;
 
+use tokio::sync::oneshot;
 use tokio::task::JoinSet;
 use tokio::time::{Instant, timeout_at};
 
@@ -25,19 +26,30 @@ pub async fn snapshot(
 ) -> io::Result<()> {
     let git_enabled = theme.git_enabled();
     let active_runtimes = theme.runtimes();
+    let deadline = Instant::now() + HELPER_TIMEOUT;
     let mut tasks = JoinSet::new();
 
-    if git_enabled {
+    let git_started = if git_enabled {
+        let (started_tx, started_rx) = oneshot::channel();
         let git_instance = instance.clone();
         let git_cwd = cwd.clone();
         tasks.spawn(async move {
+            let _ = started_tx.send(());
             let result = match gitstatus::Query::from_environment(&git_cwd) {
                 Ok(query) => daemon::git_status(&git_instance, &query).await,
                 Err(error) => Err(error),
             };
             SnapshotResult::Git(result)
         });
+        Some(started_rx)
+    } else {
+        None
+    };
+
+    if let Some(started) = git_started {
+        let _ = timeout_at(deadline, started).await;
     }
+
     if !active_runtimes.is_empty() {
         let runtime_instance = instance.clone();
         let runtime_cwd = cwd.clone();
@@ -49,7 +61,6 @@ pub async fn snapshot(
         });
     }
 
-    let deadline = Instant::now() + HELPER_TIMEOUT;
     let mut output = io::stdout().lock();
     while !tasks.is_empty() {
         let Ok(Some(result)) = timeout_at(deadline, tasks.join_next()).await else {

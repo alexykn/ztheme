@@ -11,11 +11,17 @@ never leave prompt work attached to the shell. Runtime discovery and Git
 inspection, however, benefit from state that survives a single prompt render
 and can be shared by multiple shells.
 
-Zsh therefore renders the immediate directory, character, and status segments
-itself. For asynchronous segments it starts a short-lived `__snapshot` helper.
-The helper requests Git state and runtime values concurrently, streams each
-completed fragment back to Zsh, and exits after one shared deadline. The helper
-does not keep background state of its own.
+Zsh computes the immediate directory, character, and status segments itself.
+For asynchronous segments it starts a short-lived `__snapshot` helper before
+rendering the next prompt. The helper starts the Git request first, starts
+runtime detection immediately after that, and exits after one shared deadline.
+The helper does not keep background state of its own.
+
+The shell stores the incoming fragments but does not redraw the prompt for each
+one. It waits for the helper's final `done` record, then renders the complete
+prompt once. While a new snapshot is pending, the previous complete prompt
+stays visible; the first prompt remains empty until its snapshot is ready.
+This makes the update atomic without adding a second animation protocol.
 
 The daemon provides that shared background state. It hosts two independent
 long-lived capabilities:
@@ -33,29 +39,32 @@ values with the compiled theme.
 
 ```text
 Zsh precmd/chpwd
-├── render synchronous shell segments immediately
-└── start ztheme __snapshot
-    ├── Git task
-    │   └── daemon::git_status
-    │       └── persistent gitstatus::Client
-    │           └── gitstatusd
-    └── runtime task
-        ├── detect project and active runtimes
-        ├── daemon::runtime_cache_get
-        ├── on miss: execute runtime snapshots
-        └── daemon::runtime_cache_put
+├── start ztheme __snapshot
+│   ├── start Git task first
+│   │   └── daemon::git_status
+│   │       └── persistent gitstatus::Client
+│   │           └── gitstatusd
+│   └── start runtime task immediately after Git begins
+│       ├── detect project and active runtimes
+│       ├── daemon::runtime_cache_get
+│       ├── on miss: execute runtime snapshots
+│       └── daemon::runtime_cache_put
+├── compute synchronous shell segments while the helper runs
+└── keep the previous complete prompt visible
 
-completed task
-└── prompt protocol record
-    └── Zsh accepts it only for the current generation
+prompt protocol records
+└── Zsh stores current-generation fragments without redrawing
 
 shared 550 ms deadline
 ├── cancel unfinished helper tasks
 └── write final done record
+
+done record
+└── Zsh renders all collected segments and redraws once
 ```
 
-Git and runtime results may arrive in either order. Zsh can update a completed
-segment without waiting for the other task. Generation IDs prevent a slow
+Git and runtime records may still arrive in either order on the prompt
+protocol, but neither one is rendered by itself. Generation IDs prevent a slow
 helper for an old working directory from overwriting a newer prompt.
 
 ## Why a daemon
@@ -349,9 +358,10 @@ needs the result.
 
 `prompt/mod.rs` is the application-level coordinator. It:
 
-- starts Git and runtime work concurrently;
+- starts the Git task first and lets it begin its daemon request;
+- starts runtime detection immediately afterward;
 - applies one shared 550 ms deadline;
-- writes completed segments incrementally;
+- writes completed segments to the prompt stream;
 - cancels unfinished work;
 - always writes the final `done` record;
 - sanitizes errors before sending them to Zsh.
@@ -361,8 +371,10 @@ It does not manage daemon sockets, process startup, cache persistence, or the
 
 The 550 ms limit is one deadline shared by both jobs, not 550 ms per operation.
 Once it expires, the helper aborts unfinished Tokio tasks and writes `done`.
-Dropping an in-flight daemon request closes that helper's socket connection;
-the daemon remains independent and available to later prompts.
+The shell treats that record as the rendering barrier, so a slow or missing
+result cannot leave the prompt waiting forever. Dropping an in-flight daemon
+request closes that helper's socket connection; the daemon remains independent
+and available to later prompts.
 
 Runtime-cache failures are soft on the rendering path. A failed read falls
 back to executing the runtime snapshot, and a failed write does not discard
@@ -495,6 +507,12 @@ prompt text, while daemon messages carry structured data. Percent characters
 and control characters are escaped before dynamic text enters a prompt
 fragment. Error records replace tabs, newlines, and other controls and are
 bounded before output.
+
+Zsh accepts and stores segment and error records for the current generation,
+but does not redraw for each record. The final `done` record releases the
+generation's rendering barrier and causes one complete prompt redraw. If the
+worker cannot start or exits without `done`, the shell falls back to rendering
+the immediate segments rather than leaving the prompt stuck.
 
 The generation is allocated by the shell integration. Zsh ignores records from
 superseded generations, allowing directory changes to cancel or outlive an
