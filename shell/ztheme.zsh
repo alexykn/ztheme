@@ -12,7 +12,9 @@ autoload -Uz add-zle-hook-widget
 colors
 setopt PROMPT_SUBST
 
-(( $+functions[_ztheme_close_worker] )) && _ztheme_close_worker
+if (( $+functions[_ztheme_close_worker] )); then
+    { _ztheme_close_worker } 2>/dev/null
+fi
 
 # ---------------------------------------------------------------------------
 # Compiled theme
@@ -44,11 +46,12 @@ _ztheme_close_worker() {
     emulate -L zsh
 
     local -i fd=$ZTHEME_ASYNC_FD
-    (( fd >= 0 )) || return
+    ZTHEME_ASYNC_FD=-1
+    (( fd >= 0 )) || return 0
 
     builtin zle -F "$fd" 2>/dev/null
-    exec {fd}<&- 2>/dev/null
-    ZTHEME_ASYNC_FD=-1
+    exec {fd}<&-
+    return 0
 }
 
 _ztheme_async_callback() {
@@ -118,13 +121,16 @@ _ztheme_start_worker() {
 
     local -i generation=$ZTHEME_GENERATION
     local cwd="$PWD"
-    exec {ZTHEME_ASYNC_FD}< <(
+    if ! exec {ZTHEME_ASYNC_FD}< <(
         command "$__ZTHEME_BIN" __snapshot \
             --generation "$generation" \
             --cwd "$cwd" \
             --theme "$__ZTHEME_ASYNC_THEME" \
             "${__ZTHEME_INSTANCE_ARGS[@]}" 2>/dev/null
-    )
+    ); then
+        ZTHEME_ASYNC_FD=-1
+        return 0
+    fi
 
     if ! builtin zle -F "$ZTHEME_ASYNC_FD" \
         _ztheme_async_callback 2>/dev/null
