@@ -17,7 +17,7 @@ jobs:
     name: Verify
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install Zsh
         run: |
           sudo apt-get update
@@ -58,7 +58,7 @@ jobs:
             target: aarch64-apple-darwin
             asset: ztheme-aarch64-apple-darwin
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@1.97.1
         with:
           targets: ${{ matrix.target }}
@@ -83,7 +83,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@1.97.1
       - name: Publish to crates.io
         env:
