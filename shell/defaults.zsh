@@ -39,7 +39,9 @@ then
     builtin setopt INTERACTIVE_COMMENTS
     builtin setopt NO_BEEP
 
-    if (( ! $+functions[compdef] )); then
+    if [[ -o interactive ]] &&
+        (( ! $+functions[compdef] ))
+    then
         builtin autoload -Uz compinit
 
         local ztheme_zcompdump="${ZDOTDIR:-$HOME}/.zcompdump-${ZSH_VERSION}"

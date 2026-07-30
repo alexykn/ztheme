@@ -71,6 +71,7 @@ impl Sandbox {
             .env("XDG_DATA_HOME", &self.data)
             .env("XDG_CACHE_HOME", &self.cache)
             .env("NO_COLOR", "1")
+            .env("TERM", "xterm-256color")
             .env("ZTHEME_TEST_BIN", env!("CARGO_BIN_EXE_ztheme"))
             .env_remove("GIT_DIR")
             .env_remove("GIT_WORK_TREE")
