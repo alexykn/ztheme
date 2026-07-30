@@ -1,38 +1,64 @@
 # ztheme
 
-`ztheme` is a fast asynchronous Zsh prompt. It renders the directory, command
-status, and prompt character immediately, then streams Git and runtime context
-into the active prompt.
+A fast, batteries-included Zsh prompt with asynchronous Git and runtime
+context, flexible themes, syntax highlighting, and autosuggestions.
 
-It has one user-local daemon, no Git writes or implicit fetches, and a typed
-theme format without plugins or an interpreted template language.
+Your directory and prompt appear immediately. Git state and language versions
+arrive in the background without blocking input.
 
 <p align="center">
-  <img src="img/image-two.png" alt="Default ztheme prompt with Git status, Rust version, and syntax highlighting">
+  <img src="img/image-two.png" alt="Catppuccin Mocha ztheme prompt with Git status, Rust version, and syntax highlighting">
   <br>
-  <sub>Default theme with asynchronous Git and runtime context.</sub>
+  <sub>The bundled Catppuccin Mocha theme.</sub>
 </p>
 
 <p align="center">
   <img src="img/image-one.png" alt="Vesper ztheme prompt with syntax highlighting">
   <br>
-  <sub>Vesper theme with a two-line prompt and themed command input.</sub>
+  <sub>The bundled Vesper theme.</sub>
 </p>
 
-## Installation
+## Highlights
 
-ztheme supports Zsh on macOS and Linux. The default theme uses Nerd Font
-glyphs. Building from source requires Rust 1.97 or newer; managed dependency
-setup requires `curl`, `tar`, and `shasum` or `sha256sum`.
+- Responsive prompt with asynchronous Git and runtime detection
+- Git state powered by
+  [gitstatusd](https://github.com/romkatv/gitstatus), without implicit fetches
+- Themes for layout, colors, symbols, spacing, and input highlighting
+- Automatic project detection for Rust, Python, Node.js, Go, Java, and more
+- Sensible Zsh history, completion, navigation, and key-binding defaults
+- No telemetry or network access during normal prompt use
 
-### Install from crates.io
+## Install
+
+ztheme supports Zsh on macOS and Linux. A
+[Nerd Font](https://www.nerdfonts.com/) is recommended for the default symbols.
 
 ```console
 cargo install ztheme --locked
 ztheme setup
 ```
 
-### Build from source
+Add ztheme near the end of `.zshrc`:
+
+```zsh
+eval "$(ztheme init zsh)"
+```
+
+Start a new shell:
+
+```console
+exec zsh
+```
+
+`ztheme setup` installs the required Git helper and can also install
+[zsh-syntax-highlighting](https://github.com/zsh-users/zsh-syntax-highlighting)
+and [zsh-autosuggestions](https://github.com/zsh-users/zsh-autosuggestions).
+Use `ztheme setup --yes` for unattended setup.
+
+<details>
+<summary>Other installation methods</summary>
+
+Build from source with Rust 1.97 or newer:
 
 ```console
 git clone https://github.com/alexykn/ztheme.git
@@ -41,126 +67,49 @@ cargo install --locked --path . --root ~/.local
 ztheme setup
 ```
 
-Ensure `~/.local/bin` is on `PATH`, then add the embedded integration to
-`.zshrc`:
+Ensure `~/.local/bin` is on `PATH`.
 
-```console
-eval "$(ztheme init zsh)"
-```
+Native archives for Apple Silicon, Intel macOS, x86_64 Linux, and arm64 Linux
+are available on the [Releases](https://github.com/alexykn/ztheme/releases)
+page. Verify the archive against `SHA256SUMS`, place `ztheme` on `PATH`, and run
+`ztheme setup`.
 
-### Release archive
-
-Tagged releases provide native archives for Apple Silicon, Intel macOS, and
-x86_64 or arm64 Linux. Download the archive matching your platform from
-[Releases](https://github.com/alexykn/ztheme/releases), verify it against
-`SHA256SUMS`, and extract it. Each archive contains `ztheme`, `LICENSE`, and
-`README.md`. Place `ztheme` in a directory on `PATH`, then run `ztheme setup`.
-
-`ztheme setup` downloads checksum-verified copies of gitstatusd and, when
-selected, zsh-syntax-highlighting and zsh-autosuggestions. Normal prompt use
-does not make network requests or send telemetry.
-
-## Updating and removing
-
-For a source installation, pull the repository and repeat the install command.
-For a release archive, replace the installed executable with a newer verified
-archive. `ztheme clear` removes cached prompt data but preserves managed helper
-installations. To remove ztheme completely, remove the executable and the
-`${XDG_CACHE_HOME:-$HOME/.cache}/ztheme`,
-`${XDG_DATA_HOME:-$HOME/.local/share}/ztheme`, and
-`${XDG_CONFIG_HOME:-$HOME/.config}/ztheme` directories if you no longer need
-their cache, managed helpers, or themes.
-
-## Shell defaults
-
-The integration establishes a complete interactive baseline once per shell.
-It enables persistent deduplicated shared history, directory-stack navigation,
-interactive comments, cached completion with a daily audit, hidden-file and
-case-insensitive completion, prefix-aware history search, and common terminal
-navigation keys. It does not change `PATH`, aliases, application environment,
-editor selection, terminal integration, or external tool initialization.
-
-A nonstandard `HISTFILE` makes the complete history setup user-owned. The
-standard `${ZDOTDIR:-$HOME}/.zsh_history` still receives ztheme's defaults
-because macOS assigns that path with a small system history. Set
-`ZTHEME_HISTORY_DEFAULTS=0` before initialization to retain custom history
-settings that use the standard path. Existing completion initialization and
-completion styles are preserved. ztheme sets `VIRTUAL_ENV_DISABLE_PROMPT=1`
-only when the variable is unset.
-
-Defaults are ordinary Zsh state. Assignments after initialization take
-precedence and survive theme reloads and deferred input-plugin initialization:
-
-```zsh
-eval "$(ztheme init zsh)"
-
-HISTSIZE=50000
-unsetopt AUTO_CD SHARE_HISTORY
-zstyle ':completion:*' menu no
-bindkey -v
-bindkey '^[[A' up-line-or-history
-```
-
-Set `ZTHEME_SHELL_DEFAULTS=0` before initialization to retain the prompt,
-themes, Git integration, syntax highlighting, and autosuggestions without the
-shell baseline:
-
-```zsh
-ZTHEME_SHELL_DEFAULTS=0
-eval "$(ztheme init zsh)"
-```
+</details>
 
 ## Themes
 
-Theme selection is separate from presentation:
-
-```toml
-# ${XDG_CONFIG_HOME:-$HOME/.config}/ztheme/config.toml
-version = 1
-theme = "alx"
-```
-
-A named theme is loaded from
-`${XDG_CONFIG_HOME:-$HOME/.config}/ztheme/themes/alx.toml`. Absolute theme paths
-are also accepted. Use `default` or omit the config file to select the embedded
-default theme. A one-shell override is available during initialization:
-
-```console
-eval "$(ztheme init zsh --theme /absolute/path/to/theme.toml)"
-```
-
-Manage themes from an initialized shell:
+Explore available themes:
 
 ```console
 ztheme theme list
-ztheme theme edit vesper
+```
+
+Catppuccin Mocha is selected by default. Vesper is bundled as an alternative:
+
+```console
 ztheme theme apply vesper
-ztheme theme reload
 ```
 
 <p align="center">
   <img src="img/image-big.png" alt="ztheme theme list showing palettes, layouts, symbols, and prompt previews" width="900">
 </p>
 
-`theme list` always shows the embedded default first, followed by custom themes
-from `${XDG_CONFIG_HOME:-$HOME/.config}/ztheme/themes`. It renders each theme's
-semantic palette, layout, Git symbols, and a representative prompt example.
-ANSI colors are emitted only to a terminal and are disabled when `NO_COLOR` is
-set.
+Custom themes live in:
 
-`theme edit` opens the selected external theme with nonempty `$VISUAL`, falling
-back to nonempty `$EDITOR`, waits for the editor, and validates the result.
-The embedded default is read-only. Editor values may contain arguments, such
-as `VISUAL="code --wait"`.
+```text
+${XDG_CONFIG_HOME:-$HOME/.config}/ztheme/themes/
+```
 
-`theme apply` validates and compiles the theme before atomically updating
-`config.toml`, then evaluates the generated integration in the current shell.
-`theme reload` rereads the exact selector active in the current shell without
-changing `config.toml`; it is intended for the edit-and-reload loop. Both
-commands leave the current prompt unchanged if theme compilation fails.
+The active theme is selected in
+`${XDG_CONFIG_HOME:-$HOME/.config}/ztheme/config.toml`:
 
-Custom themes overlay the embedded defaults, so they only need to contain the
-values they change:
+```toml
+version = 1
+theme = "my-theme"
+```
+
+Custom themes inherit every omitted value from Catppuccin Mocha. Save one as
+`themes/my-theme.toml`; a useful theme can stay small:
 
 ```toml
 version = 1
@@ -168,53 +117,54 @@ version = 1
 [palette]
 path = "#89b4fa"
 muted = "#7f849c"
-git = "#cba6f7"
 accent = "#f9e2af"
 success = "#a6e3a1"
-warning = "#fab387"
 error = "#f38ba8"
 
 [layout]
 lines = [
-    ["directory", "git", "python"],
+    ["directory", "git", "python", "rust"],
     ["character"],
 ]
 right = ["status"]
-separator = " "
-blank_line_before = true
 
 [segments.git]
 prefix = "on "
 symbol = " "
 
-[segments.git.symbols]
-modified = "!"
-deleted = "✘"
-untracked = "?"
-
-[segments.python]
-prefix = "via "
-symbol = " "
-version_prefix = "v"
-style = { foreground = "accent" }
+[segments.character]
+success = "❯"
+error = "❯"
+spacing = { after = 1 }
 ```
 
-Available segments are `directory`, `git`, `character`, `status`, `python`,
-`perl`, `java`, `kotlin`, `scala`, `rust`, `go`, `bun`, `deno`, `node`,
-`ruby`, `php`, `dotnet`, `c`, `cpp`, `swift`, and `lua`.
+Apply it, then use the edit-and-reload loop:
 
-Git and runtime segments are asynchronous and therefore left-prompt only.
-`directory` and `status` may be placed in the final-line right prompt.
-`character`, when present, must be the final segment of the final left line.
-Segments cannot be repeated. The separator is inserted only between nonempty
-segments.
+```console
+ztheme theme apply my-theme
+ztheme theme edit my-theme
+ztheme theme reload
+```
 
-Colors are either palette names or direct `#RRGGBB` values. Styles support
-foreground and background colors, bold, underline, and standout. Theme
-literals are escaped rather than interpreted as Zsh prompt code.
+Layouts may use `directory`, `git`, `character`, `status`, and the runtime
+segments `python`, `perl`, `java`, `kotlin`, `scala`, `rust`, `go`, `bun`,
+`deno`, `node`, `ruby`, `php`, `dotnet`, `c`, `cpp`, `swift`, and `lua`.
 
-Input styling is inherited from the embedded default theme and is entirely
-optional in custom themes. Override only the entries that should differ:
+Colors accept palette names or `#RRGGBB`. Styles support `foreground`,
+`background`, `bold`, `underline`, and `standout`.
+
+See the complete [theme schema](docs/theme.md), including every layout and
+segment key.
+
+## Syntax highlighting
+
+Syntax highlighting is part of the theme, not a separate color configuration.
+Run `ztheme setup` to install the managed
+[zsh-syntax-highlighting](https://github.com/zsh-users/zsh-syntax-highlighting)
+integration.
+
+Catppuccin Mocha already styles commands, arguments, paths, options, quotes,
+errors, and shell syntax. Override only what your theme needs:
 
 ```toml
 [input]
@@ -223,121 +173,102 @@ completion = { foreground = "accent" }
 
 [input.syntax]
 command = { foreground = "success", bold = true }
-default = { foreground = "text" }
+builtin = { foreground = "success" }
+alias = { foreground = "success" }
+path = { foreground = "path", underline = true }
 single-hyphen-option = { foreground = "text" }
 double-hyphen-option = { foreground = "text" }
+single-quoted-argument = { foreground = "accent" }
+double-quoted-argument = { foreground = "accent" }
 comment = { foreground = "muted" }
+unknown-token = { foreground = "error", bold = true }
 ```
 
-The keys under `input.syntax` map directly to documented
-`ZSH_HIGHLIGHT_STYLES` names. Styles use the same typed fields as prompt
-segments; `"none"` explicitly disables a syntax style. The embedded
-`themes/default.toml` contains the complete mapping, including optional
-bracket, cursor, line, and root highlighters. Pattern and regular-expression
-highlighters use separate Zsh pattern maps and are not theme syntax styles.
-
-The input styles are applied through
-[zsh-syntax-highlighting](https://github.com/zsh-users/zsh-syntax-highlighting).
-Command suggestions are provided by
-[zsh-autosuggestions](https://github.com/zsh-users/zsh-autosuggestions).
-`ztheme setup` offers to install pinned, checksum-verified copies under
-`${XDG_DATA_HOME:-$HOME/.local/share}/ztheme/zsh-syntax-highlighting`
-and `${XDG_DATA_HOME:-$HOME/.local/share}/ztheme/zsh-autosuggestions`.
-The shell integration loads both once, after `.zshrc` has finished and before
-the first interactive line. If another copy is already loaded, ztheme leaves
-it alone.
-
-Autosuggestions use their asynchronous mode and documented manual-rebind mode,
-so widget wrapping happens once rather than during every prompt. Right Arrow,
-End, and Ctrl-Space accept the current suggestion. Missing or declined input
-helpers never prevent the prompt from starting and add no recurring prompt
-work. Default key assignments are made before the deferred widget wrapping, so
-later `bindkey` commands remain authoritative.
-
-Every segment supports bounded unstyled outer spacing:
+Every entry under `input.syntax` is optional and uses the same style fields as
+prompt segments. Set a style to `"none"` to disable it explicitly:
 
 ```toml
-[segments.character]
-prefix = " "
-suffix = " "
-spacing = { before = 0, after = 1 }
+[input.syntax]
+cursor = "none"
 ```
 
-`prefix` and `suffix` remain inside the segment style, which makes them useful
-as colored padding. `spacing.before` and `spacing.after` add zero to sixteen
-ordinary spaces outside the style reset. They default to zero.
+Supported names follow zsh-syntax-highlighting's main, brackets, cursor, line,
+and root highlighters. The built-in
+[`themes/catppuccin-mocha.toml`](themes/catppuccin-mocha.toml) is the complete
+reference and a good starting point for fine-grained overrides.
 
-TOML is read, merged, and validated only by `ztheme init zsh`. Rust then
-compiles an exact unrolled left/right compositor and a compact asynchronous
-theme value. Prompt refreshes do not read or parse theme files. Re-run the
-initialization, source `.zshrc`, or start a new shell after changing a theme.
+See [syntax highlighting and input schema](docs/syntax-highlighting.md) for the
+full list of accepted syntax-style names and configuration keys.
 
-Git status is provided exclusively by
-[gitstatusd](https://github.com/romkatv/gitstatus). On first initialization,
-`ztheme` checks its fixed managed path and, when missing, offers to install the
-pinned upstream binary. Installation downloads the official artifact, verifies
-its SHA-256 checksum, and stores it under
-`${XDG_DATA_HOME:-$HOME/.local/share}/ztheme/gitstatus/v1.5`. For unattended
-setup of gitstatusd and both input helpers, run:
+## Shell defaults
+
+ztheme provides a practical interactive baseline:
+
+- persistent, deduplicated shared history
+- cached, case-insensitive completion with hidden files
+- prefix-aware Up and Down history search
+- common Home, End, Delete, word, and arrow-key bindings
+- directory-stack navigation and interactive comments
+- asynchronous autosuggestions with Right Arrow, End, or Ctrl-Space to accept
+
+These are ordinary Zsh settings. Put overrides after initialization and your
+`.zshrc` remains authoritative:
+
+```zsh
+eval "$(ztheme init zsh)"
+
+bindkey -v
+unsetopt AUTO_CD
+HISTSIZE=50000
+```
+
+To use only the prompt and input integrations:
+
+```zsh
+ZTHEME_SHELL_DEFAULTS=0
+eval "$(ztheme init zsh)"
+```
+
+Set `ZTHEME_HISTORY_DEFAULTS=0` instead to disable only history defaults.
+ztheme does not manage `PATH`, aliases, editor selection, terminal integration,
+or application environment variables.
+
+## Commands
+
+| Command | Purpose |
+| --- | --- |
+| `ztheme setup` | Install or repair prompt helpers |
+| `ztheme theme list` | Preview available themes |
+| `ztheme theme apply NAME` | Apply and remember a theme |
+| `ztheme theme edit NAME` | Open a theme in `$VISUAL` or `$EDITOR` |
+| `ztheme theme reload` | Reload the current theme after editing |
+| `ztheme clear` | Clear cached prompt data |
+
+## Updating and removal
+
+Update a Cargo installation with:
 
 ```console
-ztheme setup --yes
+cargo install ztheme --locked --force
 ```
 
-The normal initialization path performs no platform detection, version process,
-checksum, Homebrew lookup, or network work once that executable exists.
+To remove ztheme, delete the executable and its initialization line. Managed
+data is stored below `${XDG_DATA_HOME:-$HOME/.local/share}/ztheme`, cached data
+below `${XDG_CACHE_HOME:-$HOME/.cache}/ztheme`, and themes below
+`${XDG_CONFIG_HOME:-$HOME/.config}/ztheme`.
 
-The public CLI exposes initialization, dependency setup, help, and
-`ztheme clear`. The shell integration uses hidden commands for asynchronous
-context updates and daemon startup.
+## Built with
 
-A production shell always uses `/tmp/ztheme-$UID/daemon.sock`, regardless of
-which binary path initialized it. A process-lifetime advisory lock guarantees
-that only one production daemon can own that socket; the operating system
-releases the lock immediately if the daemon exits or crashes. The next daemon
-then replaces any stale socket before binding.
+- [Catppuccin](https://github.com/catppuccin/catppuccin) provides the Mocha
+  palette used by the default theme.
+- [Vesper](https://github.com/raunofreiberg/vesper) provides the palette used
+  by the bundled Vesper theme.
+- [gitstatusd](https://github.com/romkatv/gitstatus) provides fast Git status.
+- [zsh-syntax-highlighting](https://github.com/zsh-users/zsh-syntax-highlighting)
+  highlights commands as they are typed.
+- [zsh-autosuggestions](https://github.com/zsh-users/zsh-autosuggestions)
+  provides history-based suggestions.
 
-Shell initialization starts a daemon contender directly in the background.
-There is no startup ping or version handshake: an existing daemon keeps the
-singleton lock and the contender exits. Every normal cache or Git request
-already carries the wire version in its fixed five-byte header. When a newer
-client reaches an older daemon, that request makes the daemon shut down
-cleanly; the client starts its replacement and retries the request. Older clients
-cannot terminate newer daemons.
+## License
 
-Additional instances require an explicit development name:
-
-```console
-eval "$(target/release/ztheme init zsh --dev feature)"
-target/release/ztheme clear --dev feature
-```
-
-Each development name has its own singleton socket. Without `--dev NAME`, even
-a development build joins the production instance.
-
-The daemon keeps up to 500 semantic runtime snapshots in memory and persists them under
-`${XDG_CACHE_HOME:-$HOME/.cache}/ztheme`. It binds the socket before loading
-that file in the background, writes changes atomically after a short debounce,
-and expires entries after 24 hours unless their project, environment, selector,
-or executable fingerprint changes sooner. Access updates LRU order
-without extending that safety expiry.
-
-The same daemon owns one persistent gitstatusd child. Prompt clients never spawn
-`git` and ztheme does not keep a second Git cache. `ztheme clear` discards the
-runtime cache and restarts gitstatusd, while preserving the installed
-executable.
-
-The asynchronous snapshot process receives the precompiled theme value, formats
-finished Git/runtime fragments in Rust, and streams only those fragments to
-Zsh. The daemon remains theme-independent, and dynamic values are sanitized and
-escaped for safe use with Zsh `PROMPT_SUBST`.
-
-Upstream protocol boundaries are explicit:
-
-- bare repositories are not reported by gitstatusd
-- `GIT_DIR` is supported, but combining it with `GIT_WORK_TREE` is rejected
-- gitstatusd reports renames as deleted plus new, so ztheme does not render a
-  separate rename marker
-
-gitstatusd is distributed under GPL-3.0. ztheme communicates with it as a
-separate process through its documented pipe protocol.
+[MIT](LICENSE). gitstatusd is a separate GPL-3.0-licensed process.
