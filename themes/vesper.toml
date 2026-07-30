@@ -1,0 +1,142 @@
+# Palette: Vesper by Rauno Freiberg
+# https://github.com/raunofreiberg/vesper
+version = 1
+
+[palette]
+bg = "#101010"
+text = "#FFFFFF"
+muted = "#A0A0A0"
+faint = "#7E7E7E"
+path = "#FFC799"
+git = "#FFC799"
+accent = "#99FFE4"
+success = "#99FFE4"
+warning = "#FFC799"
+error = "#FF8080"
+orange = "#FF7300"
+sky = "#99D1FF"
+violet = "#AA99FF"
+
+[input.syntax]
+alias = { foreground = "sky" }
+arg0 = { foreground = "sky" }
+autodirectory = { foreground = "sky", underline = true }
+bracket-level-1 = { foreground = "sky" }
+bracket-level-2 = { foreground = "accent" }
+bracket-level-3 = { foreground = "violet" }
+bracket-level-4 = { foreground = "sky" }
+bracket-level-5 = { foreground = "accent" }
+builtin = { foreground = "sky" }
+command = { foreground = "sky" }
+commandseparator = { foreground = "violet" }
+function = { foreground = "sky" }
+global-alias = { foreground = "sky" }
+globbing = { foreground = "violet" }
+hashed-command = { foreground = "sky" }
+history-expansion = { foreground = "violet" }
+path = { foreground = "sky", underline = true }
+path_prefix = { foreground = "sky", underline = true }
+precommand = { foreground = "violet" }
+redirection = { foreground = "violet" }
+reserved-word = { foreground = "violet" }
+suffix-alias = { foreground = "sky" }
+
+[layout]
+lines = [
+    [
+        "directory",
+        "git",
+        "python",
+        "perl",
+        "java",
+        "kotlin",
+        "scala",
+        "rust",
+        "go",
+        "bun",
+        "deno",
+        "node",
+        "ruby",
+        "php",
+        "dotnet",
+        "c",
+        "cpp",
+        "swift",
+        "lua",
+    ],
+    ["character"],
+]
+right = ["status"]
+separator = "  "
+blank_line_before = true
+
+[segments.directory]
+home_symbol = "~"
+truncation_symbol = "…/"
+style = { foreground = "path", bold = true }
+
+[segments.directory.width]
+percent = 55
+minimum = 28
+maximum = 96
+
+[segments.git]
+prefix = ""
+symbol = " "
+action_prefix = " "
+changes_prefix = " "
+style = { foreground = "muted", bold = true }
+action_style = { foreground = "muted" }
+
+[segments.git.symbols]
+conflicted = "×"
+staged = "+"
+modified = "~"
+deleted = "−"
+untracked = "?"
+ahead = "↑"
+behind = "↓"
+diverged = "↕"
+stash = "≡"
+
+[segments.git.styles]
+conflicted = { foreground = "error", bold = true }
+staged = { foreground = "success", bold = true }
+modified = { foreground = "warning", bold = true }
+deleted = { foreground = "error", bold = true }
+untracked = { foreground = "muted", bold = true }
+ahead = { foreground = "success" }
+behind = { foreground = "error" }
+diverged = { foreground = "orange", bold = true }
+stash = { foreground = "accent" }
+
+[segments.character]
+prefix = " "
+success = "❯"
+error = "❯"
+suffix = " "
+spacing = { after = 1 }
+success_style = { foreground = "bg", background = "git", bold = true }
+error_style = { foreground = "bg", background = "error", bold = true }
+
+[segments.status]
+prefix = " "
+suffix = " "
+show_success = false
+style = { foreground = "bg", background = "error", bold = true }
+
+[segments.python]
+prefix = ""
+style = { foreground = "accent" }
+
+[segments.rust]
+prefix = ""
+style = { foreground = "git" }
+
+[segments.go]
+prefix = ""
+style = { foreground = "accent" }
+
+[segments.node]
+prefix = ""
+style = { foreground = "success" }

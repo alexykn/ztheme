@@ -22,10 +22,15 @@ use validate::validate;
 
 const DEFAULT_THEME_SELECTOR: &str = "catppuccin-mocha";
 const CATPPUCCIN_MOCHA_THEME: &str = include_str!("../../themes/catppuccin-mocha.toml");
+const VESPER_THEME: &str = include_str!("../../themes/vesper.toml");
 const BUNDLED_THEMES: &[BundledTheme] = &[
     BundledTheme {
         selector: DEFAULT_THEME_SELECTOR,
         overlay: None,
+    },
+    BundledTheme {
+        selector: "vesper",
+        overlay: Some(VESPER_THEME),
     },
 ];
 const THEME_VERSION: u64 = 1;

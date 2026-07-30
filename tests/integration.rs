@@ -296,8 +296,10 @@ fn theme_management_lists_and_atomically_persists_valid_themes() {
     let catppuccin = listing
         .find("\n○ catppuccin-mocha (default) - builtin")
         .unwrap();
+    let vesper = listing.find("\n○ vesper - builtin").unwrap();
     let amber = listing.find("\n● amber").unwrap();
-    assert!(catppuccin < amber);
+    assert!(catppuccin < vesper);
+    assert!(vesper < amber);
     for section in ["palette", "layout", "symbols", "example"] {
         assert!(listing.contains(section));
     }
