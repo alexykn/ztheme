@@ -31,6 +31,7 @@ struct Shared {
     state: Mutex<State>,
     disk_io: Mutex<()>,
     changed: Notify,
+    shutdown: Notify,
     cache_path: Option<PathBuf>,
     gitstatus: Mutex<gitstatus::Client>,
 }
@@ -68,6 +69,7 @@ pub async fn serve(socket: PathBuf) -> io::Result<()> {
         state: Mutex::new(State::default()),
         disk_io: Mutex::new(()),
         changed: Notify::new(),
+        shutdown: Notify::new(),
         cache_path: super::cache_path(),
         gitstatus: Mutex::new(gitstatus::Client::start()?),
     });
@@ -79,7 +81,10 @@ pub async fn serve(socket: PathBuf) -> io::Result<()> {
     loop {
         while clients.try_join_next().is_some() {}
 
-        let accepted = timeout(IDLE_TIMEOUT, listener.accept()).await;
+        let accepted = tokio::select! {
+            () = shared.shutdown.notified() => break,
+            accepted = timeout(IDLE_TIMEOUT, listener.accept()) => accepted,
+        };
         let Ok(accepted) = accepted else {
             break;
         };
@@ -94,32 +99,38 @@ pub async fn serve(socket: PathBuf) -> io::Result<()> {
 
     load_task.abort();
     flush_task.abort();
+    clients.abort_all();
     while clients.join_next().await.is_some() {}
     flush_latest(&shared).await.map(|_| ())
 }
 
 async fn handle_client(mut stream: UnixStream, shared: Arc<Shared>) -> io::Result<()> {
     match wire::read_header(&mut stream).await? {
-        wire::GET => {
+        wire::RequestHeader::DaemonOutdated => {
+            wire::write_daemon_outdated(&mut stream).await?;
+            shared.shutdown.notify_one();
+            Ok(())
+        }
+        wire::RequestHeader::ClientOutdated => wire::write_client_outdated(&mut stream).await,
+        wire::RequestHeader::Operation(wire::GET) => {
             let key = wire::read_key(&mut stream).await?;
             match cache_get(&shared, key).await {
                 Some(value) => wire::write_hit(&mut stream, &value).await,
                 None => wire::write_miss(&mut stream).await,
             }
         }
-        wire::PUT => {
+        wire::RequestHeader::Operation(wire::PUT) => {
             let key = wire::read_key(&mut stream).await?;
             let value = wire::read_value(&mut stream).await?;
             cache_put(&shared, key, value).await;
             wire::write_ok(&mut stream).await
         }
-        wire::PING => wire::write_ok(&mut stream).await,
-        wire::CLEAR => {
+        wire::RequestHeader::Operation(wire::CLEAR) => {
             clear_cache(&shared).await?;
             shared.gitstatus.lock().await.restart()?;
             wire::write_ok(&mut stream).await
         }
-        wire::GIT => {
+        wire::RequestHeader::Operation(wire::GIT) => {
             let query = wire::read_query(&mut stream).await?;
             let mut client = shared.gitstatus.lock().await;
             let result = if let Ok(result) = timeout(GITSTATUS_TIMEOUT, client.query(&query)).await
@@ -139,7 +150,7 @@ async fn handle_client(mut stream: UnixStream, shared: Arc<Shared>) -> io::Resul
             };
             wire::write_git_result(&mut stream, result).await
         }
-        _ => Err(io::Error::new(
+        wire::RequestHeader::Operation(_) => Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "unknown daemon operation",
         )),

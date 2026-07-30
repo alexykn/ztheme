@@ -23,6 +23,54 @@ const CACHE_FORMAT_VERSION: u16 = 1;
 const MAX_ENTRIES: usize = 500;
 const MAX_VALUE_BYTES: usize = 16 * 1024;
 const SAFETY_EXPIRY: Duration = Duration::from_hours(24);
+const REPLACEMENT_ATTEMPTS: usize = 20;
+const REPLACEMENT_DELAY: Duration = Duration::from_millis(10);
+
+macro_rules! request_with_upgrade {
+    ($instance:expr, |$socket:ident| $operation:expr) => {{
+        let instance = $instance;
+        let $socket = instance.socket_path();
+        match $operation.await {
+            Ok(value) => Ok(value),
+            Err(wire::Error::Io(error)) => Err(error),
+            Err(wire::Error::ClientOutdated) => Err(client_outdated()),
+            Err(wire::Error::DaemonOutdated) => {
+                let mut spawned = false;
+                let mut result = None;
+                for _ in 0..REPLACEMENT_ATTEMPTS {
+                    tokio::time::sleep(REPLACEMENT_DELAY).await;
+                    match $operation.await {
+                        Ok(value) => {
+                            result = Some(Ok(value));
+                            break;
+                        }
+                        Err(wire::Error::DaemonOutdated) => {}
+                        Err(wire::Error::ClientOutdated) => {
+                            result = Some(Err(client_outdated()));
+                            break;
+                        }
+                        Err(wire::Error::Io(error)) if replacement_transition(&error) => {
+                            if !spawned && !$socket.try_exists()? {
+                                spawn_daemon(instance)?;
+                                spawned = true;
+                            }
+                        }
+                        Err(wire::Error::Io(error)) => {
+                            result = Some(Err(error));
+                            break;
+                        }
+                    }
+                }
+                result.unwrap_or_else(|| {
+                    Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "outdated ztheme daemon did not restart",
+                    ))
+                })
+            }
+        }
+    }};
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Instance {
@@ -189,34 +237,24 @@ impl Entry {
 }
 
 pub async fn get(instance: &Instance, key: CacheKey) -> io::Result<Option<Vec<u8>>> {
-    wire::get(&instance.socket_path(), key).await
+    request_with_upgrade!(instance, |socket| wire::get(&socket, key))
 }
 
 pub async fn put(instance: &Instance, key: CacheKey, value: &[u8]) -> io::Result<()> {
     validate_value(value)?;
-    wire::put(&instance.socket_path(), key, value).await
+    request_with_upgrade!(instance, |socket| wire::put(&socket, key, value))
 }
 
 pub async fn git(instance: &Instance, query: &Query) -> io::Result<Option<Snapshot>> {
-    let socket = instance.socket_path();
-    match wire::git(&socket, query).await {
+    match request_with_upgrade!(instance, |socket| wire::git(&socket, query)) {
         Ok(snapshot) => Ok(snapshot),
-        Err(first_error)
-            if matches!(
-                first_error.kind(),
-                io::ErrorKind::ConnectionRefused | io::ErrorKind::NotFound
-            ) =>
-        {
+        Err(first_error) if daemon_unavailable(&first_error) => {
             spawn_daemon(instance)?;
             for _ in 0..10 {
                 tokio::time::sleep(Duration::from_millis(20)).await;
-                match wire::git(&socket, query).await {
+                match request_with_upgrade!(instance, |socket| wire::git(&socket, query)) {
                     Ok(snapshot) => return Ok(snapshot),
-                    Err(error)
-                        if matches!(
-                            error.kind(),
-                            io::ErrorKind::ConnectionRefused | io::ErrorKind::NotFound
-                        ) => {}
+                    Err(error) if daemon_unavailable(&error) => {}
                     Err(error) => return Err(error),
                 }
             }
@@ -227,26 +265,22 @@ pub async fn git(instance: &Instance, query: &Query) -> io::Result<Option<Snapsh
 }
 
 pub async fn clear(instance: &Instance) -> io::Result<()> {
-    let socket = instance.socket_path();
-    if wire::clear(&socket).await.is_ok() {
-        return Ok(());
+    match request_with_upgrade!(instance, |socket| wire::clear(&socket)) {
+        Ok(()) => return Ok(()),
+        Err(error) if daemon_unavailable(&error) => {}
+        Err(error) => return Err(error),
     }
 
     for _ in 0..10 {
         tokio::time::sleep(Duration::from_millis(20)).await;
-        if wire::clear(&socket).await.is_ok() {
-            return Ok(());
+        match request_with_upgrade!(instance, |socket| wire::clear(&socket)) {
+            Ok(()) => return Ok(()),
+            Err(error) if daemon_unavailable(&error) => {}
+            Err(error) => return Err(error),
         }
     }
 
     disk::clear_all()
-}
-
-pub async fn ensure_daemon(instance: &Instance) -> io::Result<()> {
-    if wire::ping(&instance.socket_path()).await.is_ok() {
-        return Ok(());
-    }
-    spawn_daemon(instance)
 }
 
 pub fn spawn_daemon(instance: &Instance) -> io::Result<()> {
@@ -264,6 +298,30 @@ pub fn spawn_daemon(instance: &Instance) -> io::Result<()> {
 
 pub async fn serve(instance: &Instance) -> io::Result<()> {
     daemon::serve(instance.socket_path()).await
+}
+
+fn client_outdated() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::Unsupported,
+        "ztheme client is older than the running daemon",
+    )
+}
+
+fn daemon_unavailable(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::ConnectionRefused | io::ErrorKind::NotFound
+    )
+}
+
+fn replacement_transition(error: &io::Error) -> bool {
+    daemon_unavailable(error)
+        || matches!(
+            error.kind(),
+            io::ErrorKind::BrokenPipe
+                | io::ErrorKind::ConnectionReset
+                | io::ErrorKind::UnexpectedEof
+        )
 }
 
 fn cache_path() -> Option<PathBuf> {

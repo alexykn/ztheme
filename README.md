@@ -184,6 +184,14 @@ that only one production daemon can own that socket; the operating system
 releases the lock immediately if the daemon exits or crashes. The next daemon
 then replaces any stale socket before binding.
 
+Shell initialization starts a daemon contender directly in the background.
+There is no startup ping or version handshake: an existing daemon keeps the
+singleton lock and the contender exits. Every normal cache or Git request
+already carries the wire version in its fixed five-byte header. When a newer
+client reaches an older daemon, that request makes the daemon shut down
+cleanly; the client starts its replacement and retries the request. Older clients
+cannot terminate newer daemons.
+
 Additional instances require an explicit development name:
 
 ```console

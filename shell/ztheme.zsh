@@ -333,7 +333,7 @@ RPROMPT='${ZTHEME_RPROMPT}'
 if (( __ZTHEME_HAS_ASYNC )); then
     local ztheme_bg_nice="$options[bgnice]"
     unsetopt BG_NICE
-    command "$__ZTHEME_BIN" __start-daemon \
+    command "$__ZTHEME_BIN" __daemon \
         "${__ZTHEME_INSTANCE_ARGS[@]}" >/dev/null 2>&1 &!
     [[ "$ztheme_bg_nice" == on ]] && setopt BG_NICE
     unset ztheme_bg_nice

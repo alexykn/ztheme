@@ -11,17 +11,18 @@ use tokio::time::timeout;
 use super::{CacheKey, MAX_VALUE_BYTES};
 use crate::gitstatus::{Query, Snapshot};
 
-pub const VERSION: u16 = 3;
-pub const MAGIC: [u8; 4] = *b"ZTC3";
+pub const VERSION: u16 = 1;
 pub const GET: u8 = 1;
 pub const PUT: u8 = 2;
-pub const PING: u8 = 3;
 pub const CLEAR: u8 = 4;
 pub const GIT: u8 = 5;
 pub const MISS: u8 = 0;
 pub const HIT: u8 = 1;
 pub const OK: u8 = 2;
 
+const MAGIC: [u8; 2] = *b"ZT";
+const DAEMON_OUTDATED: u8 = 0xfe;
+const CLIENT_OUTDATED: u8 = 0xff;
 const EXCHANGE_TIMEOUT: Duration = Duration::from_millis(25);
 const GIT_TIMEOUT: Duration = Duration::from_millis(500);
 const MAX_PATH_BYTES: usize = 16 * 1024;
@@ -34,29 +35,50 @@ const GIT_ERROR: u8 = 2;
 const QUERY_DIRECTORY: u8 = 0;
 const QUERY_GIT_DIR: u8 = 1;
 
-pub async fn get(socket: &Path, key: CacheKey) -> io::Result<Option<Vec<u8>>> {
+#[derive(Debug)]
+pub enum Error {
+    Io(io::Error),
+    DaemonOutdated,
+    ClientOutdated,
+}
+
+pub enum RequestHeader {
+    Operation(u8),
+    DaemonOutdated,
+    ClientOutdated,
+}
+
+pub type Result<T> = std::result::Result<T, Error>;
+
+impl From<io::Error> for Error {
+    fn from(error: io::Error) -> Self {
+        Self::Io(error)
+    }
+}
+
+pub async fn get(socket: &Path, key: CacheKey) -> Result<Option<Vec<u8>>> {
     exchange(socket, async |stream| {
         write_request(stream, GET, Some(key)).await?;
-        match stream.read_u8().await? {
+        match read_response(stream).await? {
             MISS => Ok(None),
             HIT => {
                 let length = usize::try_from(stream.read_u32().await?)
                     .map_err(|_| invalid_data("invalid cache value length"))?;
                 if length > MAX_VALUE_BYTES {
-                    return Err(invalid_data("cache value exceeds size limit"));
+                    return Err(invalid_data("cache value exceeds size limit").into());
                 }
                 let mut bytes = vec![0; length];
                 stream.read_exact(&mut bytes).await?;
                 super::validate_value(&bytes)?;
                 Ok(Some(bytes))
             }
-            _ => Err(invalid_data("invalid cache response")),
+            _ => Err(invalid_data("invalid cache response").into()),
         }
     })
     .await
 }
 
-pub async fn put(socket: &Path, key: CacheKey, value: &[u8]) -> io::Result<()> {
+pub async fn put(socket: &Path, key: CacheKey, value: &[u8]) -> Result<()> {
     exchange(socket, async |stream| {
         write_request(stream, PUT, Some(key)).await?;
         stream.write_u32(u32_len(value)?).await?;
@@ -66,7 +88,7 @@ pub async fn put(socket: &Path, key: CacheKey, value: &[u8]) -> io::Result<()> {
     .await
 }
 
-pub async fn clear(socket: &Path) -> io::Result<()> {
+pub async fn clear(socket: &Path) -> Result<()> {
     exchange(socket, async |stream| {
         write_request(stream, CLEAR, None).await?;
         expect_ok(stream).await
@@ -74,38 +96,34 @@ pub async fn clear(socket: &Path) -> io::Result<()> {
     .await
 }
 
-pub async fn ping(socket: &Path) -> io::Result<()> {
-    exchange(socket, async |stream| {
-        write_request(stream, PING, None).await?;
-        expect_ok(stream).await
-    })
-    .await
-}
-
-pub async fn git(socket: &Path, query: &Query) -> io::Result<Option<Snapshot>> {
+pub async fn git(socket: &Path, query: &Query) -> Result<Option<Snapshot>> {
     exchange_with_timeout(socket, GIT_TIMEOUT, async |stream| {
         write_request(stream, GIT, None).await?;
         write_query(stream, query).await?;
-        match stream.read_u8().await? {
+        match read_response(stream).await? {
             GIT_NONE => Ok(None),
-            GIT_SNAPSHOT => read_snapshot(stream).await.map(Some),
+            GIT_SNAPSHOT => Ok(Some(read_snapshot(stream).await?)),
             GIT_ERROR => {
                 let message = read_text(stream, MAX_ERROR_BYTES, "Git error").await?;
-                Err(io::Error::other(message))
+                Err(io::Error::other(message).into())
             }
-            _ => Err(invalid_data("invalid Git response")),
+            _ => Err(invalid_data("invalid Git response").into()),
         }
     })
     .await
 }
 
-pub async fn read_header(stream: &mut UnixStream) -> io::Result<u8> {
+pub async fn read_header(stream: &mut UnixStream) -> io::Result<RequestHeader> {
     let mut magic = [0; MAGIC.len()];
     stream.read_exact(&mut magic).await?;
     if magic != MAGIC {
         return Err(invalid_data("invalid cache protocol"));
     }
-    stream.read_u8().await
+    match stream.read_u16().await?.cmp(&VERSION) {
+        std::cmp::Ordering::Less => Ok(RequestHeader::ClientOutdated),
+        std::cmp::Ordering::Equal => stream.read_u8().await.map(RequestHeader::Operation),
+        std::cmp::Ordering::Greater => Ok(RequestHeader::DaemonOutdated),
+    }
 }
 
 pub async fn read_query(stream: &mut UnixStream) -> io::Result<Query> {
@@ -149,6 +167,14 @@ pub async fn write_ok(stream: &mut UnixStream) -> io::Result<()> {
     stream.write_u8(OK).await
 }
 
+pub async fn write_daemon_outdated(stream: &mut UnixStream) -> io::Result<()> {
+    stream.write_u8(DAEMON_OUTDATED).await
+}
+
+pub async fn write_client_outdated(stream: &mut UnixStream) -> io::Result<()> {
+    stream.write_u8(CLIENT_OUTDATED).await
+}
+
 pub async fn write_git_result(
     stream: &mut UnixStream,
     result: io::Result<Option<Snapshot>>,
@@ -166,27 +192,28 @@ pub async fn write_git_result(
     }
 }
 
-async fn exchange<T, F>(socket: &Path, operation: F) -> io::Result<T>
+async fn exchange<T, F>(socket: &Path, operation: F) -> Result<T>
 where
-    F: AsyncFnOnce(&mut UnixStream) -> io::Result<T>,
+    F: AsyncFnOnce(&mut UnixStream) -> Result<T>,
 {
     exchange_with_timeout(socket, EXCHANGE_TIMEOUT, operation).await
 }
 
-async fn exchange_with_timeout<T, F>(
-    socket: &Path,
-    duration: Duration,
-    operation: F,
-) -> io::Result<T>
+async fn exchange_with_timeout<T, F>(socket: &Path, duration: Duration, operation: F) -> Result<T>
 where
-    F: AsyncFnOnce(&mut UnixStream) -> io::Result<T>,
+    F: AsyncFnOnce(&mut UnixStream) -> Result<T>,
 {
     timeout(duration, async {
         let mut stream = UnixStream::connect(socket).await?;
         operation(&mut stream).await
     })
     .await
-    .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "daemon exchange timed out"))?
+    .map_err(|_| {
+        Error::Io(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "daemon exchange timed out",
+        ))
+    })?
 }
 
 async fn write_request(
@@ -195,6 +222,7 @@ async fn write_request(
     key: Option<CacheKey>,
 ) -> io::Result<()> {
     stream.write_all(&MAGIC).await?;
+    stream.write_u16(VERSION).await?;
     stream.write_u8(operation).await?;
     if let Some(key) = key {
         stream.write_u64(key.value()).await?;
@@ -202,11 +230,19 @@ async fn write_request(
     Ok(())
 }
 
-async fn expect_ok(stream: &mut UnixStream) -> io::Result<()> {
-    if stream.read_u8().await? == OK {
+async fn expect_ok(stream: &mut UnixStream) -> Result<()> {
+    if read_response(stream).await? == OK {
         return Ok(());
     }
-    Err(invalid_data("cache operation failed"))
+    Err(invalid_data("cache operation failed").into())
+}
+
+async fn read_response(stream: &mut UnixStream) -> Result<u8> {
+    match stream.read_u8().await? {
+        DAEMON_OUTDATED => Err(Error::DaemonOutdated),
+        CLIENT_OUTDATED => Err(Error::ClientOutdated),
+        response => Ok(response),
+    }
 }
 
 async fn write_query(stream: &mut UnixStream, query: &Query) -> io::Result<()> {

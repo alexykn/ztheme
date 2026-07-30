@@ -46,9 +46,6 @@ enum Request {
     Clear {
         instance: cache::Instance,
     },
-    StartDaemon {
-        instance: cache::Instance,
-    },
     Snapshot {
         generation: u64,
         cwd: PathBuf,
@@ -95,7 +92,6 @@ fn main() {
             persist,
         } => theme_zsh(&instance, &selector, persist).and_then(|script| write_stdout(&script)),
         Request::Clear { instance } => run_async(cache::clear(&instance)),
-        Request::StartDaemon { instance } => run_async(cache::ensure_daemon(&instance)),
         Request::Snapshot {
             generation,
             cwd,
@@ -281,10 +277,6 @@ fn arguments() -> Result<Request, &'static str> {
     if command == "clear" {
         let instance = instance_argument(arguments)?;
         return Ok(Request::Clear { instance });
-    }
-    if command == "__start-daemon" {
-        let instance = instance_argument(arguments)?;
-        return Ok(Request::StartDaemon { instance });
     }
     if command == "__daemon" {
         let instance = instance_argument(arguments)?;
