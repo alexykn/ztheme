@@ -122,6 +122,14 @@ pub(crate) fn cache_key(project: &detect::Project, active: &[Runtime]) -> CacheK
         hash.add_u64(b"runtime-command", u64::from(runtime.id()));
         let spec = spec(*runtime);
         hash.add_os(b"runtime-program", &spec.program);
+        hash.add_u64(
+            b"runtime-argument-count",
+            u64::try_from(spec.arguments.len()).unwrap_or(u64::MAX),
+        );
+        for argument in spec.arguments {
+            hash.add_bytes(b"runtime-argument", argument.as_bytes());
+        }
+        hash.add_u64(b"runtime-merge-stderr", u64::from(spec.merge_stderr));
         let executable = resolve_program(&spec.program);
         if let Some(executable) = executable.as_deref() {
             hash.add_path(b"resolved-executable", executable);
