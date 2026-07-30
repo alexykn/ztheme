@@ -38,6 +38,8 @@ typeset -gi ZTHEME_AUTOSUGGESTIONS_WARNING_SHOWN=${ZTHEME_AUTOSUGGESTIONS_WARNIN
 typeset -gi ZTHEME_SYNTAX_WARNING_SHOWN=${ZTHEME_SYNTAX_WARNING_SHOWN:-0}
 typeset -g ZSH_AUTOSUGGEST_MANUAL_REBIND=1
 
+@ZTHEME_SHELL_DEFAULTS@
+
 _ztheme_close_worker() {
     emulate -L zsh
 
@@ -265,8 +267,6 @@ _ztheme_initialize_autosuggestions() {
     _zsh_autosuggest_start
 
     if (( $+widgets[autosuggest-accept] )); then
-        builtin bindkey '^ ' autosuggest-accept
-        builtin bindkey '^[[F' autosuggest-accept
         return 0
     fi
 

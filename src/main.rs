@@ -21,6 +21,7 @@ use tokio::time::{Instant, timeout_at};
 use projects::Runtime;
 
 const HELPER_TIMEOUT: Duration = Duration::from_millis(550);
+const ZSH_DEFAULTS: &str = include_str!("../shell/defaults.zsh");
 const ZSH_INTEGRATION: &str = include_str!("../shell/ztheme.zsh");
 
 enum Request {
@@ -469,6 +470,7 @@ fn init_zsh(instance: &cache::Instance, selector: Option<&str>) -> io::Result<St
             "@ZTHEME_SYNTAX_HIGHLIGHTING@",
             &shell_quote(&syntax_highlighting::managed_script().to_string_lossy()),
         )
+        .replace("@ZTHEME_SHELL_DEFAULTS@", ZSH_DEFAULTS)
         .replace("@ZTHEME_COMPILED_THEME@", &theme_zsh))
 }
 

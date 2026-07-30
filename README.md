@@ -32,6 +32,45 @@ Add the embedded integration to `.zshrc`:
 eval "$(ztheme init zsh)"
 ```
 
+## Shell defaults
+
+The integration establishes a complete interactive baseline once per shell.
+It enables persistent deduplicated shared history, directory-stack navigation,
+interactive comments, cached completion with a daily audit, hidden-file and
+case-insensitive completion, prefix-aware history search, and common terminal
+navigation keys. It does not change `PATH`, aliases, application environment,
+editor selection, terminal integration, or external tool initialization.
+
+A nonstandard `HISTFILE` makes the complete history setup user-owned. The
+standard `${ZDOTDIR:-$HOME}/.zsh_history` still receives ztheme's defaults
+because macOS assigns that path with a small system history. Set
+`ZTHEME_HISTORY_DEFAULTS=0` before initialization to retain custom history
+settings that use the standard path. Existing completion initialization and
+completion styles are preserved. ztheme sets `VIRTUAL_ENV_DISABLE_PROMPT=1`
+only when the variable is unset.
+
+Defaults are ordinary Zsh state. Assignments after initialization take
+precedence and survive theme reloads and deferred input-plugin initialization:
+
+```zsh
+eval "$(ztheme init zsh)"
+
+HISTSIZE=50000
+unsetopt AUTO_CD SHARE_HISTORY
+zstyle ':completion:*' menu no
+bindkey -v
+bindkey '^[[A' up-line-or-history
+```
+
+Set `ZTHEME_SHELL_DEFAULTS=0` before initialization to retain the prompt,
+themes, Git integration, syntax highlighting, and autosuggestions without the
+shell baseline:
+
+```zsh
+ZTHEME_SHELL_DEFAULTS=0
+eval "$(ztheme init zsh)"
+```
+
 ## Themes
 
 Theme selection is separate from presentation:
@@ -173,7 +212,8 @@ Autosuggestions use their asynchronous mode and documented manual-rebind mode,
 so widget wrapping happens once rather than during every prompt. Right Arrow,
 End, and Ctrl-Space accept the current suggestion. Missing or declined input
 helpers never prevent the prompt from starting and add no recurring prompt
-work.
+work. Default key assignments are made before the deferred widget wrapping, so
+later `bindkey` commands remain authoritative.
 
 Every segment supports bounded unstyled outer spacing:
 
