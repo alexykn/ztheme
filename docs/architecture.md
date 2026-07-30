@@ -169,10 +169,9 @@ Production uses `daemon.sock`. A development instance hashes its validated
 filesystem path. This allows a development build and the installed production
 binary to run simultaneously without sharing daemon state.
 
-The transport is intentionally Unix-specific. ztheme already targets Zsh and
-uses Unix process and filesystem semantics, so a cross-platform TCP fallback
-would add another security and lifecycle model without serving the supported
-environment.
+The transport is intentionally Unix-specific. ztheme targets Zsh because that
+is what I use. Similarly it uses Unix process and filesystem semantics because 
+I don't care about Windows.
 
 #### Single ownership and lifecycle
 
