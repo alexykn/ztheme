@@ -251,7 +251,7 @@ preferences, or application environment variables.
 | `ztheme theme apply NAME` | Apply and remember a theme |
 | `ztheme theme edit NAME` | Open a theme in `$VISUAL` or `$EDITOR` |
 | `ztheme theme reload` | Reload the current theme after editing |
-| `ztheme clear` | Clear cached prompt data |
+| `ztheme clear` | Clear runtime values and reset Git status |
 
 ## Updating and removal
 
@@ -265,6 +265,13 @@ To remove ztheme, delete the executable and its initialization line. Managed
 data is stored below `${XDG_DATA_HOME:-$HOME/.local/share}/ztheme`, cached data
 below `${XDG_CACHE_HOME:-$HOME/.cache}/ztheme`, and themes below
 `${XDG_CONFIG_HOME:-$HOME/.config}/ztheme`.
+
+## Architecture
+
+Short-lived CLI and snapshot-helper processes communicate with a per-user
+daemon that hosts runtime caching and the persistent `gitstatusd` client.
+See [Architecture](docs/architecture.md) for subsystem ownership, protocols,
+and the runtime-extension workflow.
 
 ## Built with
 

@@ -286,6 +286,29 @@ fn cli_help_version_and_invalid_arguments_have_stable_exit_classes() {
 }
 
 #[test]
+fn snapshot_without_async_segments_finishes_its_generation() {
+    let sandbox = Sandbox::new();
+    let output = sandbox
+        .command()
+        .args([
+            "__snapshot",
+            "--generation",
+            "42",
+            "--cwd",
+            sandbox.home.to_str().unwrap(),
+            "--theme",
+            "0000",
+            "--dev",
+            "empty-snapshot-test",
+        ])
+        .output()
+        .unwrap();
+
+    assert_success(&output);
+    assert_eq!(output.stdout, b"ZTHEME1\t42\tdone\n");
+}
+
+#[test]
 fn theme_management_lists_and_atomically_persists_valid_themes() {
     let sandbox = Sandbox::new();
     sandbox.install_fake_gitstatus();

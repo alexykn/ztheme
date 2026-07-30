@@ -10,9 +10,7 @@ use tokio::process::Command;
 use tokio::task::JoinSet;
 use tokio::time::timeout;
 
-mod detect;
-
-pub(crate) use detect::{Project, detect, worktree_root};
+pub(crate) mod detect;
 
 use crate::cache::CacheKey;
 
@@ -88,7 +86,7 @@ pub(crate) struct RuntimeValue {
     pub(crate) environment: Option<String>,
 }
 
-pub(crate) async fn snapshot(project: Project, active: Vec<Runtime>) -> Vec<RuntimeValue> {
+pub(crate) async fn snapshot(project: detect::Project, active: Vec<Runtime>) -> Vec<RuntimeValue> {
     let mut tasks = JoinSet::new();
 
     for runtime in active {
@@ -116,7 +114,7 @@ pub(crate) async fn snapshot(project: Project, active: Vec<Runtime>) -> Vec<Runt
     values
 }
 
-pub(crate) fn cache_key(project: &Project, active: &[Runtime]) -> CacheKey {
+pub(crate) fn cache_key(project: &detect::Project, active: &[Runtime]) -> CacheKey {
     let mut hash = project.hash.clone();
     hash.add_u64(b"runtime-snapshot-version", 1);
 

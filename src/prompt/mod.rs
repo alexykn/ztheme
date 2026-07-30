@@ -141,8 +141,8 @@ async fn runtime_values(
     cwd: PathBuf,
     active: Vec<Runtime>,
 ) -> io::Result<Vec<RuntimeValue>> {
-    let git_root = runtime::worktree_root(&cwd);
-    let project = runtime::detect(&cwd, git_root.as_deref());
+    let git_root = runtime::detect::worktree_root(&cwd);
+    let project = runtime::detect::detect(&cwd, git_root.as_deref());
     let detected = active
         .into_iter()
         .filter(|runtime| project.runtimes.contains(runtime))

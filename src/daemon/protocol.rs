@@ -11,14 +11,14 @@ use tokio::time::timeout;
 use crate::cache::{CacheKey, MAX_VALUE_BYTES, validate_value};
 use crate::gitstatus::{Query, Snapshot};
 
-pub const VERSION: u16 = 1;
-pub const RUNTIME_CACHE_GET: u8 = 1;
-pub const RUNTIME_CACHE_PUT: u8 = 2;
-pub const RESET: u8 = 4;
-pub const GIT_STATUS: u8 = 5;
-pub const MISS: u8 = 0;
-pub const HIT: u8 = 1;
-pub const OK: u8 = 2;
+pub(super) const VERSION: u16 = 1;
+pub(super) const RUNTIME_CACHE_GET: u8 = 1;
+pub(super) const RUNTIME_CACHE_PUT: u8 = 2;
+pub(super) const RESET: u8 = 4;
+pub(super) const GIT_STATUS: u8 = 5;
+pub(super) const MISS: u8 = 0;
+pub(super) const HIT: u8 = 1;
+pub(super) const OK: u8 = 2;
 
 const MAGIC: [u8; 2] = *b"ZT";
 const DAEMON_OUTDATED: u8 = 0xfe;
@@ -36,19 +36,19 @@ const QUERY_DIRECTORY: u8 = 0;
 const QUERY_GIT_DIR: u8 = 1;
 
 #[derive(Debug)]
-pub enum Error {
+pub(super) enum Error {
     Io(io::Error),
     DaemonOutdated,
     ClientOutdated,
 }
 
-pub enum RequestHeader {
+pub(super) enum RequestHeader {
     Operation(u8),
     DaemonOutdated,
     ClientOutdated,
 }
 
-pub type Result<T> = std::result::Result<T, Error>;
+pub(super) type Result<T> = std::result::Result<T, Error>;
 
 impl From<io::Error> for Error {
     fn from(error: io::Error) -> Self {
@@ -56,7 +56,7 @@ impl From<io::Error> for Error {
     }
 }
 
-pub async fn runtime_cache_get(socket: &Path, key: CacheKey) -> Result<Option<Vec<u8>>> {
+pub(super) async fn runtime_cache_get(socket: &Path, key: CacheKey) -> Result<Option<Vec<u8>>> {
     exchange(socket, async |stream| {
         write_request(stream, RUNTIME_CACHE_GET, Some(key)).await?;
         match read_response(stream).await? {
@@ -78,7 +78,7 @@ pub async fn runtime_cache_get(socket: &Path, key: CacheKey) -> Result<Option<Ve
     .await
 }
 
-pub async fn runtime_cache_put(socket: &Path, key: CacheKey, value: &[u8]) -> Result<()> {
+pub(super) async fn runtime_cache_put(socket: &Path, key: CacheKey, value: &[u8]) -> Result<()> {
     exchange(socket, async |stream| {
         write_request(stream, RUNTIME_CACHE_PUT, Some(key)).await?;
         stream.write_u32(u32_len(value)?).await?;
@@ -88,7 +88,7 @@ pub async fn runtime_cache_put(socket: &Path, key: CacheKey, value: &[u8]) -> Re
     .await
 }
 
-pub async fn reset(socket: &Path) -> Result<()> {
+pub(super) async fn reset(socket: &Path) -> Result<()> {
     exchange(socket, async |stream| {
         write_request(stream, RESET, None).await?;
         expect_ok(stream).await
@@ -96,7 +96,7 @@ pub async fn reset(socket: &Path) -> Result<()> {
     .await
 }
 
-pub async fn git_status(socket: &Path, query: &Query) -> Result<Option<Snapshot>> {
+pub(super) async fn git_status(socket: &Path, query: &Query) -> Result<Option<Snapshot>> {
     exchange_with_timeout(socket, GIT_TIMEOUT, async |stream| {
         write_request(stream, GIT_STATUS, None).await?;
         write_query(stream, query).await?;
@@ -113,7 +113,7 @@ pub async fn git_status(socket: &Path, query: &Query) -> Result<Option<Snapshot>
     .await
 }
 
-pub async fn read_header(stream: &mut UnixStream) -> io::Result<RequestHeader> {
+pub(super) async fn read_header(stream: &mut UnixStream) -> io::Result<RequestHeader> {
     let mut magic = [0; MAGIC.len()];
     stream.read_exact(&mut magic).await?;
     if magic != MAGIC {
@@ -126,7 +126,7 @@ pub async fn read_header(stream: &mut UnixStream) -> io::Result<RequestHeader> {
     }
 }
 
-pub async fn read_query(stream: &mut UnixStream) -> io::Result<Query> {
+pub(super) async fn read_query(stream: &mut UnixStream) -> io::Result<Query> {
     let kind = stream.read_u8().await?;
     let path = read_bytes(stream, MAX_PATH_BYTES, "Git query path").await?;
     let path = std::path::PathBuf::from(OsString::from_vec(path));
@@ -137,11 +137,11 @@ pub async fn read_query(stream: &mut UnixStream) -> io::Result<Query> {
     }
 }
 
-pub async fn read_key(stream: &mut UnixStream) -> io::Result<CacheKey> {
+pub(super) async fn read_key(stream: &mut UnixStream) -> io::Result<CacheKey> {
     Ok(CacheKey::from_value(stream.read_u64().await?))
 }
 
-pub async fn read_value(stream: &mut UnixStream) -> io::Result<Vec<u8>> {
+pub(super) async fn read_value(stream: &mut UnixStream) -> io::Result<Vec<u8>> {
     let length = usize::try_from(stream.read_u32().await?)
         .map_err(|_| invalid_data("invalid cache value length"))?;
     if length > MAX_VALUE_BYTES {
@@ -153,29 +153,29 @@ pub async fn read_value(stream: &mut UnixStream) -> io::Result<Vec<u8>> {
     Ok(bytes)
 }
 
-pub async fn write_miss(stream: &mut UnixStream) -> io::Result<()> {
+pub(super) async fn write_miss(stream: &mut UnixStream) -> io::Result<()> {
     stream.write_u8(MISS).await
 }
 
-pub async fn write_hit(stream: &mut UnixStream, value: &[u8]) -> io::Result<()> {
+pub(super) async fn write_hit(stream: &mut UnixStream, value: &[u8]) -> io::Result<()> {
     stream.write_u8(HIT).await?;
     stream.write_u32(u32_len(value)?).await?;
     stream.write_all(value).await
 }
 
-pub async fn write_ok(stream: &mut UnixStream) -> io::Result<()> {
+pub(super) async fn write_ok(stream: &mut UnixStream) -> io::Result<()> {
     stream.write_u8(OK).await
 }
 
-pub async fn write_daemon_outdated(stream: &mut UnixStream) -> io::Result<()> {
+pub(super) async fn write_daemon_outdated(stream: &mut UnixStream) -> io::Result<()> {
     stream.write_u8(DAEMON_OUTDATED).await
 }
 
-pub async fn write_client_outdated(stream: &mut UnixStream) -> io::Result<()> {
+pub(super) async fn write_client_outdated(stream: &mut UnixStream) -> io::Result<()> {
     stream.write_u8(CLIENT_OUTDATED).await
 }
 
-pub async fn write_git_result(
+pub(super) async fn write_git_result(
     stream: &mut UnixStream,
     result: io::Result<Option<Snapshot>>,
 ) -> io::Result<()> {

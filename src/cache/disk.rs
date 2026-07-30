@@ -14,12 +14,12 @@ const MAGIC: [u8; 4] = *b"ZTHC";
 const MAX_FILE_BYTES: u64 = 9 * 1024 * 1024;
 const FUTURE_SKEW_SECONDS: u64 = 5 * 60;
 
-pub struct Loaded {
-    pub entries: HashMap<CacheKey, Entry>,
-    pub needs_rewrite: bool,
+pub(super) struct Loaded {
+    pub(super) entries: HashMap<CacheKey, Entry>,
+    pub(super) needs_rewrite: bool,
 }
 
-pub fn load(path: &Path) -> io::Result<Loaded> {
+pub(super) fn load(path: &Path) -> io::Result<Loaded> {
     validate_private_file(path)?;
     let metadata = path.metadata()?;
     if metadata.len() > MAX_FILE_BYTES {
@@ -38,7 +38,7 @@ pub fn load(path: &Path) -> io::Result<Loaded> {
     decode(&bytes)
 }
 
-pub fn save(path: &Path, entries: &HashMap<CacheKey, Entry>) -> io::Result<()> {
+pub(super) fn save(path: &Path, entries: &HashMap<CacheKey, Entry>) -> io::Result<()> {
     let Some(parent) = path.parent() else {
         return Err(invalid_data("cache path has no parent"));
     };
@@ -61,7 +61,7 @@ pub fn save(path: &Path, entries: &HashMap<CacheKey, Entry>) -> io::Result<()> {
     result
 }
 
-pub fn clear_all(path: Option<&Path>) -> io::Result<()> {
+pub(super) fn clear_all(path: Option<&Path>) -> io::Result<()> {
     let Some(path) = path else {
         return Ok(());
     };
