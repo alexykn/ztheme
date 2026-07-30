@@ -25,6 +25,13 @@ ztheme supports Zsh on macOS and Linux. The default theme uses Nerd Font
 glyphs. Building from source requires Rust 1.97 or newer; managed dependency
 setup requires `curl`, `tar`, and `shasum` or `sha256sum`.
 
+### Install from crates.io
+
+```console
+cargo install ztheme --locked
+ztheme setup
+```
+
 ### Build from source
 
 ```console

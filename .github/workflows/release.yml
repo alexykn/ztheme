@@ -24,7 +24,14 @@ jobs:
       - run: cargo fmt --check
       - run: cargo clippy --all-targets --all-features -- -D warnings -W clippy::pedantic
       - run: cargo test --all-targets --all-features
+      - run: cargo package --locked
       - run: zsh -n shell/ztheme.zsh shell/defaults.zsh
+      - name: Verify tag version
+        if: github.event_name == 'push'
+        run: |
+          tag_version="${GITHUB_REF_NAME#v}"
+          package_version=$(awk -F '"' '/^version = / { print $2; exit }' Cargo.toml)
+          test "$tag_version" = "$package_version"
 
   build:
     name: Build (${{ matrix.asset }})
@@ -73,11 +80,11 @@ jobs:
       contents: write
     steps:
       - uses: actions/checkout@v4
-      - name: Verify tag version
-        run: |
-          tag_version="${GITHUB_REF_NAME#v}"
-          package_version=$(awk -F '"' '/^version = / { print $2; exit }' Cargo.toml)
-          test "$tag_version" = "$package_version"
+      - uses: dtolnay/rust-toolchain@1.97.1
+      - name: Publish to crates.io
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: cargo publish --locked
       - uses: actions/download-artifact@v4
         with:
           path: release
