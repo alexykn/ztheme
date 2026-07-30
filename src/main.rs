@@ -1,9 +1,11 @@
 mod cache;
 mod git;
 mod gitstatus;
+mod install;
 mod projects;
 mod protocol;
 mod runtimes;
+mod syntax_highlighting;
 mod theme;
 
 use std::env;
@@ -458,6 +460,10 @@ fn init_zsh(instance: &cache::Instance, selector: Option<&str>) -> io::Result<St
     Ok(ZSH_INTEGRATION
         .replace("@ZTHEME_BIN@", &binary)
         .replace("@ZTHEME_INSTANCE_ARGS@", &instance_arguments)
+        .replace(
+            "@ZTHEME_SYNTAX_HIGHLIGHTING@",
+            &shell_quote(&syntax_highlighting::managed_script().to_string_lossy()),
+        )
         .replace("@ZTHEME_COMPILED_THEME@", &theme_zsh))
 }
 
@@ -473,7 +479,16 @@ fn setup(assume_yes: bool) -> io::Result<()> {
     if !gitstatus::ensure_installed(assume_yes)? {
         return Err(io::Error::other("gitstatusd installation declined"));
     }
-    println!("{}", gitstatus::managed_binary().display());
+    let syntax_installed = syntax_highlighting::ensure_installed(assume_yes)?;
+    println!("gitstatusd\t{}", gitstatus::managed_binary().display());
+    if syntax_installed {
+        println!(
+            "zsh-syntax-highlighting\t{}",
+            syntax_highlighting::managed_script().display()
+        );
+    } else {
+        println!("zsh-syntax-highlighting\tnot installed (optional)");
+    }
     Ok(())
 }
 

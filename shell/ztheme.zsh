@@ -26,12 +26,14 @@ setopt PROMPT_SUBST
 
 typeset -g __ZTHEME_BIN=@ZTHEME_BIN@
 typeset -ga __ZTHEME_INSTANCE_ARGS=(@ZTHEME_INSTANCE_ARGS@)
+typeset -g __ZTHEME_SYNTAX_HIGHLIGHTING=@ZTHEME_SYNTAX_HIGHLIGHTING@
 typeset -g ZTHEME_PROMPT=""
 typeset -g ZTHEME_RPROMPT=""
 typeset -g ZTHEME_CONTEXT_KEY=""
 typeset -g ZTHEME_LAST_ERROR=""
 typeset -gi ZTHEME_GENERATION=0
 typeset -gi ZTHEME_ASYNC_FD=-1
+typeset -gi ZTHEME_SYNTAX_WARNING_SHOWN=${ZTHEME_SYNTAX_WARNING_SHOWN:-0}
 
 _ztheme_close_worker() {
     emulate -L zsh
@@ -205,6 +207,37 @@ _ztheme_precmd() {
     _ztheme_start_worker
 }
 
+_ztheme_load_syntax_highlighting() {
+    emulate -L zsh
+    setopt localoptions no_shwordsplit
+
+    precmd_functions=(
+        ${precmd_functions:#_ztheme_load_syntax_highlighting}
+    )
+
+    if [[ -n "${ZSH_HIGHLIGHT_VERSION:-}" ]] ||
+        (( $+functions[_zsh_highlight] ))
+    then
+        return 0
+    fi
+
+    if [[ -r "$__ZTHEME_SYNTAX_HIGHLIGHTING" ]]; then
+        if builtin source "$__ZTHEME_SYNTAX_HIGHLIGHTING" &&
+            { [[ -n "${ZSH_HIGHLIGHT_VERSION:-}" ]] ||
+                (( $+functions[_zsh_highlight] )) }
+        then
+            return 0
+        fi
+    fi
+
+    if (( ! ZTHEME_SYNTAX_WARNING_SHOWN )); then
+        builtin print -u2 -r -- \
+            "ztheme: syntax highlighting is unavailable; run \`ztheme setup\` to install it."
+        ZTHEME_SYNTAX_WARNING_SHOWN=1
+    fi
+    return 0
+}
+
 _ztheme_preexec() {
     emulate -L zsh
 
@@ -303,7 +336,9 @@ _ztheme_zle_line_finish() {
 # ---------------------------------------------------------------------------
 
 precmd_functions=(${precmd_functions:#_ztheme_precmd})
+precmd_functions=(${precmd_functions:#_ztheme_load_syntax_highlighting})
 precmd_functions=(_ztheme_precmd $precmd_functions)
+precmd_functions+=(_ztheme_load_syntax_highlighting)
 
 for hook_spec in \
     preexec:_ztheme_preexec \

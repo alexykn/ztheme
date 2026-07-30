@@ -23,6 +23,7 @@ Build and install:
 
 ```console
 cargo install --locked --path ~/github/ztheme --root ~/.local --force
+ztheme setup
 ```
 
 Add the embedded integration to `.zshrc`:
@@ -157,6 +158,15 @@ segments; `"none"` explicitly disables a syntax style. The embedded
 bracket, cursor, line, and root highlighters. Pattern and regular-expression
 highlighters use separate Zsh pattern maps and are not theme syntax styles.
 
+The input styles are applied through
+[zsh-syntax-highlighting](https://github.com/zsh-users/zsh-syntax-highlighting).
+`ztheme setup` offers to install a pinned, checksum-verified copy under
+`${XDG_DATA_HOME:-$HOME/.local/share}/ztheme/zsh-syntax-highlighting`.
+The shell integration loads it once, after `.zshrc` has finished and before the
+first interactive line. If another copy is already loaded, ztheme leaves it
+alone. Missing or declined syntax highlighting never prevents the prompt from
+starting and adds no recurring prompt work.
+
 Every segment supports bounded unstyled outer spacing:
 
 ```toml
@@ -181,7 +191,7 @@ Git status is provided exclusively by
 pinned upstream binary. Installation downloads the official artifact, verifies
 its SHA-256 checksum, and stores it under
 `${XDG_DATA_HOME:-$HOME/.local/share}/ztheme/gitstatus/v1.5`. For unattended
-setup, run:
+setup of both gitstatusd and syntax highlighting, run:
 
 ```console
 ztheme setup --yes
