@@ -1,7 +1,7 @@
 # ztheme
 
-A Zsh prompt for Git and runtime context, with themes, syntax
-highlighting, and autosuggestions close at hand.
+A Zsh prompt for Git and runtime context, customizable themes, syntax
+highlighting, and autosuggestions.
 
 Your directory and prompt appear immediately. Git state and language versions
 arrive in the background without blocking input.
