@@ -1,7 +1,7 @@
 # ztheme
 
-A fast, batteries-included Zsh prompt with asynchronous Git and runtime
-context, flexible themes, syntax highlighting, and autosuggestions.
+A Zsh prompt for Git and runtime context, with themes, syntax
+highlighting, and autosuggestions close at hand.
 
 Your directory and prompt appear immediately. Git state and language versions
 arrive in the background without blocking input.
