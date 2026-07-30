@@ -55,8 +55,8 @@ it's worth the effort.
 
 Instead of animating the late Git update, we now start the Git request first,
 start language detection right after it, and wait until the snapshot is done
-before replacing the prompt. While that happens, the previous complete prompt
-stays on screen. This removes the flicker without needing an animation system.
+before rendering the prompt. This removes the flicker without needing an
+animation system.
 
 It gives up the immediate first render, but the result feels much calmer and is
 good enough for now.

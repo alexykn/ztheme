@@ -227,7 +227,7 @@ fn emit_assign_async(output: &mut String, segments: &[SegmentId]) {
 
 fn emit_layout_renderer(output: &mut String, layout: &ValidatedLayout, source: &Layout) {
     output.push_str(
-        "_ztheme_render_layout() {\n    emulate -L zsh\n    local prompt='' right='' line='' separator=''\n",
+        "_ztheme_render_layout() {\n    emulate -L zsh\n    (( ! ZTHEME_ASYNC_PENDING )) || return\n    local prompt='' right='' line='' separator=''\n",
     );
     if source.blank_line_before {
         output.push_str("    prompt=$'\\n'\n");

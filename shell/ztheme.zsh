@@ -36,6 +36,7 @@ typeset -g ZTHEME_CONTEXT_KEY=""
 typeset -g ZTHEME_LAST_ERROR=""
 typeset -gi ZTHEME_GENERATION=0
 typeset -gi ZTHEME_ASYNC_FD=-1
+typeset -gi ZTHEME_ASYNC_PENDING=0
 typeset -gi ZTHEME_AUTOSUGGESTIONS_WARNING_SHOWN=${ZTHEME_AUTOSUGGESTIONS_WARNING_SHOWN:-0}
 typeset -gi ZTHEME_SYNTAX_WARNING_SHOWN=${ZTHEME_SYNTAX_WARNING_SHOWN:-0}
 typeset -g ZSH_AUTOSUGGEST_MANUAL_REBIND=1
@@ -58,6 +59,7 @@ _ztheme_close_worker() {
 
     local -i fd=$ZTHEME_ASYNC_FD
     ZTHEME_ASYNC_FD=-1
+    ZTHEME_ASYNC_PENDING=0
     (( fd >= 0 )) || return 0
 
     builtin zle -F "$fd" 2>/dev/null
@@ -152,6 +154,9 @@ _ztheme_start_worker() {
         _ztheme_close_worker
         return 1
     fi
+    ZTHEME_ASYNC_PENDING=1
+    ZTHEME_PROMPT=""
+    ZTHEME_RPROMPT=""
     return 0
 }
 
@@ -386,7 +391,6 @@ _ztheme_focus_in() {
 
     builtin printf '\e[?25h'
     _ztheme_format_directory
-    (( ZTHEME_ASYNC_FD < 0 )) || return
     _ztheme_render_layout
     builtin zle reset-prompt
 }

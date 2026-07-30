@@ -19,9 +19,10 @@ The helper does not keep background state of its own.
 
 The shell stores the incoming fragments but does not redraw the prompt for each
 one. It waits for the helper's final `done` record, then renders the complete
-prompt once. While a new snapshot is pending, the previous complete prompt
-stays visible; the first prompt remains empty until its snapshot is ready.
-This makes the update atomic without adding a second animation protocol.
+prompt once. While a snapshot is pending, Zsh leaves the prompt empty; it only
+appears once every requested async segment has completed or the deadline has
+expired. This makes the update atomic without adding a second animation
+protocol.
 
 The daemon provides that shared background state. It hosts two independent
 long-lived capabilities:
@@ -50,7 +51,7 @@ Zsh precmd/chpwd
 │       ├── on miss: execute runtime snapshots
 │       └── daemon::runtime_cache_put
 ├── compute synchronous shell segments while the helper runs
-└── keep the previous complete prompt visible
+└── leave the prompt empty until the snapshot finishes
 
 prompt protocol records
 └── Zsh stores current-generation fragments without redrawing
