@@ -340,3 +340,122 @@ fn u32_len(value: &[u8]) -> io::Result<u32> {
 fn invalid_data(message: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message)
 }
+
+#[cfg(test)]
+mod tests {
+    use std::ffi::OsString;
+    use std::io;
+    use std::os::unix::ffi::OsStringExt as _;
+    use std::path::PathBuf;
+
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+    use tokio::net::UnixStream;
+
+    use super::{
+        DAEMON_OUTDATED, GIT_ERROR, GIT_NONE, GIT_SNAPSHOT, MAGIC, MAX_PATH_BYTES, RequestHeader,
+        VERSION, read_header, read_query, read_response, read_snapshot, read_text,
+        write_git_result, write_query, write_snapshot,
+    };
+    use crate::gitstatus::{Query, Snapshot};
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn header_distinguishes_protocol_versions() {
+        for (version, expected) in [
+            (VERSION.saturating_sub(1), "client"),
+            (VERSION, "operation"),
+            (VERSION.saturating_add(1), "daemon"),
+        ] {
+            let (mut client, mut server) = UnixStream::pair().unwrap();
+            client.write_all(&MAGIC).await.unwrap();
+            client.write_u16(version).await.unwrap();
+            client.write_u8(9).await.unwrap();
+            let header = read_header(&mut server).await.unwrap();
+            match (header, expected) {
+                (RequestHeader::ClientOutdated, "client")
+                | (RequestHeader::DaemonOutdated, "daemon")
+                | (RequestHeader::Operation(9), "operation") => {}
+                _ => panic!("unexpected header for version {version}"),
+            }
+        }
+
+        let (mut client, mut server) = UnixStream::pair().unwrap();
+        client.write_all(b"NO").await.unwrap();
+        client.write_u16(VERSION).await.unwrap();
+        assert!(read_header(&mut server).await.is_err());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn git_queries_round_trip_non_utf8_paths() {
+        let path = PathBuf::from(OsString::from_vec(vec![b'/', b'r', 0xff]));
+        for query in [Query::Directory(path.clone()), Query::GitDir(path.clone())] {
+            let (mut writer, mut reader) = UnixStream::pair().unwrap();
+            write_query(&mut writer, &query).await.unwrap();
+            let decoded = read_query(&mut reader).await.unwrap();
+            assert_eq!(decoded.path(), query.path());
+            assert_eq!(decoded.is_git_dir(), query.is_git_dir());
+        }
+
+        let oversized = Query::Directory(PathBuf::from(OsString::from_vec(vec![
+            b'x';
+            MAX_PATH_BYTES + 1
+        ])));
+        let (mut writer, _) = UnixStream::pair().unwrap();
+        assert!(write_query(&mut writer, &oversized).await.is_err());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn git_snapshots_and_result_variants_round_trip() {
+        let snapshot = Snapshot {
+            worktree: PathBuf::from("/repo"),
+            oid: "0123456789abcdef".to_owned(),
+            branch: "main".to_owned(),
+            action: "merge".to_owned(),
+            ahead: 3,
+            behind: 2,
+            stashes: 1,
+            changes: 0b1_1111,
+        };
+        let (mut writer, mut reader) = UnixStream::pair().unwrap();
+        write_snapshot(&mut writer, &snapshot).await.unwrap();
+        let decoded = read_snapshot(&mut reader).await.unwrap();
+        assert_eq!(decoded.worktree, snapshot.worktree);
+        assert_eq!(decoded.oid, snapshot.oid);
+        assert_eq!(decoded.branch, snapshot.branch);
+        assert_eq!(decoded.action, snapshot.action);
+        assert_eq!(decoded.ahead, 3);
+        assert_eq!(decoded.behind, 2);
+        assert_eq!(decoded.stashes, 1);
+        assert_eq!(decoded.changes, 0b1_1111);
+
+        let (mut writer, mut reader) = UnixStream::pair().unwrap();
+        write_git_result(&mut writer, Ok(None)).await.unwrap();
+        assert_eq!(read_response(&mut reader).await.unwrap(), GIT_NONE);
+
+        let (mut writer, mut reader) = UnixStream::pair().unwrap();
+        write_git_result(&mut writer, Ok(Some(snapshot)))
+            .await
+            .unwrap();
+        assert_eq!(read_response(&mut reader).await.unwrap(), GIT_SNAPSHOT);
+        assert_eq!(read_snapshot(&mut reader).await.unwrap().branch, "main");
+
+        let (mut writer, mut reader) = UnixStream::pair().unwrap();
+        write_git_result(&mut writer, Err(io::Error::other("broken")))
+            .await
+            .unwrap();
+        assert_eq!(reader.read_u8().await.unwrap(), GIT_ERROR);
+        assert_eq!(
+            read_text(&mut reader, 1024, "error").await.unwrap(),
+            "broken"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn response_versions_are_reported_to_the_client() {
+        let (mut writer, mut reader) = UnixStream::pair().unwrap();
+        writer.write_u8(DAEMON_OUTDATED).await.unwrap();
+        assert!(matches!(
+            read_response(&mut reader).await,
+            Err(super::Error::DaemonOutdated)
+        ));
+    }
+}

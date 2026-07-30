@@ -392,3 +392,57 @@ fn user_id() -> u32 {
     // SAFETY: getuid takes no arguments and has no failure mode.
     unsafe { getuid() }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{Entry, Fingerprint, Instance, SAFETY_EXPIRY};
+
+    #[test]
+    fn development_instance_names_are_validated() {
+        assert!(Instance::development(String::new()).is_err());
+        assert!(Instance::development("x".repeat(65)).is_err());
+        assert!(Instance::development("bad\nname".to_owned()).is_err());
+        assert!(Instance::development("feature".to_owned()).is_ok());
+    }
+
+    #[test]
+    fn instance_socket_paths_are_isolated() {
+        let production = Instance::Production.socket_path();
+        let first = Instance::development("one".to_owned())
+            .unwrap()
+            .socket_path();
+        let second = Instance::development("two".to_owned())
+            .unwrap()
+            .socket_path();
+
+        assert_ne!(production, first);
+        assert_ne!(first, second);
+        assert_eq!(
+            first,
+            Instance::development("one".to_owned())
+                .unwrap()
+                .socket_path()
+        );
+    }
+
+    #[test]
+    fn fingerprints_separate_domains_labels_and_field_boundaries() {
+        let mut first = Fingerprint::new(b"one");
+        first.add_bytes(b"a", b"bc");
+        let mut second = Fingerprint::new(b"one");
+        second.add_bytes(b"ab", b"c");
+        let mut other_domain = Fingerprint::new(b"two");
+        other_domain.add_bytes(b"a", b"bc");
+
+        assert_ne!(first.finish(), second.finish());
+        assert_ne!(Fingerprint::new(b"one").finish(), other_domain.finish());
+    }
+
+    #[test]
+    fn entry_freshness_has_an_exact_safety_boundary() {
+        let entry = Entry::new(Vec::new(), 100, 1);
+        assert!(entry.is_fresh(100 + SAFETY_EXPIRY.as_secs()));
+        assert!(!entry.is_fresh(101 + SAFETY_EXPIRY.as_secs()));
+        assert!(!entry.is_fresh(99));
+    }
+}

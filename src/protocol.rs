@@ -48,3 +48,29 @@ fn write_fields(output: &mut impl Write, generation: u64, fields: &[&str]) -> io
     writeln!(output)?;
     output.flush()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{prompt_text, write_done, write_error, write_segment};
+
+    #[test]
+    fn prompt_text_escapes_prompt_sequences_and_controls() {
+        assert_eq!(prompt_text("100%\tready\n\u{1b}"), "100%% ready ?");
+        assert_eq!(prompt_text("Grüße 🚀"), "Grüße 🚀");
+    }
+
+    #[test]
+    fn records_have_exact_tab_delimited_framing() {
+        let mut output = Vec::new();
+        write_segment(&mut output, 7, "git", " main").unwrap();
+        write_error(&mut output, 7, "runtime", "bad\tvalue\nnext").unwrap();
+        write_done(&mut output, 7).unwrap();
+
+        assert_eq!(
+            String::from_utf8(output).unwrap(),
+            "ZTHEME1\t7\tsegment\tgit\t main\n\
+             ZTHEME1\t7\terror\truntime\tbad value next\n\
+             ZTHEME1\t7\tdone\n"
+        );
+    }
+}

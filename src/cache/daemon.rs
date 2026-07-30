@@ -379,3 +379,66 @@ impl Drop for SocketGuard {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+    use std::fs;
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    use super::{acquire_lock, trim_lru};
+    use crate::cache::{CacheKey, Entry};
+
+    static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+    struct TestDirectory(PathBuf);
+
+    impl TestDirectory {
+        fn new() -> Self {
+            let sequence = SEQUENCE.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "ztheme-daemon-test-{}-{sequence}",
+                std::process::id()
+            ));
+            fs::create_dir(&path).unwrap();
+            Self(path)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TestDirectory {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn daemon_lock_has_a_single_owner_and_is_reusable() {
+        let directory = TestDirectory::new();
+        let socket = directory.path().join("daemon.sock");
+        let first = acquire_lock(&socket).unwrap().unwrap();
+        assert!(acquire_lock(&socket).unwrap().is_none());
+        drop(first);
+        assert!(acquire_lock(&socket).unwrap().is_some());
+    }
+
+    #[test]
+    fn lru_trimming_keeps_the_newest_entries() {
+        let mut entries = HashMap::new();
+        for order in 0..=500 {
+            entries.insert(
+                CacheKey::from_value(order),
+                Entry::new(Vec::new(), 1, order),
+            );
+        }
+
+        trim_lru(&mut entries);
+        assert_eq!(entries.len(), 500);
+        assert!(!entries.contains_key(&CacheKey::from_value(0)));
+        assert!(entries.contains_key(&CacheKey::from_value(500)));
+    }
+}

@@ -457,3 +457,89 @@ fn hash_metadata(path: &Path, fingerprint: &mut Fingerprint) {
     let metadata = path.metadata().ok();
     fingerprint.add_metadata(b"metadata", metadata.as_ref());
 }
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    use super::{Runtime, detect};
+
+    static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+    struct TestDirectory(PathBuf);
+
+    impl TestDirectory {
+        fn new() -> Self {
+            let sequence = SEQUENCE.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "ztheme-project-test-{}-{sequence}",
+                std::process::id()
+            ));
+            fs::create_dir(&path).unwrap();
+            Self(path)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TestDirectory {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn detects_parent_markers_until_the_git_root() {
+        let directory = TestDirectory::new();
+        let nested = directory.path().join("src/deep");
+        fs::create_dir_all(&nested).unwrap();
+        fs::write(directory.path().join("Cargo.toml"), b"[package]\n").unwrap();
+        fs::write(directory.path().join("pyproject.toml"), b"[project]\n").unwrap();
+
+        let project = detect(&nested, Some(directory.path()));
+        assert!(project.runtimes.contains(&Runtime::Rust));
+        assert!(project.runtimes.contains(&Runtime::Python));
+    }
+
+    #[test]
+    fn nearest_javascript_ecosystem_wins() {
+        let directory = TestDirectory::new();
+        let nested = directory.path().join("app");
+        fs::create_dir(&nested).unwrap();
+        fs::write(directory.path().join("bun.lock"), b"").unwrap();
+        fs::write(nested.join("package.json"), b"{}").unwrap();
+
+        let project = detect(&nested, Some(directory.path()));
+        assert!(project.runtimes.contains(&Runtime::Node));
+        assert!(!project.runtimes.contains(&Runtime::Bun));
+    }
+
+    #[test]
+    fn cpp_source_suppresses_the_redundant_c_runtime() {
+        let directory = TestDirectory::new();
+        fs::write(directory.path().join("main.c"), b"").unwrap();
+        fs::write(directory.path().join("main.cpp"), b"").unwrap();
+
+        let project = detect(directory.path(), Some(directory.path()));
+        assert!(project.runtimes.contains(&Runtime::Cpp));
+        assert!(!project.runtimes.contains(&Runtime::C));
+    }
+
+    #[test]
+    fn selector_changes_invalidate_the_project_fingerprint() {
+        let directory = TestDirectory::new();
+        let before = detect(directory.path(), Some(directory.path()))
+            .fingerprint
+            .finish();
+        fs::write(directory.path().join(".python-version"), b"3.14\n").unwrap();
+        let after = detect(directory.path(), Some(directory.path()))
+            .fingerprint
+            .finish();
+
+        assert_ne!(before, after);
+    }
+}

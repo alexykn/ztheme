@@ -34,8 +34,18 @@ pub const UNTRACKED: u8 = 1 << 4;
 
 impl Query {
     pub fn from_environment(cwd: &Path) -> io::Result<Self> {
-        let git_dir = env::var_os("GIT_DIR");
-        let worktree = env::var_os("GIT_WORK_TREE");
+        Self::from_values(
+            cwd,
+            env::var_os("GIT_DIR").as_deref(),
+            env::var_os("GIT_WORK_TREE").as_deref(),
+        )
+    }
+
+    fn from_values(
+        cwd: &Path,
+        git_dir: Option<&std::ffi::OsStr>,
+        worktree: Option<&std::ffi::OsStr>,
+    ) -> io::Result<Self> {
         if git_dir.is_some() && worktree.is_some() {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
@@ -44,10 +54,10 @@ impl Query {
         }
 
         if let Some(git_dir) = git_dir {
-            return Ok(Self::GitDir(absolute(cwd, Path::new(&git_dir))));
+            return Ok(Self::GitDir(absolute(cwd, Path::new(git_dir))));
         }
         if let Some(worktree) = worktree {
-            return Ok(Self::Directory(absolute(cwd, Path::new(&worktree))));
+            return Ok(Self::Directory(absolute(cwd, Path::new(worktree))));
         }
         Ok(Self::Directory(cwd.to_path_buf()))
     }
@@ -68,5 +78,42 @@ fn absolute(base: &Path, path: &Path) -> PathBuf {
         path.to_path_buf()
     } else {
         base.join(path)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::ffi::OsStr;
+    use std::io;
+    use std::path::Path;
+
+    use super::Query;
+
+    #[test]
+    fn environment_values_select_the_correct_query_kind() {
+        let cwd = Path::new("/work/project");
+
+        let default = Query::from_values(cwd, None, None).unwrap();
+        assert!(!default.is_git_dir());
+        assert_eq!(default.path(), cwd);
+
+        let git_dir = Query::from_values(cwd, Some(OsStr::new("../repo.git")), None).unwrap();
+        assert!(git_dir.is_git_dir());
+        assert_eq!(git_dir.path(), Path::new("/work/project/../repo.git"));
+
+        let worktree = Query::from_values(cwd, None, Some(OsStr::new("checkout"))).unwrap();
+        assert!(!worktree.is_git_dir());
+        assert_eq!(worktree.path(), Path::new("/work/project/checkout"));
+    }
+
+    #[test]
+    fn environment_values_reject_git_dir_with_worktree() {
+        let error = Query::from_values(
+            Path::new("/work"),
+            Some(OsStr::new(".git")),
+            Some(OsStr::new(".")),
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Unsupported);
     }
 }

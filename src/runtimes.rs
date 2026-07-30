@@ -428,3 +428,135 @@ impl<'a> Decoder<'a> {
 fn invalid_data(message: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{RuntimeValue, decode, encode, parse_version};
+    use crate::projects::Runtime;
+
+    #[test]
+    fn parses_supported_runtime_versions() {
+        let cases = [
+            (Runtime::Python, "Python 3.14.6\n", "3.14.6"),
+            (Runtime::Perl, "5.40.2\n", "5.40.2"),
+            (
+                Runtime::Java,
+                "openjdk version \"25.0.1\" 2025-10-21\n",
+                "25.0.1",
+            ),
+            (
+                Runtime::Kotlin,
+                "info: kotlinc-jvm 2.2.20 (JRE 25)\n",
+                "2.2.20",
+            ),
+            (Runtime::Scala, "Scala code runner version 3.7.3\n", "3.7.3"),
+            (
+                Runtime::Rust,
+                "rustc 1.97.1 (8bab26f4f 2026-07-14)\n",
+                "1.97.1",
+            ),
+            (Runtime::Go, "go version go1.25.1 darwin/arm64\n", "1.25.1"),
+            (Runtime::Bun, "1.2.20\n", "1.2.20"),
+            (Runtime::Deno, "deno 2.4.5\nv8 13.7\n", "2.4.5"),
+            (Runtime::Node, "v24.5.0\n", "24.5.0"),
+            (Runtime::Ruby, "ruby 3.4.5 (2025-07-16 revision)\n", "3.4.5"),
+            (Runtime::Php, "PHP 8.4.11 (cli)\n", "8.4.11"),
+            (Runtime::Dotnet, "9.0.304\n", "9.0.304"),
+            (Runtime::C, "Apple clang version 17.0.0\n", "17.0.0"),
+            (Runtime::Cpp, "g++ (GCC) 15.2.1 20250730\n", "15.2.1"),
+            (
+                Runtime::Swift,
+                "Apple Swift version 6.2 (swiftlang)\n",
+                "6.2",
+            ),
+            (Runtime::Lua, "Lua 5.4.8  Copyright (C)\n", "5.4.8"),
+        ];
+
+        for (runtime, output, expected) in cases {
+            assert_eq!(
+                parse_version(runtime, output).as_deref(),
+                Some(expected),
+                "{}",
+                runtime.name()
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_unparseable_runtime_versions() {
+        assert_eq!(parse_version(Runtime::Python, "python unknown"), None);
+        assert_eq!(parse_version(Runtime::Go, "go version unknown"), None);
+        assert_eq!(
+            parse_version(Runtime::Java, "openjdk version unknown"),
+            None
+        );
+        assert_eq!(parse_version(Runtime::Rust, "\n\n"), None);
+    }
+
+    #[test]
+    fn runtime_cache_round_trips_and_sorts_values() {
+        let values = [
+            RuntimeValue {
+                runtime: Runtime::Rust,
+                version: "1.97.1".to_owned(),
+                label: None,
+                environment: Some("nightly".to_owned()),
+            },
+            RuntimeValue {
+                runtime: Runtime::Python,
+                version: "3.14.6".to_owned(),
+                label: Some("cpython".to_owned()),
+                environment: Some(".venv".to_owned()),
+            },
+        ];
+
+        let decoded = decode(&encode(&values).unwrap()).unwrap();
+        assert_eq!(decoded.len(), 2);
+        assert_eq!(decoded[0].runtime, Runtime::Python);
+        assert_eq!(decoded[0].version, "3.14.6");
+        assert_eq!(decoded[0].label.as_deref(), Some("cpython"));
+        assert_eq!(decoded[0].environment.as_deref(), Some(".venv"));
+        assert_eq!(decoded[1].runtime, Runtime::Rust);
+        assert_eq!(decoded[1].environment.as_deref(), Some("nightly"));
+    }
+
+    #[test]
+    fn runtime_cache_rejects_malformed_records() {
+        let duplicate = [
+            2,
+            Runtime::Rust.id(),
+            0,
+            1,
+            b'1',
+            0,
+            0,
+            Runtime::Rust.id(),
+            0,
+            1,
+            b'2',
+            0,
+            0,
+        ];
+        assert!(decode(&duplicate).is_err());
+
+        assert!(decode(&[1, u8::MAX]).is_err());
+        assert!(decode(&[1, Runtime::Rust.id(), 0, 0, 2]).is_err());
+
+        let valid = encode(&[RuntimeValue {
+            runtime: Runtime::Node,
+            version: "24.5.0".to_owned(),
+            label: None,
+            environment: None,
+        }])
+        .unwrap();
+        for length in 0..valid.len() {
+            assert!(
+                decode(&valid[..length]).is_err(),
+                "accepted length {length}"
+            );
+        }
+        let mut trailing = valid;
+        trailing.push(0);
+        assert!(decode(&trailing).is_err());
+    }
+}

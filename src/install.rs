@@ -251,3 +251,69 @@ fn user_id() -> u32 {
     // SAFETY: getuid has no preconditions and returns the real user ID.
     unsafe { getuid() }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt as _;
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    use super::{TemporaryDirectory, verify_sha256};
+
+    static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+    struct TestDirectory(PathBuf);
+
+    impl TestDirectory {
+        fn new() -> Self {
+            let sequence = SEQUENCE.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "ztheme-install-test-{}-{sequence}",
+                std::process::id()
+            ));
+            fs::create_dir(&path).unwrap();
+            Self(path)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TestDirectory {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn checksum_verification_accepts_only_the_expected_digest() {
+        let directory = TestDirectory::new();
+        let path = directory.path().join("archive");
+        fs::write(&path, b"hello\n").unwrap();
+
+        verify_sha256(
+            &path,
+            "5891b5b522d5df086d0ff0b110fbd9d21bb4fc7163af34d08286a2e846f6be03",
+            "fixture",
+        )
+        .unwrap();
+        assert!(verify_sha256(&path, &"0".repeat(64), "fixture").is_err());
+    }
+
+    #[test]
+    fn temporary_install_directories_are_private_and_cleaned_up() {
+        let directory = TestDirectory::new();
+        let temporary_path;
+        {
+            let temporary = TemporaryDirectory::create(directory.path(), "fixture").unwrap();
+            temporary_path = temporary.path().to_path_buf();
+            assert_eq!(
+                fs::metadata(&temporary_path).unwrap().permissions().mode() & 0o777,
+                0o700
+            );
+        }
+        assert!(!temporary_path.exists());
+    }
+}

@@ -466,3 +466,149 @@ impl<'a> Decoder<'a> {
         self.position == self.bytes.len()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use super::{AsyncTheme, compile};
+    use crate::gitstatus::{CONFLICTED, DELETED, STAGED, Snapshot, UNSTAGED, UNTRACKED};
+    use crate::projects::Runtime;
+    use crate::runtimes::RuntimeValue;
+    use crate::theme::{DEFAULT_THEME, SegmentId, Theme, parse_versioned, validate};
+
+    fn theme() -> Theme {
+        parse_versioned(DEFAULT_THEME, "default")
+            .unwrap()
+            .try_into()
+            .unwrap()
+    }
+
+    fn compiled() -> AsyncTheme {
+        let theme = theme();
+        validate(&theme).unwrap();
+        compile(
+            &theme,
+            &[SegmentId::Git, SegmentId::Runtime(Runtime::Python)],
+        )
+        .unwrap()
+    }
+
+    fn snapshot() -> Snapshot {
+        Snapshot {
+            worktree: PathBuf::from("/repo"),
+            oid: "0123456789abcdef".to_owned(),
+            branch: "main".to_owned(),
+            action: String::new(),
+            ahead: 0,
+            behind: 0,
+            stashes: 0,
+            changes: 0,
+        }
+    }
+
+    #[test]
+    fn encoded_theme_preserves_rendering_behavior() {
+        let original = compiled();
+        let decoded = AsyncTheme::decode_hex(&original.encode_hex().unwrap()).unwrap();
+        let mut git = snapshot();
+        git.ahead = 2;
+        git.changes = STAGED | UNTRACKED;
+        let runtime = RuntimeValue {
+            runtime: Runtime::Python,
+            version: "3.14.6".to_owned(),
+            label: Some("cpython".to_owned()),
+            environment: Some(".venv".to_owned()),
+        };
+
+        assert_eq!(
+            decoded.render_git(Some(&git)),
+            original.render_git(Some(&git))
+        );
+        assert_eq!(
+            decoded.render_runtime(&runtime),
+            original.render_runtime(&runtime)
+        );
+        assert_eq!(decoded.runtimes(), [Runtime::Python]);
+    }
+
+    #[test]
+    fn git_rendering_handles_detached_heads_and_marker_order() {
+        let theme = compiled();
+        let mut git = snapshot();
+        git.branch.clear();
+        git.action = "rebase%onto\nmain".to_owned();
+        git.ahead = 2;
+        git.behind = 1;
+        git.stashes = 3;
+        git.changes = CONFLICTED | STAGED | UNSTAGED | DELETED | UNTRACKED;
+
+        let rendered = theme.render_git(Some(&git));
+        assert!(rendered.contains("01234567"));
+        assert!(rendered.contains("rebase%%onto main"));
+        assert!(rendered.contains("⇕2/1"));
+        assert!(rendered.contains("$3"));
+
+        let markers = ["=", "+", "!", "✘", "?"];
+        let mut position = 0;
+        for marker in markers {
+            let next = rendered[position..].find(marker).unwrap() + position;
+            assert!(next >= position);
+            position = next + marker.len();
+        }
+    }
+
+    #[test]
+    fn empty_git_and_runtime_values_do_not_render_content() {
+        let theme = compiled();
+        assert_eq!(theme.render_git(None), "");
+
+        let mut git = snapshot();
+        git.branch.clear();
+        git.oid.clear();
+        assert_eq!(theme.render_git(Some(&git)), "");
+
+        let runtime = RuntimeValue {
+            runtime: Runtime::Python,
+            version: String::new(),
+            label: None,
+            environment: None,
+        };
+        assert_eq!(theme.render_runtime(&runtime).as_deref(), Some(""));
+    }
+
+    #[test]
+    fn runtime_rendering_sanitizes_dynamic_values() {
+        let rendered = compiled()
+            .render_runtime(&RuntimeValue {
+                runtime: Runtime::Python,
+                version: "3.14%dev".to_owned(),
+                label: Some("cpython\nfast".to_owned()),
+                environment: Some("venv\tone".to_owned()),
+            })
+            .unwrap();
+
+        assert!(rendered.contains("cpython fast"));
+        assert!(rendered.contains("3.14%%dev"));
+        assert!(rendered.contains("venv one"));
+    }
+
+    #[test]
+    fn malformed_encoded_themes_are_rejected() {
+        assert!(AsyncTheme::decode_hex("0").is_err());
+        assert!(AsyncTheme::decode_hex("zz").is_err());
+        assert!(AsyncTheme::decode_hex("02").is_err());
+
+        let encoded = compiled().encode_hex().unwrap();
+        for length in (0..encoded.len()).step_by(2) {
+            assert!(
+                AsyncTheme::decode_hex(&encoded[..length]).is_err(),
+                "accepted byte length {}",
+                length / 2
+            );
+        }
+        let mut trailing = encoded;
+        trailing.push_str("00");
+        assert!(AsyncTheme::decode_hex(&trailing).is_err());
+    }
+}

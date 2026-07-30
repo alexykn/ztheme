@@ -260,3 +260,110 @@ fn invalid_data_with_field(field: &'static str, message: &'static str) -> io::Er
         format!("gitstatusd {field} {message}"),
     )
 }
+
+#[cfg(test)]
+mod tests {
+    use super::parse_response;
+    use crate::gitstatus::{CONFLICTED, DELETED, STAGED, UNSTAGED, UNTRACKED};
+
+    fn response(request_id: u64, fields: &[String]) -> Vec<u8> {
+        let mut values = vec![request_id.to_string(), "1".to_owned()];
+        values.extend_from_slice(fields);
+        values.join("\x1f").into_bytes()
+    }
+
+    fn fields() -> Vec<String> {
+        [
+            "/repo",
+            "0123456789abcdef",
+            "main",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "0",
+            "0",
+            "0",
+            "0",
+            "0",
+            "0",
+            "0",
+            "0",
+            "0",
+            "0",
+            "0",
+        ]
+        .map(str::to_owned)
+        .to_vec()
+    }
+
+    #[test]
+    fn parses_non_repository_and_repository_metadata() {
+        assert!(parse_response(9, b"9\x1f0").unwrap().is_none());
+
+        let mut values = fields();
+        values[6] = "merge".to_owned();
+        values[12] = "3".to_owned();
+        values[13] = "2".to_owned();
+        values[14] = "4".to_owned();
+        let snapshot = parse_response(9, &response(9, &values)).unwrap().unwrap();
+        assert_eq!(snapshot.worktree.to_string_lossy(), "/repo");
+        assert_eq!(snapshot.oid, "0123456789abcdef");
+        assert_eq!(snapshot.branch, "main");
+        assert_eq!(snapshot.action, "merge");
+        assert_eq!(snapshot.ahead, 3);
+        assert_eq!(snapshot.behind, 2);
+        assert_eq!(snapshot.stashes, 4);
+    }
+
+    #[test]
+    fn maps_change_counts_without_double_counting_deletions() {
+        let cases = [
+            (1, 0, 0, 0, STAGED),
+            (0, 1, 0, 0, UNSTAGED),
+            (1, 0, 0, 1, DELETED),
+            (0, 1, 1, 0, DELETED),
+            (2, 0, 0, 1, STAGED | DELETED),
+            (0, 2, 1, 0, UNSTAGED | DELETED),
+        ];
+
+        for (staged, unstaged, unstaged_deleted, staged_deleted, expected) in cases {
+            let mut values = fields();
+            values[8] = staged.to_string();
+            values[9] = unstaged.to_string();
+            values[16] = unstaged_deleted.to_string();
+            values[18] = staged_deleted.to_string();
+            let snapshot = parse_response(1, &response(1, &values)).unwrap().unwrap();
+            assert_eq!(snapshot.changes, expected);
+        }
+    }
+
+    #[test]
+    fn maps_conflicted_and_untracked_counts() {
+        let mut values = fields();
+        values[10] = "1".to_owned();
+        values[11] = "2".to_owned();
+        let snapshot = parse_response(1, &response(1, &values)).unwrap().unwrap();
+        assert_eq!(snapshot.changes, CONFLICTED | UNTRACKED);
+    }
+
+    #[test]
+    fn rejects_malformed_responses() {
+        assert!(parse_response(2, b"1\x1f0").is_err());
+        assert!(parse_response(1, b"1\x1f2").is_err());
+        assert!(parse_response(1, b"1\x1f1\x1f/repo").is_err());
+
+        let mut invalid_count = fields();
+        invalid_count[8] = "-1".to_owned();
+        assert!(parse_response(1, &response(1, &invalid_count)).is_err());
+
+        let mut invalid_utf8 = response(1, &fields());
+        let branch = invalid_utf8
+            .windows(4)
+            .position(|window| window == b"main")
+            .unwrap();
+        invalid_utf8[branch] = 0xff;
+        assert!(parse_response(1, &invalid_utf8).is_err());
+    }
+}

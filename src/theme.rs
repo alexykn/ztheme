@@ -822,3 +822,113 @@ fn shell_quote(value: &str) -> String {
 fn invalid(message: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message.into())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{CompiledTheme, DEFAULT_THEME, Theme, merge, parse_versioned, validate};
+
+    fn merged_theme(overlay: &str) -> std::io::Result<Theme> {
+        let mut value = parse_versioned(DEFAULT_THEME, "default")?;
+        merge(&mut value, parse_versioned(overlay, "overlay")?);
+        value
+            .try_into()
+            .map_err(|error| super::invalid(format!("invalid theme: {error}")))
+    }
+
+    fn validate_overlay(overlay: &str) -> std::io::Result<()> {
+        validate(&merged_theme(overlay)?).map(|_| ())
+    }
+
+    #[test]
+    fn embedded_default_theme_compiles_to_zsh() {
+        let theme = merged_theme("version = 1").unwrap();
+        let layout = validate(&theme).unwrap();
+        let compiled = CompiledTheme {
+            theme,
+            layout,
+            selector: "default".to_owned(),
+        };
+        let zsh = compiled.zsh().unwrap();
+
+        assert!(zsh.contains("__ZTHEME_THEME_SELECTOR='default'"));
+        assert!(zsh.contains("_ztheme_render_layout()"));
+        assert!(zsh.contains("ZSH_HIGHLIGHT_STYLES[command]"));
+        assert!(!zsh.contains("@ZTHEME_"));
+    }
+
+    #[test]
+    fn overlays_replace_only_explicit_values() {
+        let theme = merged_theme(
+            r##"
+version = 1
+
+[palette]
+path = "#112233"
+
+[layout]
+lines = [["directory"], ["character"]]
+"##,
+        )
+        .unwrap();
+
+        assert_eq!(theme.palette["path"], "#112233");
+        assert_eq!(theme.palette["accent"], "#f9e2af");
+        assert_eq!(theme.layout.lines.len(), 2);
+        assert_eq!(theme.layout.lines[0], ["directory"]);
+        assert_eq!(theme.segments.git.symbol, " ");
+        validate(&theme).unwrap();
+    }
+
+    #[test]
+    fn invalid_theme_contracts_are_rejected() {
+        let cases = [
+            ("unknown field", "version = 1\nsurprise = true"),
+            (
+                "duplicate segment",
+                "version = 1\n[layout]\nlines = [[\"directory\", \"directory\"]]",
+            ),
+            (
+                "async right segment",
+                "version = 1\n[layout]\nright = [\"git\"]",
+            ),
+            (
+                "misplaced character",
+                "version = 1\n[layout]\nlines = [[\"character\", \"directory\"]]",
+            ),
+            (
+                "invalid palette color",
+                "version = 1\n[palette]\naccent = \"orange\"",
+            ),
+            (
+                "control character",
+                "version = 1\n[segments.git]\nsymbol = \"bad\\n\"",
+            ),
+            (
+                "invalid width",
+                "version = 1\n[segments.directory.width]\npercent = 0",
+            ),
+            (
+                "invalid spacing",
+                "version = 1\n[segments.character.spacing]\nafter = 17",
+            ),
+            (
+                "unknown syntax style",
+                "version = 1\n[input.syntax]\nnot-a-real-style = \"none\"",
+            ),
+        ];
+
+        for (name, overlay) in cases {
+            assert!(
+                validate_overlay(overlay).is_err(),
+                "accepted invalid case: {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn unsupported_or_missing_versions_are_rejected_before_merge() {
+        assert!(parse_versioned("theme = \"x\"", "missing").is_err());
+        assert!(parse_versioned("version = 2", "future").is_err());
+        assert!(parse_versioned("version = \"1\"", "wrong type").is_err());
+    }
+}
