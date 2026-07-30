@@ -58,9 +58,9 @@ line = "none"
 named-fd = { foreground = "text" }
 numeric-fd = { foreground = "text" }
 path = { foreground = "path", underline = true }
-path_pathseparator = { foreground = "muted", underline = true }
+path_pathseparator = { foreground = "path", underline = true }
 path_prefix = { foreground = "path", underline = true }
-path_prefix_pathseparator = { foreground = "muted", underline = true }
+path_prefix_pathseparator = { foreground = "path", underline = true }
 precommand = { foreground = "accent" }
 process-substitution = { foreground = "text" }
 process-substitution-delimiter = { foreground = "muted" }
