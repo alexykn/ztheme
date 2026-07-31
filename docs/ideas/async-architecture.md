@@ -42,13 +42,3 @@ also cannot remove Tokio because the socket transport remains async. A blocking
 daemon core would instead add blocking-worker boundaries, standard mutexes, and
 separate cache and `gitstatusd` implementations without buying a stable latency
 gain.
-
-## Result of the experiment
-
-Keep the current async client and async daemon cores.
-
-The async client preserves useful parallelism when the cache misses, while its
-overhead is lost in the noise on cache hits. The async daemon already matches
-the transport model and handles concurrent clients without another execution
-layer. Maintaining sync alternatives would add more architecture than the
-measurements justify.
