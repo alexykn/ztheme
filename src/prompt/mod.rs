@@ -83,59 +83,64 @@ pub async fn snapshot(
         let Ok(Some(result)) = timeout_at(deadline, tasks.join_next()).await else {
             break;
         };
-        match result {
-            Ok(SnapshotResult::Git(Ok(snapshot))) => {
-                protocol::write_segment(
-                    &mut io::stdout().lock(),
-                    generation,
-                    "git",
-                    &theme.render_git(snapshot.as_ref()),
-                )?;
-            }
-            Ok(SnapshotResult::Git(Err(error))) => {
-                protocol::write_error(
-                    &mut io::stdout().lock(),
-                    generation,
-                    "git",
-                    &record_error(&error),
-                )?;
-            }
-            Ok(SnapshotResult::Runtimes(Ok(values))) => {
-                for runtime in &active_runtimes {
-                    let fragment = values
-                        .iter()
-                        .find(|value| value.runtime == *runtime)
-                        .and_then(|value| theme.render_runtime(value))
-                        .unwrap_or_default();
-                    protocol::write_segment(
-                        &mut io::stdout().lock(),
-                        generation,
-                        runtime.name(),
-                        &fragment,
-                    )?;
-                }
-            }
-            Ok(SnapshotResult::Runtimes(Err(error))) => {
-                protocol::write_error(
-                    &mut io::stdout().lock(),
-                    generation,
-                    "runtime",
-                    &record_error(&error),
-                )?;
-            }
-            Err(error) => {
-                protocol::write_error(
-                    &mut io::stdout().lock(),
-                    generation,
-                    "snapshot",
-                    &record_error(&io::Error::other(error)),
-                )?;
-            }
-        }
+        write_result(result, generation, &active_runtimes, theme)?;
     }
 
     tasks.abort_all();
     protocol::write_done(&mut io::stdout().lock(), generation)
+}
+
+/// Renders one completed task result as protocol records: a Git snapshot or
+/// error segment, then the runtime segments that have values. `done` is
+/// written separately once every task has finished or the deadline passed.
+fn write_result(
+    result: Result<SnapshotResult, tokio::task::JoinError>,
+    generation: u64,
+    active_runtimes: &[Runtime],
+    theme: &theme::AsyncTheme,
+) -> io::Result<()> {
+    match result {
+        Ok(SnapshotResult::Git(Ok(snapshot))) => protocol::write_segment(
+            &mut io::stdout().lock(),
+            generation,
+            "git",
+            &theme.render_git(snapshot.as_ref()),
+        ),
+        Ok(SnapshotResult::Git(Err(error))) => protocol::write_error(
+            &mut io::stdout().lock(),
+            generation,
+            "git",
+            &record_error(&error),
+        ),
+        Ok(SnapshotResult::Runtimes(Ok(values))) => {
+            for runtime in active_runtimes {
+                let fragment = values
+                    .iter()
+                    .find(|value| value.runtime == *runtime)
+                    .and_then(|value| theme.render_runtime(value))
+                    .unwrap_or_default();
+                protocol::write_segment(
+                    &mut io::stdout().lock(),
+                    generation,
+                    runtime.name(),
+                    &fragment,
+                )?;
+            }
+            Ok(())
+        }
+        Ok(SnapshotResult::Runtimes(Err(error))) => protocol::write_error(
+            &mut io::stdout().lock(),
+            generation,
+            "runtime",
+            &record_error(&error),
+        ),
+        Err(error) => protocol::write_error(
+            &mut io::stdout().lock(),
+            generation,
+            "snapshot",
+            &record_error(&io::Error::other(error)),
+        ),
+    }
 }
 
 pub fn init_zsh(instance: &daemon::Instance, selector: Option<&str>) -> io::Result<String> {

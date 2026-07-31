@@ -283,8 +283,6 @@ print -r -- "SHELL_PID=$$" >> "$ZTHEME_TEST_MARKER"
 print -r -- "READY" >> "$ZTHEME_TEST_MARKER"
 while true; do read -r __zt_line || break; done
 "#,
-        instance = instance,
-        preamble = preamble,
     );
     child
         .stdin
@@ -706,6 +704,193 @@ fn client_request_with_env(generation: u64, cwd: &[u8], env: &[(&str, &str)]) ->
     bytes
 }
 
+/// Sends a request and reads records until `done`, asserting each record
+/// carries the request's generation.
+fn send_and_read_until_done(
+    stdin: &mut std::process::ChildStdin,
+    stdout: &mut BufReader<std::process::ChildStdout>,
+    generation: u64,
+    cwd: &[u8],
+    env: &[(&str, &str)],
+) -> Vec<String> {
+    stdin
+        .write_all(&client_request_with_env(generation, cwd, env))
+        .unwrap();
+    read_until_done(stdout, generation)
+}
+
+/// Reads records until `done`, asserting each record carries the generation.
+fn read_until_done(
+    stdout: &mut BufReader<std::process::ChildStdout>,
+    generation: u64,
+) -> Vec<String> {
+    let mut records = Vec::new();
+    loop {
+        let mut line = String::new();
+        assert_ne!(
+            stdout.read_line(&mut line).unwrap(),
+            0,
+            "client closed its output before done"
+        );
+        let fields: Vec<&str> = line.trim_end().split('\t').collect();
+        assert_eq!(fields[0], "ZTHEME1");
+        assert_eq!(fields[1], generation.to_string());
+        records.push(line.clone());
+        if fields[2] == "done" {
+            return records;
+        }
+    }
+}
+
+/// Sends a request and returns the rendered python segment fragment.
+fn send_python_request(
+    stdin: &mut std::process::ChildStdin,
+    stdout: &mut BufReader<std::process::ChildStdout>,
+    generation: u64,
+    cwd: &[u8],
+    env: &[(&str, &str)],
+) -> String {
+    let records = send_and_read_until_done(stdin, stdout, generation, cwd, env);
+    records
+        .iter()
+        .find_map(|record| {
+            let fields: Vec<&str> = record.trim_end().split('\t').collect();
+            (fields[2] == "segment" && fields[3] == "python").then(|| fields[4].to_owned())
+        })
+        .unwrap_or_default()
+}
+
+/// Writes a python-only theme whose environment label carries a `env:` prefix.
+fn write_python_env_theme(sandbox: &Sandbox, name: &str) {
+    sandbox.write_theme(
+        name,
+        "version = 1\n[layout]\nlines = [[\"python\"]]\nright = []\nseparator = \" | \"\nblank_line_before = false\n[segments.python]\nsymbol = \"py\"\nstyle = { foreground = \"accent\" }\nenvironment = { prefix = \"env:\" }\n",
+    );
+}
+
+/// Writes a git-only theme.
+fn write_git_theme(sandbox: &Sandbox, name: &str) {
+    sandbox.write_theme(
+        name,
+        "version = 1\n[layout]\nlines = [[\"git\"]]\nright = []\nseparator = \" | \"\nblank_line_before = false\n",
+    );
+}
+
+const PLAIN_PYTHON: &str =
+    "#include <stdio.h>\nint main(void) { printf(\"Python 3.12.0\\n\"); return 0; }\n";
+
+const ENV_ECHO_PYTHON: &str = "#include <stdio.h>\n#include <stdlib.h>\nint main(void) { const char* v = getenv(\"VIRTUAL_ENV\"); const char* r = getenv(\"RUSTUP_TOOLCHAIN\"); printf(\"Python %s-%s-3.12.0\\n\", v ? v : \"unset\", r ? r : \"unset\"); return 0; }\n";
+
+/// Compiles the fake python into the sandbox, warms the dyld cache, and adds
+/// the pyproject marker so the python runtime is detected. Returns the
+/// request PATH value that resolves `python` to the fake.
+fn install_fake_python(sandbox: &Sandbox, source: &str) -> String {
+    let bin = sandbox.home.join("bin");
+    fs::create_dir_all(&bin).unwrap();
+    let fake_python = bin.join("python");
+    let source_path = sandbox.home.join("fake_python.c");
+    fs::write(&source_path, source).unwrap();
+    let compiled = Command::new("cc")
+        .arg(&source_path)
+        .arg("-o")
+        .arg(&fake_python)
+        .status()
+        .unwrap();
+    assert!(compiled.success(), "failed to compile fake python");
+    // Warm the dyld cache so the first request's exec is fast.
+    assert!(Command::new(&fake_python).status().unwrap().success());
+    fs::write(sandbox.home.join("pyproject.toml"), "[]\n").unwrap();
+    bin.to_str().unwrap().to_owned()
+}
+
+/// Replaces gitstatusd with one that answers after 150 ms.
+fn install_delayed_gitstatusd(sandbox: &Sandbox) {
+    let delayed = sandbox.data.join("ztheme/gitstatus/v1.5/gitstatusd");
+    fs::create_dir_all(delayed.parent().unwrap()).unwrap();
+    fs::write(&delayed, "#!/bin/sh\n/bin/sleep 0.15\nexec cat\n").unwrap();
+    fs::set_permissions(&delayed, fs::Permissions::from_mode(0o700)).unwrap();
+}
+
+/// Spawns the shared server for an instance and waits for its socket.
+fn spawn_server(sandbox: &Sandbox, instance: &str) -> (ChildGuard, PathBuf) {
+    let server = sandbox
+        .command()
+        .args(["__daemon", "--dev", instance])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut server = ChildGuard::new(server);
+    let socket = wait_for_socket(server.child(), &sandbox.runtime);
+    (server, socket)
+}
+
+/// Runs `init zsh` for an instance and theme and extracts the compiled theme.
+fn theme_hex(sandbox: &Sandbox, instance: &str, theme: &str) -> String {
+    let generated = sandbox
+        .command()
+        .args(["init", "zsh", "--dev", instance, "--theme", theme])
+        .output()
+        .unwrap();
+    assert_success(&generated);
+    let source = String::from_utf8(generated.stdout).unwrap();
+    source
+        .lines()
+        .find_map(|line| line.strip_prefix("typeset -g __ZTHEME_ASYNC_THEME='"))
+        .and_then(|rest| rest.strip_suffix('\''))
+        .unwrap()
+        .to_owned()
+}
+
+/// Spawns a client daemon with the test process as its parent and optional
+/// extra startup environment.
+fn spawn_client_daemon(
+    sandbox: &Sandbox,
+    instance: &str,
+    hex: &str,
+    extra_env: &[(&str, &str)],
+) -> (
+    Child,
+    std::process::ChildStdin,
+    BufReader<std::process::ChildStdout>,
+) {
+    let mut command = sandbox.command();
+    for (name, value) in extra_env {
+        command.env(name, value);
+    }
+    let mut child = command
+        .args([
+            "__client-daemon",
+            "--shell-pid",
+            &std::process::id().to_string(),
+            "--theme",
+            hex,
+            "--dev",
+            instance,
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let stdin = child.stdin.take().unwrap();
+    let stdout = BufReader::new(child.stdout.take().unwrap());
+    (child, stdin, stdout)
+}
+
+/// Shuts the shared server down and reaps it.
+fn shutdown_server(server: ChildGuard, socket: &Path) {
+    shutdown_outdated_daemon(socket);
+    let mut server = server;
+    assert!(
+        wait_for_exit(server.child(), PROCESS_TIMEOUT)
+            .unwrap()
+            .success()
+    );
+    server.wait().unwrap();
+}
+
 #[test]
 fn client_daemon_round_trips_requests_and_exits_on_eof() {
     let sandbox = Sandbox::new();
@@ -899,7 +1084,6 @@ while (( ! found_done )); do
 done
 _ztheme_stop_client
 "#,
-        instance = instance
     );
     let output = sandbox.zsh(&script);
     assert_success(&output);
@@ -953,7 +1137,6 @@ typeset -F elapsed=$(( EPOCHREALTIME - start_time ))
 (( elapsed < 1.5 )) || exit 86  # timed out instead of seeing EOF
 _ztheme_stop_client
 "#,
-        instance = instance
     );
     let output = sandbox.zsh(&script);
     assert_success(&output);
@@ -977,218 +1160,58 @@ fn client_daemon_applies_per_request_environment() {
     let sandbox = Sandbox::new();
     sandbox.install_fake_gitstatus();
     let instance = format!("client-env-{}", SEQUENCE.fetch_add(1, Ordering::Relaxed));
-    sandbox.write_theme(
-        "slowpython",
-        "version = 1\n[layout]\nlines = [[\"python\"]]\nright = []\nseparator = \" | \"\nblank_line_before = false\n[segments.python]\nsymbol = \"py\"\nstyle = { foreground = \"accent\" }\nenvironment = { prefix = \"env:\" }\n",
-    );
-
-    // The version command must finish well inside the runtime command
-    // timeout (250 ms). The first exec of a freshly compiled binary under a
-    // stripped environment is slow (dyld warmup), so it is executed once
-    // before the client starts.
-    let bin = sandbox.home.join("bin");
-    fs::create_dir_all(&bin).unwrap();
-    let fake_source = sandbox.home.join("fake_python.c");
-    fs::write(
-        &fake_source,
-        "#include <stdio.h>\nint main(void) { printf(\"Python 3.12.0\\n\"); return 0; }\n",
-    )
-    .unwrap();
-    let fake_python = bin.join("python");
-    let compiled = Command::new("cc")
-        .arg(&fake_source)
-        .arg("-o")
-        .arg(&fake_python)
-        .status()
-        .unwrap();
-    assert!(compiled.success(), "failed to compile fake python");
-    // Warm the dyld cache so the first request's exec is fast.
-    assert!(Command::new(&fake_python).status().unwrap().success());
-    // Marker so the python runtime is detected in the request cwd.
-    fs::write(sandbox.home.join("pyproject.toml"), "[]\n").unwrap();
-
-    let server = sandbox
-        .command()
-        .args(["__daemon", "--dev", &instance])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .unwrap();
-    let mut server = ChildGuard::new(server);
-    let socket = wait_for_socket(server.child(), &sandbox.runtime);
-
-    let generated = sandbox
-        .command()
-        .args(["init", "zsh", "--dev", &instance, "--theme", "slowpython"])
-        .output()
-        .unwrap();
-    assert_success(&generated);
-    let source = String::from_utf8(generated.stdout).unwrap();
-    let hex = source
-        .lines()
-        .find_map(|line| line.strip_prefix("typeset -g __ZTHEME_ASYNC_THEME='"))
-        .and_then(|rest| rest.strip_suffix('\''))
-        .unwrap()
-        .to_owned();
-
-    let mut child = sandbox
-        .command()
-        .args([
-            "__client-daemon",
-            "--shell-pid",
-            &std::process::id().to_string(),
-            "--theme",
-            &hex,
-            "--dev",
-            &instance,
-        ])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .unwrap();
-    let mut stdin = child.stdin.take().unwrap();
-    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    write_python_env_theme(&sandbox, "envpython");
+    let fake_path = install_fake_python(&sandbox, PLAIN_PYTHON);
+    let (server, socket) = spawn_server(&sandbox, &instance);
+    let hex = theme_hex(&sandbox, &instance, "envpython");
+    let (mut child, mut stdin, mut stdout) = spawn_client_daemon(&sandbox, &instance, &hex, &[]);
     let cwd = sandbox.home.to_str().unwrap().as_bytes().to_vec();
-    let fake_path = bin.to_str().unwrap();
-
-    fn read_until_done(
-        stdout: &mut BufReader<std::process::ChildStdout>,
-        generation: u64,
-    ) -> Vec<String> {
-        let mut fragments = Vec::new();
-        loop {
-            let mut line = String::new();
-            assert_ne!(
-                stdout.read_line(&mut line).unwrap(),
-                0,
-                "client closed its output before done"
-            );
-            let fields: Vec<&str> = line.trim_end().split('\t').collect();
-            assert_eq!(fields[0], "ZTHEME1");
-            assert_eq!(fields[1], generation.to_string());
-            if fields[2] == "segment" {
-                assert_eq!(fields[3], "python");
-                fragments.push(fields[4].to_owned());
-            }
-            if fields[2] == "done" {
-                return fragments;
-            }
-        }
-    }
 
     // Request 1: VIRTUAL_ENV unset -> no environment label.
-    stdin
-        .write_all(&client_request_with_env(1, &cwd, &[("PATH", fake_path)]))
-        .unwrap();
-    let first = read_until_done(&mut stdout, 1);
+    let first = send_python_request(&mut stdin, &mut stdout, 1, &cwd, &[("PATH", &fake_path)]);
     assert!(
-        first.iter().all(|fragment| !fragment.contains("env:")),
-        "unexpected label without VIRTUAL_ENV: {first:?}"
+        !first.contains("env:"),
+        "unexpected label without VIRTUAL_ENV: {first}"
     );
 
     // Request 2: VIRTUAL_ENV set -> the label must reflect the new value.
-    stdin
-        .write_all(&client_request_with_env(
-            2,
-            &cwd,
-            &[("PATH", fake_path), ("VIRTUAL_ENV", "/venv-b")],
-        ))
-        .unwrap();
-    let second = read_until_done(&mut stdout, 2);
+    let second = send_python_request(
+        &mut stdin,
+        &mut stdout,
+        2,
+        &cwd,
+        &[("PATH", &fake_path), ("VIRTUAL_ENV", "/venv-b")],
+    );
     assert!(
-        second
-            .iter()
-            .any(|fragment| fragment.contains("env:venv-b")),
-        "request environment was not applied: {second:?}"
+        second.contains("env:venv-b"),
+        "request environment was not applied: {second}"
     );
 
     // Request 3: back to the unset state; the previous value must not leak.
-    stdin
-        .write_all(&client_request_with_env(3, &cwd, &[("PATH", fake_path)]))
-        .unwrap();
-    let third = read_until_done(&mut stdout, 3);
+    let third = send_python_request(&mut stdin, &mut stdout, 3, &cwd, &[("PATH", &fake_path)]);
     assert!(
-        third
-            .iter()
-            .all(|fragment| !fragment.contains("env:venv-b")),
-        "stale environment leaked into a later request: {third:?}"
+        !third.contains("env:venv-b"),
+        "stale environment leaked into a later request: {third}"
     );
 
     drop(stdin);
-    let status = wait_for_exit(&mut child, PROCESS_TIMEOUT).unwrap();
-    assert!(status.success());
-
-    shutdown_outdated_daemon(&socket);
     assert!(
-        wait_for_exit(server.child(), PROCESS_TIMEOUT)
+        wait_for_exit(&mut child, PROCESS_TIMEOUT)
             .unwrap()
             .success()
     );
-    server.wait().unwrap();
+    shutdown_server(server, &socket);
 }
 
 #[test]
 fn client_daemon_cancels_in_flight_work_without_emitting_stale_records() {
     let sandbox = Sandbox::new();
     let instance = format!("client-cancel-{}", SEQUENCE.fetch_add(1, Ordering::Relaxed));
-    sandbox.write_theme(
-        "gitonly",
-        "version = 1\n[layout]\nlines = [[\"git\"]]\nright = []\nseparator = \" | \"\nblank_line_before = false\n",
-    );
-
-    // A gitstatusd that answers after a delay: the daemon spawns it with a
-    // normal environment, so the delay is reliable (unlike a runtime command
-    // in the client's stripped request environment).
-    let delayed = sandbox.data.join("ztheme/gitstatus/v1.5/gitstatusd");
-    fs::create_dir_all(delayed.parent().unwrap()).unwrap();
-    fs::write(&delayed, "#!/bin/sh\n/bin/sleep 0.15\nexec cat\n").unwrap();
-    fs::set_permissions(&delayed, fs::Permissions::from_mode(0o700)).unwrap();
-
-    let server = sandbox
-        .command()
-        .args(["__daemon", "--dev", &instance])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .unwrap();
-    let mut server = ChildGuard::new(server);
-    let socket = wait_for_socket(server.child(), &sandbox.runtime);
-
-    let generated = sandbox
-        .command()
-        .args(["init", "zsh", "--dev", &instance, "--theme", "gitonly"])
-        .output()
-        .unwrap();
-    assert_success(&generated);
-    let source = String::from_utf8(generated.stdout).unwrap();
-    let hex = source
-        .lines()
-        .find_map(|line| line.strip_prefix("typeset -g __ZTHEME_ASYNC_THEME='"))
-        .and_then(|rest| rest.strip_suffix('\''))
-        .unwrap()
-        .to_owned();
-
-    let mut child = sandbox
-        .command()
-        .args([
-            "__client-daemon",
-            "--shell-pid",
-            &std::process::id().to_string(),
-            "--theme",
-            &hex,
-            "--dev",
-            &instance,
-        ])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .unwrap();
-    let mut stdin = child.stdin.take().unwrap();
-    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    write_git_theme(&sandbox, "gitonly");
+    install_delayed_gitstatusd(&sandbox);
+    let (server, socket) = spawn_server(&sandbox, &instance);
+    let hex = theme_hex(&sandbox, &instance, "gitonly");
+    let (mut child, mut stdin, mut stdout) = spawn_client_daemon(&sandbox, &instance, &hex, &[]);
     let cwd = sandbox.home.to_str().unwrap().as_bytes().to_vec();
     let fake_path = sandbox.data.to_str().unwrap();
 
@@ -1206,74 +1229,39 @@ fn client_daemon_cancels_in_flight_work_without_emitting_stale_records() {
             &[("PATH", fake_path), ("VIRTUAL_ENV", "/venv-b")],
         ))
         .unwrap();
-
-    let mut records = Vec::new();
-    loop {
-        let mut line = String::new();
-        assert_ne!(
-            stdout.read_line(&mut line).unwrap(),
-            0,
-            "client closed its output before done"
-        );
-        let fields: Vec<&str> = line.trim_end().split('\t').collect();
-        assert_eq!(fields[0], "ZTHEME1");
-        assert_eq!(fields[1], "2", "superseded request leaked records: {line}");
-        records.push(line.clone());
-        if fields[2] == "done" {
-            break;
-        }
-    }
+    let records = read_until_done(&mut stdout, 2);
     assert!(records.len() >= 2, "expected records before done");
 
     // Request C: the client still serves normally after the supersede.
-    stdin
-        .write_all(&client_request_with_env(3, &cwd, &[("PATH", fake_path)]))
-        .unwrap();
-    let mut c_records = Vec::new();
-    loop {
-        let mut line = String::new();
-        assert_ne!(
-            stdout.read_line(&mut line).unwrap(),
-            0,
-            "client closed its output before done"
-        );
-        let fields: Vec<&str> = line.trim_end().split('\t').collect();
-        assert_eq!(fields[0], "ZTHEME1");
-        assert_eq!(fields[1], "3");
-        c_records.push(line.clone());
-        if fields[2] == "done" {
-            break;
-        }
-    }
+    let c_records =
+        send_and_read_until_done(&mut stdin, &mut stdout, 3, &cwd, &[("PATH", fake_path)]);
     assert!(c_records.len() >= 2, "expected records before done");
 
     drop(stdin);
-    let status = wait_for_exit(&mut child, PROCESS_TIMEOUT).unwrap();
-    assert!(status.success());
-
-    shutdown_outdated_daemon(&socket);
     assert!(
-        wait_for_exit(server.child(), PROCESS_TIMEOUT)
+        wait_for_exit(&mut child, PROCESS_TIMEOUT)
             .unwrap()
             .success()
     );
-    server.wait().unwrap();
+    shutdown_server(server, &socket);
 }
 
 fn stale_fifo_count() -> usize {
     let base = std::env::var("TMPDIR").unwrap_or_else(|_| "/tmp".into());
     let prefix = format!("ztheme-{}-", user_id());
-    fs::read_dir(&base)
-        .map(|entries| {
-            entries
-                .flatten()
-                .filter(|entry| {
-                    let name = entry.file_name().to_string_lossy().into_owned();
-                    name.starts_with(&prefix) && (name.ends_with(".req") || name.ends_with(".resp"))
-                })
-                .count()
-        })
-        .unwrap_or(0)
+    fs::read_dir(base).map_or(0, |entries| {
+        entries
+            .flatten()
+            .filter(|entry| {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                name.starts_with(&prefix)
+                    && matches!(
+                        Path::new(&name).extension().and_then(OsStr::to_str),
+                        Some("req" | "resp")
+                    )
+            })
+            .count()
+    })
 }
 
 /// Polls until the shared $TMPDIR holds no ztheme FIFO entries beyond the
@@ -1337,7 +1325,6 @@ eval "$("$ZTHEME_TEST_BIN" init zsh --dev {instance})" || exit 80
 (( __ZTHEME_HAS_ASYNC )) || exit 81
 "$HOME/bin/fdprobe" "$ZTHEME_REQ_FD" "$ZTHEME_RESP_FD" > "$HOME/fdprobe.out"
 "#,
-        instance = instance
     );
     let output = sandbox.zsh(&script);
     assert_success(&output);
@@ -1695,7 +1682,6 @@ _ztheme_stop_client
 (( ZTHEME_RESP_FD < 0 )) || exit 85
 print -u1 -- "OK"
 "#,
-        instance = instance
     );
     let output = sandbox.zsh(&script);
     assert_success(&output);
@@ -1723,150 +1709,56 @@ fn runtime_child_receives_the_request_environment() {
         "client-child-env-{}",
         SEQUENCE.fetch_add(1, Ordering::Relaxed)
     );
-    sandbox.write_theme(
-        "envpython",
-        "version = 1\n[layout]\nlines = [[\"python\"]]\nright = []\nseparator = \" | \"\nblank_line_before = false\n[segments.python]\nsymbol = \"py\"\nstyle = { foreground = \"accent\" }\nenvironment = { prefix = \"env:\" }\n",
-    );
-
-    // The fake python echoes its own VIRTUAL_ENV and RUSTUP_TOOLCHAIN into
-    // the version field, so the parsed segment proves exactly which values
-    // the runtime child received.
-    let bin = sandbox.home.join("bin");
-    fs::create_dir_all(&bin).unwrap();
-    let fake_source = sandbox.home.join("fake_python.c");
-    fs::write(
-        &fake_source,
-        "#include <stdio.h>\n#include <stdlib.h>\n\
-         int main(void) { const char* v = getenv(\"VIRTUAL_ENV\"); const char* r = getenv(\"RUSTUP_TOOLCHAIN\"); \n\
-             printf(\"Python %s-%s-3.12.0\\n\", v ? v : \"unset\", r ? r : \"unset\"); return 0; }\n",
-    )
-    .unwrap();
-    let fake_python = bin.join("python");
-    let compiled = Command::new("cc")
-        .arg(&fake_source)
-        .arg("-o")
-        .arg(&fake_python)
-        .status()
-        .unwrap();
-    assert!(compiled.success(), "failed to compile fake python");
-    assert!(Command::new(&fake_python).status().unwrap().success());
-    fs::write(sandbox.home.join("pyproject.toml"), "[]\n").unwrap();
-
-    let server = sandbox
-        .command()
-        .args(["__daemon", "--dev", &instance])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .unwrap();
-    let mut server = ChildGuard::new(server);
-    let socket = wait_for_socket(server.child(), &sandbox.runtime);
-
-    let generated = sandbox
-        .command()
-        .args(["init", "zsh", "--dev", &instance, "--theme", "envpython"])
-        .output()
-        .unwrap();
-    assert_success(&generated);
-    let source = String::from_utf8(generated.stdout).unwrap();
-    let hex = source
-        .lines()
-        .find_map(|line| line.strip_prefix("typeset -g __ZTHEME_ASYNC_THEME='"))
-        .and_then(|rest| rest.strip_suffix('\''))
-        .unwrap()
-        .to_owned();
+    write_python_env_theme(&sandbox, "envpython");
+    let fake_path = install_fake_python(&sandbox, ENV_ECHO_PYTHON);
+    let (server, socket) = spawn_server(&sandbox, &instance);
+    let hex = theme_hex(&sandbox, &instance, "envpython");
 
     // Start the client with a VIRTUAL_ENV of its own: a request that leaves
     // the field empty must still remove it from the child command, proving
     // explicit env_remove rather than accidental inheritance.
-    let mut child = sandbox
-        .command()
-        .env("VIRTUAL_ENV", "/startup-venv")
-        .env("RUSTUP_TOOLCHAIN", "startup-toolchain")
-        .args([
-            "__client-daemon",
-            "--shell-pid",
-            &std::process::id().to_string(),
-            "--theme",
-            &hex,
-            "--dev",
-            &instance,
-        ])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .unwrap();
-    let mut stdin = child.stdin.take().unwrap();
-    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    let (mut child, mut stdin, mut stdout) = spawn_client_daemon(
+        &sandbox,
+        &instance,
+        &hex,
+        &[
+            ("VIRTUAL_ENV", "/startup-venv"),
+            ("RUSTUP_TOOLCHAIN", "startup-toolchain"),
+        ],
+    );
     let cwd = sandbox.home.to_str().unwrap().as_bytes().to_vec();
-    let fake_path = bin.to_str().unwrap();
-
-    fn read_python_fragment(
-        stdout: &mut BufReader<std::process::ChildStdout>,
-        generation: u64,
-    ) -> String {
-        let mut fragment = String::new();
-        loop {
-            let mut line = String::new();
-            assert_ne!(
-                stdout.read_line(&mut line).unwrap(),
-                0,
-                "client closed its output before done"
-            );
-            let fields: Vec<&str> = line.trim_end().split('\t').collect();
-            assert_eq!(fields[0], "ZTHEME1");
-            assert_eq!(fields[1], generation.to_string());
-            if fields[2] == "segment" {
-                assert_eq!(fields[3], "python");
-                fragment = fields[4].to_owned();
-            }
-            if fields[2] == "done" {
-                return fragment;
-            }
-        }
-    }
 
     // Request 1: the child must see exactly the request values.
-    stdin
-        .write_all(&client_request_with_env(
-            1,
-            &cwd,
-            &[
-                ("PATH", fake_path),
-                ("VIRTUAL_ENV", "/venv-a"),
-                ("RUSTUP_TOOLCHAIN", "nightly"),
-            ],
-        ))
-        .unwrap();
-    let first = read_python_fragment(&mut stdout, 1);
+    let first = send_python_request(
+        &mut stdin,
+        &mut stdout,
+        1,
+        &cwd,
+        &[
+            ("PATH", &fake_path),
+            ("VIRTUAL_ENV", "/venv-a"),
+            ("RUSTUP_TOOLCHAIN", "nightly"),
+        ],
+    );
     assert!(
         first.contains("/venv-a-nightly-3.12.0"),
         "child did not receive the request environment: {first}"
     );
 
     // Request 2: empty fields must remove the inherited startup values.
-    stdin
-        .write_all(&client_request_with_env(2, &cwd, &[("PATH", fake_path)]))
-        .unwrap();
-    let second = read_python_fragment(&mut stdout, 2);
+    let second = send_python_request(&mut stdin, &mut stdout, 2, &cwd, &[("PATH", &fake_path)]);
     assert!(
         second.contains("unset-unset-3.12.0"),
         "child inherited stale startup environment: {second}"
     );
 
     drop(stdin);
-    let status = wait_for_exit(&mut child, PROCESS_TIMEOUT).unwrap();
-    assert!(status.success());
-
-    shutdown_outdated_daemon(&socket);
     assert!(
-        wait_for_exit(server.child(), PROCESS_TIMEOUT)
+        wait_for_exit(&mut child, PROCESS_TIMEOUT)
             .unwrap()
             .success()
     );
-    server.wait().unwrap();
+    shutdown_server(server, &socket);
 }
 
 #[test]
@@ -1874,108 +1766,15 @@ fn two_clients_share_one_server_without_environment_contamination() {
     let sandbox = Sandbox::new();
     sandbox.install_fake_gitstatus();
     let instance = format!("client-two-{}", SEQUENCE.fetch_add(1, Ordering::Relaxed));
-    sandbox.write_theme(
-        "envpython",
-        "version = 1\n[layout]\nlines = [[\"python\"]]\nright = []\nseparator = \" | \"\nblank_line_before = false\n[segments.python]\nsymbol = \"py\"\nstyle = { foreground = \"accent\" }\nenvironment = { prefix = \"env:\" }\n",
-    );
-    let bin = sandbox.home.join("bin");
-    fs::create_dir_all(&bin).unwrap();
-    let fake_source = sandbox.home.join("fake_python.c");
-    fs::write(
-        &fake_source,
-        "#include <stdio.h>\nint main(void) { printf(\"Python 3.12.0\\n\"); return 0; }\n",
-    )
-    .unwrap();
-    let fake_python = bin.join("python");
-    let compiled = Command::new("cc")
-        .arg(&fake_source)
-        .arg("-o")
-        .arg(&fake_python)
-        .status()
-        .unwrap();
-    assert!(compiled.success(), "failed to compile fake python");
-    assert!(Command::new(&fake_python).status().unwrap().success());
-    fs::write(sandbox.home.join("pyproject.toml"), "[]\n").unwrap();
-
-    let server = sandbox
-        .command()
-        .args(["__daemon", "--dev", &instance])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .unwrap();
-    let mut server = ChildGuard::new(server);
-    let socket = wait_for_socket(server.child(), &sandbox.runtime);
-
-    let generated = sandbox
-        .command()
-        .args(["init", "zsh", "--dev", &instance, "--theme", "envpython"])
-        .output()
-        .unwrap();
-    assert_success(&generated);
-    let source = String::from_utf8(generated.stdout).unwrap();
-    let hex = source
-        .lines()
-        .find_map(|line| line.strip_prefix("typeset -g __ZTHEME_ASYNC_THEME='"))
-        .and_then(|rest| rest.strip_suffix('\''))
-        .unwrap()
-        .to_owned();
-
-    fn spawn_client(
-        sandbox: &Sandbox,
-        instance: &str,
-        hex: &str,
-    ) -> (std::process::Child, BufReader<std::process::ChildStdout>) {
-        let mut child = sandbox
-            .command()
-            .args([
-                "__client-daemon",
-                "--shell-pid",
-                &std::process::id().to_string(),
-                "--theme",
-                hex,
-                "--dev",
-                instance,
-            ])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap();
-        let stdout = BufReader::new(child.stdout.take().unwrap());
-        (child, stdout)
-    }
-
-    fn read_until_done_fragment(
-        stdout: &mut BufReader<std::process::ChildStdout>,
-        generation: u64,
-    ) -> Vec<String> {
-        let mut fragments = Vec::new();
-        loop {
-            let mut line = String::new();
-            assert_ne!(
-                stdout.read_line(&mut line).unwrap(),
-                0,
-                "client closed its output before done"
-            );
-            let fields: Vec<&str> = line.trim_end().split('\t').collect();
-            assert_eq!(fields[0], "ZTHEME1");
-            assert_eq!(fields[1], generation.to_string());
-            if fields[2] == "segment" {
-                assert_eq!(fields[3], "python");
-                fragments.push(fields[4].to_owned());
-            }
-            if fields[2] == "done" {
-                return fragments;
-            }
-        }
-    }
-
-    let (mut client_a, mut stdout_a) = spawn_client(&sandbox, &instance, &hex);
-    let (mut client_b, mut stdout_b) = spawn_client(&sandbox, &instance, &hex);
+    write_python_env_theme(&sandbox, "envpython");
+    let fake_path = install_fake_python(&sandbox, PLAIN_PYTHON);
+    let (server, socket) = spawn_server(&sandbox, &instance);
+    let hex = theme_hex(&sandbox, &instance, "envpython");
+    let (mut client_a, mut stdin_a, mut stdout_a) =
+        spawn_client_daemon(&sandbox, &instance, &hex, &[]);
+    let (mut client_b, mut stdin_b, mut stdout_b) =
+        spawn_client_daemon(&sandbox, &instance, &hex, &[]);
     let cwd = sandbox.home.to_str().unwrap().as_bytes().to_vec();
-    let fake_path = bin.to_str().unwrap();
 
     // Both clients stay live against the one shared server. The requests are
     // sequential (each answered before the next is sent, so nothing
@@ -1985,67 +1784,52 @@ fn two_clients_share_one_server_without_environment_contamination() {
     // before any request, so this does not exercise daemon startup; the
     // absence of process-global mutation is what structurally rules out the
     // daemon inheriting a request's transient environment.
-    client_a
-        .stdin
-        .as_mut()
-        .unwrap()
-        .write_all(&client_request_with_env(
-            1,
-            &cwd,
-            &[("PATH", fake_path), ("VIRTUAL_ENV", "/venv-a")],
-        ))
-        .unwrap();
-    let a1 = read_until_done_fragment(&mut stdout_a, 1);
-
-    client_b
-        .stdin
-        .as_mut()
-        .unwrap()
-        .write_all(&client_request_with_env(
-            2,
-            &cwd,
-            &[("PATH", fake_path), ("VIRTUAL_ENV", "/venv-b")],
-        ))
-        .unwrap();
-    let b1 = read_until_done_fragment(&mut stdout_b, 2);
-
-    client_a
-        .stdin
-        .as_mut()
-        .unwrap()
-        .write_all(&client_request_with_env(
-            3,
-            &cwd,
-            &[("PATH", fake_path), ("VIRTUAL_ENV", "/venv-c")],
-        ))
-        .unwrap();
-    let a2 = read_until_done_fragment(&mut stdout_a, 3);
-
-    assert!(
-        a1.iter().any(|fragment| fragment.contains("env:venv-a")),
-        "client A did not render its own environment: {a1:?}"
+    let a1 = send_python_request(
+        &mut stdin_a,
+        &mut stdout_a,
+        1,
+        &cwd,
+        &[("PATH", &fake_path), ("VIRTUAL_ENV", "/venv-a")],
     );
-    assert!(
-        b1.iter().any(|fragment| fragment.contains("env:venv-b")),
-        "client B did not render its own environment: {b1:?}"
+    let b1 = send_python_request(
+        &mut stdin_b,
+        &mut stdout_b,
+        2,
+        &cwd,
+        &[("PATH", &fake_path), ("VIRTUAL_ENV", "/venv-b")],
     );
-    assert!(
-        a2.iter().any(|fragment| fragment.contains("env:venv-c")),
-        "client A's later request was contaminated: {a2:?}"
+    let a2 = send_python_request(
+        &mut stdin_a,
+        &mut stdout_a,
+        3,
+        &cwd,
+        &[("PATH", &fake_path), ("VIRTUAL_ENV", "/venv-c")],
     );
 
-    drop(client_a.stdin.take());
-    drop(client_b.stdin.take());
-    let status_a = wait_for_exit(&mut client_a, PROCESS_TIMEOUT).unwrap();
-    let status_b = wait_for_exit(&mut client_b, PROCESS_TIMEOUT).unwrap();
-    assert!(status_a.success());
-    assert!(status_b.success());
-
-    shutdown_outdated_daemon(&socket);
     assert!(
-        wait_for_exit(server.child(), PROCESS_TIMEOUT)
+        a1.contains("env:venv-a"),
+        "client A did not render its own environment: {a1}"
+    );
+    assert!(
+        b1.contains("env:venv-b"),
+        "client B did not render its own environment: {b1}"
+    );
+    assert!(
+        a2.contains("env:venv-c"),
+        "client A's later request was contaminated: {a2}"
+    );
+
+    drop(stdin_a);
+    drop(stdin_b);
+    assert!(
+        wait_for_exit(&mut client_a, PROCESS_TIMEOUT)
             .unwrap()
             .success()
     );
-    server.wait().unwrap();
+    assert!(
+        wait_for_exit(&mut client_b, PROCESS_TIMEOUT)
+            .unwrap()
+            .success()
+    );
+    shutdown_server(server, &socket);
 }

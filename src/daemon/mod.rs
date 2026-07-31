@@ -381,13 +381,14 @@ fn lock_path(socket: &Path) -> PathBuf {
 }
 
 /// The runtime directory for sockets and lock files. Production uses the
-/// per-user /tmp directory; tests override it with ZTHEME_RUNTIME_DIR so
+/// per-user /tmp directory; tests override it with `ZTHEME_RUNTIME_DIR` so
 /// development instances never pollute the shared directory. The override
 /// inherits to every spawned process (shell, client, server).
 fn runtime_directory() -> PathBuf {
-    std::env::var_os("ZTHEME_RUNTIME_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| Path::new("/tmp").join(format!("ztheme-{}", user_id())))
+    std::env::var_os("ZTHEME_RUNTIME_DIR").map_or_else(
+        || Path::new("/tmp").join(format!("ztheme-{}", user_id())),
+        PathBuf::from,
+    )
 }
 
 fn user_id() -> u32 {

@@ -59,53 +59,50 @@ pub async fn serve_client(
     loop {
         tokio::select! {
             request = receiver.recv() => {
-                match request {
-                    Some(request) => {
-                        // A new request supersedes any in-flight work: the records
-                        // of an older generation would be ignored by the shell, and
-                        // letting the work run on would waste time and read the new
-                        // request's environment. The superseded task is aborted and
-                        // awaited before the environment is touched: its JoinSet
-                        // drops only when the task is actually destroyed, and the
-                        // request tasks read environment values after awaits, so
-                        // without the await they could resume after the mutation
-                        // below with the new request's environment. This ordering
-                        // (destroy the request task and its JoinSet, then mutate
-                        // the environment) is the correctness invariant; the
-                        // integration tests can only observe its black-box
-                        // consequences (no stale records, clean per-request
-                        // environment), so this comment carries the stronger
-                        // guarantee.
-                        if let Some(handle) = current.take() {
-                            handle.abort();
-                            if let Ok(Err(error)) = handle.await {
-                                // The request's records could not be written, so
-                                // the response pipe is gone; keep serving has no
-                                // point.
-                                return Err(error);
-                            }
+                if let Some(request) = request {
+                    // A new request supersedes any in-flight work: the records
+                    // of an older generation would be ignored by the shell, and
+                    // letting the work run on would waste time and read the new
+                    // request's environment. The superseded task is aborted and
+                    // awaited before the environment is touched: its JoinSet
+                    // drops only when the task is actually destroyed, and the
+                    // request tasks read environment values after awaits, so
+                    // without the await they could resume after the mutation
+                    // below with the new request's environment. This ordering
+                    // (destroy the request task and its JoinSet, then mutate
+                    // the environment) is the correctness invariant; the
+                    // integration tests can only observe its black-box
+                    // consequences (no stale records, clean per-request
+                    // environment), so this comment carries the stronger
+                    // guarantee.
+                    if let Some(handle) = current.take() {
+                        handle.abort();
+                        if let Ok(Err(error)) = handle.await {
+                            // The request's records could not be written, so
+                            // the response pipe is gone; keep serving has no
+                            // point.
+                            return Err(error);
                         }
-                        let instance = instance.clone();
-                        let theme = Arc::clone(&theme);
-                        let environment = Arc::new(request.environment);
-                        current = Some(tokio::spawn(async move {
-                            snapshot(
-                                request.generation,
-                                request.cwd,
-                                instance,
-                                environment,
-                                &theme,
-                            )
-                            .await
-                        }));
                     }
-                    None => {
-                        // EOF only arrives after the writer closes, so finish any
-                        // in-flight request first: its records still have a reader,
-                        // or its writes fail with EPIPE if the shell is really gone.
-                        cancel_current(&mut current).await;
-                        break;
-                    }
+                    let instance = instance.clone();
+                    let theme = Arc::clone(&theme);
+                    let environment = Arc::new(request.environment);
+                    current = Some(tokio::spawn(async move {
+                        snapshot(
+                            request.generation,
+                            request.cwd,
+                            instance,
+                            environment,
+                            &theme,
+                        )
+                        .await
+                    }));
+                } else {
+                    // EOF only arrives after the writer closes, so finish any
+                    // in-flight request first: its records still have a reader,
+                    // or its writes fail with EPIPE if the shell is really gone.
+                    cancel_current(&mut current).await;
+                    break;
                 }
             }
             _ = parent_check.tick() => {
@@ -125,8 +122,8 @@ pub async fn serve_client(
     Ok(())
 }
 
-/// Aborts and awaits the in-flight request task, destroying its JoinSet and
-/// the request tasks it spawned.
+/// Aborts and awaits the in-flight request task, destroying its `JoinSet`
+/// and the request tasks it spawned.
 async fn cancel_current(current: &mut Option<JoinHandle<io::Result<()>>>) {
     if let Some(handle) = current.take() {
         handle.abort();
