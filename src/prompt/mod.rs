@@ -6,12 +6,14 @@ pub(crate) use client::serve_client;
 use std::env;
 use std::io;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::sync::oneshot;
 use tokio::task::JoinSet;
 use tokio::time::{Instant, timeout_at};
 
+use crate::environment::PromptEnvironment;
 use crate::runtime::{self, Runtime, RuntimeValue};
 use crate::{daemon, gitstatus, setup, theme};
 
@@ -25,6 +27,7 @@ pub async fn snapshot(
     generation: u64,
     cwd: PathBuf,
     instance: daemon::Instance,
+    environment: Arc<PromptEnvironment>,
     theme: &theme::AsyncTheme,
 ) -> io::Result<()> {
     let git_enabled = theme.git_enabled();
@@ -36,9 +39,14 @@ pub async fn snapshot(
         let (started_tx, started_rx) = oneshot::channel();
         let git_instance = instance.clone();
         let git_cwd = cwd.clone();
+        let git_environment = Arc::clone(&environment);
         tasks.spawn(async move {
             let _ = started_tx.send(());
-            let result = match gitstatus::Query::from_environment(&git_cwd) {
+            let result = match gitstatus::Query::from_values(
+                &git_cwd,
+                git_environment.git_dir.as_deref(),
+                git_environment.git_work_tree.as_deref(),
+            ) {
                 Ok(query) => daemon::git_status(&git_instance, &query).await,
                 Err(error) => Err(error),
             };
@@ -57,9 +65,16 @@ pub async fn snapshot(
         let runtime_instance = instance.clone();
         let runtime_cwd = cwd.clone();
         let requested = active_runtimes.clone();
+        let runtime_environment = Arc::clone(&environment);
         tasks.spawn(async move {
             SnapshotResult::Runtimes(
-                runtime_values(&runtime_instance, runtime_cwd, requested).await,
+                runtime_values(
+                    &runtime_instance,
+                    runtime_cwd,
+                    requested,
+                    runtime_environment,
+                )
+                .await,
             )
         });
     }
@@ -168,14 +183,15 @@ async fn runtime_values(
     instance: &daemon::Instance,
     cwd: PathBuf,
     active: Vec<Runtime>,
+    environment: Arc<PromptEnvironment>,
 ) -> io::Result<Vec<RuntimeValue>> {
-    let git_root = runtime::detect::worktree_root(&cwd);
-    let project = runtime::detect::detect(&cwd, git_root.as_deref());
+    let git_root = runtime::detect::worktree_root(&cwd, &environment);
+    let project = runtime::detect::detect(&cwd, git_root.as_deref(), &environment);
     let detected = active
         .into_iter()
         .filter(|runtime| project.runtimes.contains(runtime))
         .collect::<Vec<_>>();
-    let key = runtime::cache_key(&project, &detected);
+    let key = runtime::cache_key(&project, &detected, &environment);
 
     match daemon::runtime_cache_get(instance, key).await {
         Ok(Some(value)) => match runtime::decode(&value) {
@@ -186,7 +202,7 @@ async fn runtime_values(
         Err(error) => eprintln!("ztheme: runtime cache unavailable: {error}"),
     }
 
-    let values = runtime::snapshot(project, detected).await;
+    let values = runtime::snapshot(project, detected, Arc::clone(&environment)).await;
     let encoded = runtime::encode(&values)?;
     if let Err(error) = daemon::runtime_cache_put(instance, key, &encoded).await {
         eprintln!("ztheme: runtime cache write failed: {error}");

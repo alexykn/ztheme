@@ -54,7 +54,7 @@ impl Instance {
     }
 
     fn socket_path(&self) -> PathBuf {
-        let directory = Path::new("/tmp").join(format!("ztheme-{}", user_id()));
+        let directory = runtime_directory();
         match self {
             Self::Production => directory.join("daemon.sock"),
             Self::Development(name) => {
@@ -380,6 +380,16 @@ fn lock_path(socket: &Path) -> PathBuf {
     socket.with_extension("lock")
 }
 
+/// The runtime directory for sockets and lock files. Production uses the
+/// per-user /tmp directory; tests override it with ZTHEME_RUNTIME_DIR so
+/// development instances never pollute the shared directory. The override
+/// inherits to every spawned process (shell, client, server).
+fn runtime_directory() -> PathBuf {
+    std::env::var_os("ZTHEME_RUNTIME_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| Path::new("/tmp").join(format!("ztheme-{}", user_id())))
+}
+
 fn user_id() -> u32 {
     unsafe extern "C" {
         fn getuid() -> u32;
@@ -457,7 +467,7 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering};
 
-    use super::{Instance, acquire_lock, daemon_unavailable, replacement_transition};
+    use super::{Instance, acquire_lock, daemon_unavailable, lock_path, replacement_transition};
 
     static SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
@@ -493,6 +503,35 @@ mod tests {
         assert!(acquire_lock(&socket).unwrap().is_none());
         drop(first);
         assert!(acquire_lock(&socket).unwrap().is_some());
+    }
+
+    #[test]
+    fn repeated_lock_generations_reuse_one_lock_file() {
+        let directory = TestDirectory::new();
+        let socket = directory.path().join("daemon.sock");
+        let lock_path = lock_path(&socket);
+
+        for _ in 0..20 {
+            // A transient WouldBlock can follow the previous owner's drop
+            // under load; retry within a bounded window, as the daemon's
+            // startup loop does. The bound keeps a real descriptor leak from
+            // hanging the suite instead of failing it.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            let guard = loop {
+                if let Some(guard) = acquire_lock(&socket).unwrap() {
+                    break guard;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "lock was not released after dropping its previous owner"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            };
+            assert!(lock_path.exists());
+            drop(guard);
+        }
+
+        assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 1);
     }
 
     #[test]

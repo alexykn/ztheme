@@ -1,5 +1,4 @@
-use std::env;
-use std::ffi::{OsStr, OsString};
+use std::ffi::OsString;
 use std::io;
 use std::os::unix::ffi::OsStringExt as _;
 use std::os::unix::process::parent_id;
@@ -12,6 +11,7 @@ use tokio::task::JoinHandle;
 use tokio::time::{Instant, MissedTickBehavior, interval_at};
 
 use crate::daemon;
+use crate::environment::PromptEnvironment;
 use crate::prompt::snapshot;
 use crate::theme::AsyncTheme;
 
@@ -85,11 +85,18 @@ pub async fn serve_client(
                                 return Err(error);
                             }
                         }
-                        apply_request_env(&request.env);
                         let instance = instance.clone();
                         let theme = Arc::clone(&theme);
+                        let environment = Arc::new(request.environment);
                         current = Some(tokio::spawn(async move {
-                            snapshot(request.generation, request.cwd, instance, &theme).await
+                            snapshot(
+                                request.generation,
+                                request.cwd,
+                                instance,
+                                environment,
+                                &theme,
+                            )
+                            .await
                         }));
                     }
                     None => {
@@ -158,24 +165,7 @@ fn spawn_request_reader(sender: mpsc::Sender<Request>) {
 struct Request {
     generation: u64,
     cwd: PathBuf,
-    env: RequestEnv,
-}
-
-#[derive(Default)]
-struct RequestEnv {
-    path: Option<OsString>,
-    home: Option<OsString>,
-    git_dir: Option<OsString>,
-    git_work_tree: Option<OsString>,
-    git_ceilings: Option<OsString>,
-    virtual_env: Option<OsString>,
-    conda_prefix: Option<OsString>,
-    conda_default_env: Option<OsString>,
-    perlbrew_perl: Option<OsString>,
-    plenv_version: Option<OsString>,
-    rustup_toolchain: Option<OsString>,
-    rbenv_version: Option<OsString>,
-    ruby_version: Option<OsString>,
+    environment: PromptEnvironment,
 }
 
 /// Parses one NUL-delimited request. `Ok(None)` means a clean EOF before any
@@ -209,7 +199,7 @@ where
         return Err(invalid_data("client request cwd is not absolute"));
     }
 
-    let env = RequestEnv {
+    let environment = PromptEnvironment {
         path: env_field(read_field(reader)?)?,
         home: env_field(read_field(reader)?)?,
         git_dir: env_field(read_field(reader)?)?,
@@ -228,7 +218,7 @@ where
     Ok(Some(Request {
         generation,
         cwd,
-        env,
+        environment,
     }))
 }
 
@@ -258,33 +248,6 @@ fn env_field(field: Option<Vec<u8>>) -> io::Result<Option<OsString>> {
 
 fn truncated() -> io::Error {
     invalid_data("client request is truncated")
-}
-
-fn apply_request_env(env: &RequestEnv) {
-    set_env("PATH", env.path.as_deref());
-    set_env("HOME", env.home.as_deref());
-    set_env("GIT_DIR", env.git_dir.as_deref());
-    set_env("GIT_WORK_TREE", env.git_work_tree.as_deref());
-    set_env("GIT_CEILING_DIRECTORIES", env.git_ceilings.as_deref());
-    set_env("VIRTUAL_ENV", env.virtual_env.as_deref());
-    set_env("CONDA_PREFIX", env.conda_prefix.as_deref());
-    set_env("CONDA_DEFAULT_ENV", env.conda_default_env.as_deref());
-    set_env("PERLBREW_PERL", env.perlbrew_perl.as_deref());
-    set_env("PLENV_VERSION", env.plenv_version.as_deref());
-    set_env("RUSTUP_TOOLCHAIN", env.rustup_toolchain.as_deref());
-    set_env("RBENV_VERSION", env.rbenv_version.as_deref());
-    set_env("RUBY_VERSION", env.ruby_version.as_deref());
-}
-
-fn set_env(name: &str, value: Option<&OsStr>) {
-    // SAFETY: this client runs on a current-thread Tokio runtime. Before
-    // mutating the process environment, the previous request task is aborted
-    // and awaited, so no request task can read the environment concurrently
-    // or afterward.
-    match value {
-        Some(value) => unsafe { env::set_var(name, value) },
-        None => unsafe { env::remove_var(name) },
-    }
 }
 
 fn invalid_data(message: &'static str) -> io::Error {
@@ -344,13 +307,16 @@ mod tests {
         assert_eq!(request.generation, 42);
         assert_eq!(request.cwd, Path::new("/work/project"));
         assert_eq!(
-            request.env.path.as_deref(),
+            request.environment.path.as_deref(),
             Some(OsStr::new("/opt/bin:/usr/bin"))
         );
-        assert_eq!(request.env.home.as_deref(), Some(OsStr::new("/home/user")));
-        assert_eq!(request.env.git_dir, None);
         assert_eq!(
-            request.env.git_work_tree.as_deref(),
+            request.environment.home.as_deref(),
+            Some(OsStr::new("/home/user"))
+        );
+        assert_eq!(request.environment.git_dir, None);
+        assert_eq!(
+            request.environment.git_work_tree.as_deref(),
             Some(OsStr::new("/work/tree"))
         );
         assert!(read_request(&mut reader).unwrap().is_none());
@@ -371,7 +337,7 @@ mod tests {
 
         assert_eq!(request.cwd.as_os_str(), OsStr::from_bytes(&cwd));
         assert_eq!(
-            request.env.git_dir.as_deref(),
+            request.environment.git_dir.as_deref(),
             Some(OsStr::from_bytes(&git_dir))
         );
     }

@@ -1,8 +1,9 @@
 use std::env;
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::io::AsyncReadExt;
@@ -13,6 +14,7 @@ use tokio::time::timeout;
 pub(crate) mod detect;
 
 use crate::cache::CacheKey;
+use crate::environment::PromptEnvironment;
 
 const COMMAND_TIMEOUT: Duration = Duration::from_millis(250);
 const OUTPUT_LIMIT: u64 = 4_097;
@@ -86,20 +88,27 @@ pub(crate) struct RuntimeValue {
     pub(crate) environment: Option<String>,
 }
 
-pub(crate) async fn snapshot(project: detect::Project, active: Vec<Runtime>) -> Vec<RuntimeValue> {
+pub(crate) async fn snapshot(
+    project: detect::Project,
+    active: Vec<Runtime>,
+    environment: Arc<PromptEnvironment>,
+) -> Vec<RuntimeValue> {
     let mut tasks = JoinSet::new();
 
     for runtime in active {
         let cwd = project.cwd.clone();
+        let environment = Arc::clone(&environment);
         tasks.spawn(async move {
-            let spec = spec(runtime);
-            let output = capture(&cwd, &spec).await?;
+            let spec = spec(runtime, &environment);
+            let output = capture(&cwd, &spec, &environment).await?;
             let version = (spec.parse_version)(&output)?;
             Some(RuntimeValue {
                 runtime,
                 version,
                 label: spec.label.map(str::to_owned),
-                environment: spec.environment.and_then(|environment| environment()),
+                environment: spec
+                    .environment
+                    .and_then(|environment_fn| environment_fn(&environment)),
             })
         });
     }
@@ -114,13 +123,17 @@ pub(crate) async fn snapshot(project: detect::Project, active: Vec<Runtime>) -> 
     values
 }
 
-pub(crate) fn cache_key(project: &detect::Project, active: &[Runtime]) -> CacheKey {
+pub(crate) fn cache_key(
+    project: &detect::Project,
+    active: &[Runtime],
+    environment: &PromptEnvironment,
+) -> CacheKey {
     let mut hash = project.hash.clone();
     hash.add_u64(b"runtime-snapshot-version", 1);
 
     for runtime in active {
         hash.add_u64(b"runtime-command", u64::from(runtime.id()));
-        let spec = spec(*runtime);
+        let spec = spec(*runtime, environment);
         hash.add_os(b"runtime-program", &spec.program);
         hash.add_u64(
             b"runtime-argument-count",
@@ -130,7 +143,7 @@ pub(crate) fn cache_key(project: &detect::Project, active: &[Runtime]) -> CacheK
             hash.add_bytes(b"runtime-argument", argument.as_bytes());
         }
         hash.add_u64(b"runtime-merge-stderr", u64::from(spec.merge_stderr));
-        let executable = resolve_program(&spec.program);
+        let executable = resolve_program(&spec.program, environment);
         if let Some(executable) = executable.as_deref() {
             hash.add_path(b"resolved-executable", executable);
             let link_metadata = executable.symlink_metadata().ok();
@@ -200,13 +213,13 @@ struct RuntimeSpec {
     merge_stderr: bool,
     label: Option<&'static str>,
     parse_version: fn(&str) -> Option<String>,
-    environment: Option<fn() -> Option<String>>,
+    environment: Option<fn(&PromptEnvironment) -> Option<String>>,
 }
 
-fn spec(runtime: Runtime) -> RuntimeSpec {
+fn spec(runtime: Runtime, environment: &PromptEnvironment) -> RuntimeSpec {
     match runtime {
         Runtime::Python => RuntimeSpec {
-            program: python_program(),
+            program: python_program(environment),
             arguments: &["--version"],
             merge_stderr: true,
             label: None,
@@ -238,8 +251,8 @@ fn spec(runtime: Runtime) -> RuntimeSpec {
         },
         Runtime::Php => static_spec("php", &["--version"], false, parse_second_word),
         Runtime::Dotnet => static_spec("dotnet", &["--version"], false, parse_line),
-        Runtime::C => compiler_spec(false),
-        Runtime::Cpp => compiler_spec(true),
+        Runtime::C => compiler_spec(false, environment),
+        Runtime::Cpp => compiler_spec(true, environment),
         Runtime::Swift => static_spec("swift", &["--version"], false, parse_numeric),
         Runtime::Lua => static_spec("lua", &["-v"], true, parse_second_word),
     }
@@ -261,12 +274,12 @@ fn static_spec(
     }
 }
 
-fn compiler_spec(cpp: bool) -> RuntimeSpec {
-    let path = env::var_os("PATH").unwrap_or_default();
+fn compiler_spec(cpp: bool, environment: &PromptEnvironment) -> RuntimeSpec {
+    let path = environment.path.as_deref().unwrap_or_default();
     let clang = if cpp { "clang++" } else { "clang" };
     let gcc = if cpp { "g++" } else { "gcc" };
 
-    if executable_on_path(clang, &path) {
+    if executable_on_path(clang, path) {
         return RuntimeSpec {
             label: Some("clang"),
             ..static_spec(clang, &["--version"], false, parse_numeric)
@@ -284,43 +297,54 @@ fn compiler_spec(cpp: bool) -> RuntimeSpec {
     }
 }
 
-fn python_program() -> OsString {
-    for variable in ["VIRTUAL_ENV", "CONDA_PREFIX"] {
-        let Some(prefix) = env::var_os(variable) else {
-            continue;
-        };
+fn python_program(environment: &PromptEnvironment) -> OsString {
+    for prefix in [
+        environment.virtual_env.as_deref(),
+        environment.conda_prefix.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    {
         let candidate = std::path::PathBuf::from(prefix).join("bin/python");
         if candidate.is_file() {
             return candidate.into_os_string();
         }
     }
 
-    let path = env::var_os("PATH").unwrap_or_default();
-    if executable_on_path("python", &path) {
+    let path = environment.path.as_deref().unwrap_or_default();
+    if executable_on_path("python", path) {
         OsString::from("python")
     } else {
         OsString::from("python3")
     }
 }
 
-fn executable_on_path(name: &str, path: &OsString) -> bool {
+fn executable_on_path(name: &str, path: &OsStr) -> bool {
     env::split_paths(path).any(|directory| directory.join(name).is_file())
 }
 
-fn resolve_program(program: &OsString) -> Option<PathBuf> {
+fn resolve_program(program: &OsString, environment: &PromptEnvironment) -> Option<PathBuf> {
     let program = Path::new(program);
     if program.components().count() > 1 {
         return program.is_file().then(|| program.to_path_buf());
     }
 
-    let path = env::var_os("PATH")?;
-    env::split_paths(&path)
+    environment
+        .path
+        .as_deref()
+        .into_iter()
+        .flat_map(env::split_paths)
         .map(|directory| directory.join(program))
         .find(|candidate| candidate.is_file())
 }
 
-async fn capture(cwd: &Path, spec: &RuntimeSpec) -> Option<String> {
+async fn capture(
+    cwd: &Path,
+    spec: &RuntimeSpec,
+    environment: &PromptEnvironment,
+) -> Option<String> {
     let mut command = Command::new(&spec.program);
+    environment.apply_to_command(&mut command);
     command
         .args(spec.arguments)
         .current_dir(cwd)
@@ -438,30 +462,41 @@ fn numeric_word(line: &str) -> Option<String> {
     })
 }
 
-fn python_environment() -> Option<String> {
-    env::var_os("VIRTUAL_ENV")
+fn python_environment(environment: &PromptEnvironment) -> Option<String> {
+    environment
+        .virtual_env
+        .as_deref()
         .and_then(|path| PathBuf::from(path).file_name().map(OsString::from))
-        .or_else(|| env::var_os("CONDA_DEFAULT_ENV"))
+        .or_else(|| environment.conda_default_env.clone())
         .or_else(|| {
-            env::var_os("CONDA_PREFIX")
+            environment
+                .conda_prefix
+                .as_deref()
                 .and_then(|path| PathBuf::from(path).file_name().map(OsString::from))
         })
         .and_then(|value| value.into_string().ok())
 }
 
-fn perl_environment() -> Option<String> {
-    env::var_os("PERLBREW_PERL")
-        .or_else(|| env::var_os("PLENV_VERSION"))
+fn perl_environment(environment: &PromptEnvironment) -> Option<String> {
+    environment
+        .perlbrew_perl
+        .clone()
+        .or_else(|| environment.plenv_version.clone())
         .and_then(|value| value.into_string().ok())
 }
 
-fn rust_environment() -> Option<String> {
-    env::var_os("RUSTUP_TOOLCHAIN").and_then(|value| value.into_string().ok())
+fn rust_environment(environment: &PromptEnvironment) -> Option<String> {
+    environment
+        .rustup_toolchain
+        .clone()
+        .and_then(|value| value.into_string().ok())
 }
 
-fn ruby_environment() -> Option<String> {
-    env::var_os("RBENV_VERSION")
-        .or_else(|| env::var_os("RUBY_VERSION"))
+fn ruby_environment(environment: &PromptEnvironment) -> Option<String> {
+    environment
+        .rbenv_version
+        .clone()
+        .or_else(|| environment.ruby_version.clone())
         .and_then(|value| value.into_string().ok())
 }
 
@@ -554,9 +589,10 @@ mod tests {
     use std::collections::HashSet;
 
     use super::{Runtime, RuntimeValue, decode, encode, spec};
+    use crate::environment::PromptEnvironment;
 
     fn parse_version(runtime: Runtime, output: &str) -> Option<String> {
-        (spec(runtime).parse_version)(output)
+        (spec(runtime, &PromptEnvironment::default()).parse_version)(output)
     }
 
     #[test]

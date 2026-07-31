@@ -5,6 +5,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use super::Runtime;
+use crate::environment::PromptEnvironment;
 use crate::utils::HashBuilder;
 
 #[derive(Clone)]
@@ -14,11 +15,11 @@ pub(crate) struct Project {
     pub(super) hash: HashBuilder,
 }
 
-pub(crate) fn worktree_root(cwd: &Path) -> Option<PathBuf> {
-    if let Some(worktree) = env::var_os("GIT_WORK_TREE") {
-        return Some(absolute(cwd, Path::new(&worktree)));
+pub(crate) fn worktree_root(cwd: &Path, environment: &PromptEnvironment) -> Option<PathBuf> {
+    if let Some(worktree) = environment.git_work_tree.as_deref() {
+        return Some(absolute(cwd, Path::new(worktree)));
     }
-    if env::var_os("GIT_DIR").is_some() {
+    if environment.git_dir.is_some() {
         return None;
     }
 
@@ -32,32 +33,28 @@ pub(crate) fn worktree_root(cwd: &Path) -> Option<PathBuf> {
     }
 }
 
-pub(crate) fn detect(cwd: &Path, git_root: Option<&Path>) -> Project {
+pub(crate) fn detect(
+    cwd: &Path,
+    git_root: Option<&Path>,
+    environment: &PromptEnvironment,
+) -> Project {
     let mut hash = HashBuilder::new(b"ztheme-project-v1");
     let mut runtimes = HashSet::new();
-    let home = env::var_os("HOME").map(PathBuf::from);
-    let ceilings = git_ceilings();
+    let home = environment.home.as_deref().map(PathBuf::from);
+    let ceilings = environment
+        .git_ceilings
+        .as_deref()
+        .map(env::split_paths)
+        .into_iter()
+        .flatten()
+        .collect::<HashSet<_>>();
     let mut directory = cwd.to_path_buf();
     let mut javascript = None;
 
     hash.add_path(b"cwd", cwd);
-    for variable in [
-        "PATH",
-        "VIRTUAL_ENV",
-        "CONDA_PREFIX",
-        "CONDA_DEFAULT_ENV",
-        "PERLBREW_PERL",
-        "PLENV_VERSION",
-        "RUSTUP_TOOLCHAIN",
-        "RBENV_VERSION",
-        "RUBY_VERSION",
-    ] {
-        let value = env::var_os(variable);
-        hash.add_bytes(b"environment-name", variable.as_bytes());
-        hash.add_optional_os(b"environment-value", value.as_deref());
-    }
+    environment.add_runtime_fingerprint(&mut hash);
 
-    if env::var_os("VIRTUAL_ENV").is_some() || env::var_os("CONDA_PREFIX").is_some() {
+    if environment.virtual_env.is_some() || environment.conda_prefix.is_some() {
         runtimes.insert(Runtime::Python);
     }
 
@@ -326,12 +323,6 @@ fn has_any(names: &HashSet<OsString>, markers: &[&str]) -> bool {
         .any(|marker| names.contains(OsStr::new(marker)))
 }
 
-fn git_ceilings() -> HashSet<PathBuf> {
-    env::var_os("GIT_CEILING_DIRECTORIES")
-        .map(|value| env::split_paths(&value).collect())
-        .unwrap_or_default()
-}
-
 fn hash_version_selectors(directory: &Path, names: &HashSet<OsString>, hash: &mut HashBuilder) {
     for marker in [
         ".python-version",
@@ -369,6 +360,7 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use super::{Runtime, detect};
+    use crate::environment::PromptEnvironment;
 
     static SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
@@ -404,7 +396,11 @@ mod tests {
         fs::write(directory.path().join("Cargo.toml"), b"[package]\n").unwrap();
         fs::write(directory.path().join("pyproject.toml"), b"[project]\n").unwrap();
 
-        let project = detect(&nested, Some(directory.path()));
+        let project = detect(
+            &nested,
+            Some(directory.path()),
+            &PromptEnvironment::default(),
+        );
         assert!(project.runtimes.contains(&Runtime::Rust));
         assert!(project.runtimes.contains(&Runtime::Python));
     }
@@ -417,7 +413,11 @@ mod tests {
         fs::write(directory.path().join("bun.lock"), b"").unwrap();
         fs::write(nested.join("package.json"), b"{}").unwrap();
 
-        let project = detect(&nested, Some(directory.path()));
+        let project = detect(
+            &nested,
+            Some(directory.path()),
+            &PromptEnvironment::default(),
+        );
         assert!(project.runtimes.contains(&Runtime::Node));
         assert!(!project.runtimes.contains(&Runtime::Bun));
     }
@@ -428,7 +428,11 @@ mod tests {
         fs::write(directory.path().join("main.c"), b"").unwrap();
         fs::write(directory.path().join("main.cpp"), b"").unwrap();
 
-        let project = detect(directory.path(), Some(directory.path()));
+        let project = detect(
+            directory.path(),
+            Some(directory.path()),
+            &PromptEnvironment::default(),
+        );
         assert!(project.runtimes.contains(&Runtime::Cpp));
         assert!(!project.runtimes.contains(&Runtime::C));
     }
@@ -436,13 +440,21 @@ mod tests {
     #[test]
     fn selector_changes_invalidate_the_project_fingerprint() {
         let directory = TestDirectory::new();
-        let before = detect(directory.path(), Some(directory.path()))
-            .hash
-            .finish();
+        let before = detect(
+            directory.path(),
+            Some(directory.path()),
+            &PromptEnvironment::default(),
+        )
+        .hash
+        .finish();
         fs::write(directory.path().join(".python-version"), b"3.14\n").unwrap();
-        let after = detect(directory.path(), Some(directory.path()))
-            .hash
-            .finish();
+        let after = detect(
+            directory.path(),
+            Some(directory.path()),
+            &PromptEnvironment::default(),
+        )
+        .hash
+        .finish();
 
         assert_ne!(before, after);
     }

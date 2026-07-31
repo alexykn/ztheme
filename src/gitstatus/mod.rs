@@ -1,7 +1,6 @@
 mod install;
 mod process;
 
-use std::env;
 use std::io;
 use std::path::{Path, PathBuf};
 
@@ -33,15 +32,7 @@ pub const UNSTAGED: u8 = 1 << 3;
 pub const UNTRACKED: u8 = 1 << 4;
 
 impl Query {
-    pub fn from_environment(cwd: &Path) -> io::Result<Self> {
-        Self::from_values(
-            cwd,
-            env::var_os("GIT_DIR").as_deref(),
-            env::var_os("GIT_WORK_TREE").as_deref(),
-        )
-    }
-
-    fn from_values(
+    pub(crate) fn from_values(
         cwd: &Path,
         git_dir: Option<&std::ffi::OsStr>,
         worktree: Option<&std::ffi::OsStr>,

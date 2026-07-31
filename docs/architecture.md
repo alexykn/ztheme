@@ -406,12 +406,20 @@ is the per-request engine used by the client daemon:
 - sanitizes errors before sending them to Zsh.
 
 `prompt/client.rs` owns the per-shell client daemon: it parses requests from
-the shell, applies the requested environment subset, dispatches each request to
-`snapshot`, and aborts the in-flight request when a newer generation arrives.
-The client's records go to its stdout, which the shell integration connects to
-its response pipe. It verifies at startup that its parent is the shell it was
-spawned for, and re-checks once per second while idle or serving, so it cannot
-outlive a killed shell even if EOF propagation is masked.
+the shell, dispatches each request to `snapshot`, and aborts the in-flight
+request when a newer generation arrives. The client's records go to its
+stdout, which the shell integration connects to its response pipe. It
+verifies at startup that its parent is the shell it was spawned for, and
+re-checks once per second while idle or serving, so it cannot outlive a
+killed shell even if EOF propagation is masked.
+
+The client never mutates its process environment. Each request carries the
+prompt-controlled variables (`src/environment.rs`), and that value is threaded
+explicitly through Git query construction, runtime detection, cache
+fingerprints, and the environment of every runtime child command — set where
+present, explicitly removed where unset. The shared server daemon therefore
+always inherits the client's stable startup environment rather than one
+arbitrary prompt request's transient values.
 
 It does not manage server sockets, process startup, cache persistence, or the
 `gitstatusd` process.
@@ -582,12 +590,13 @@ RBENV_VERSION<NUL>RUBY_VERSION<NUL>
 ```
 
 `ZTREQ` and version `1` guard against garbage input. The environment subset is
-exactly what runtime detection, command resolution, and the Git query read;
-the client applies it to its own process environment for the duration of that
-request because it outlives the shell's per-prompt environment changes. An
-empty environment field means the variable is unset. The shell owns the write
-end of the request pipe, so EOF on the client's stdin means the shell is gone
-and the client exits.
+exactly what runtime detection, command resolution, and the Git query read.
+The client does not apply it to its own process: the values are threaded
+through the request explicitly and applied only to the child commands that
+need them (set when present, removed when empty), because the client outlives
+the shell's per-prompt environment changes. An empty environment field means
+the variable is unset. The shell owns the write end of the request pipe, so
+EOF on the client's stdin means the shell is gone and the client exits.
 
 These protocols remain separate because they solve different compatibility
 problems. The daemon protocol is a local service API carrying binary structured
