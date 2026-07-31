@@ -116,7 +116,12 @@ per shell; it exits when the shell's request pipe closes, which happens even
 when the shell is killed without running cleanup hooks. The shell and the
 client communicate over a pair of named pipes that are unlinked as soon as
 both sides have opened them, so a killed shell leaves no stale filesystem
-entries behind.
+entries behind. Every prompt descriptor is opened close-on-exec
+(`sysopen -o cloexec`) so it cannot leak into external commands or into the
+client itself, and the client additionally checks every second that its
+parent is still the shell that spawned it — an independent fallback if EOF
+propagation is ever masked by descriptor leakage, transport changes, or an
+unexpected wrapper process.
 
 ## Source layout
 
@@ -404,7 +409,9 @@ is the per-request engine used by the client daemon:
 the shell, applies the requested environment subset, dispatches each request to
 `snapshot`, and aborts the in-flight request when a newer generation arrives.
 The client's records go to its stdout, which the shell integration connects to
-its response pipe.
+its response pipe. It verifies at startup that its parent is the shell it was
+spawned for, and re-checks once per second while idle or serving, so it cannot
+outlive a killed shell even if EOF propagation is masked.
 
 It does not manage server sockets, process startup, cache persistence, or the
 `gitstatusd` process.

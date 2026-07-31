@@ -63,9 +63,12 @@ impl Sandbox {
     }
 
     fn zsh(&self, script: &str) -> Output {
+        self.zsh_command().args(["-dfc", script]).output().unwrap()
+    }
+
+    fn zsh_command(&self) -> Command {
         let mut command = Command::new("zsh");
         command
-            .args(["-dfc", script])
             .env("HOME", &self.home)
             .env("XDG_CONFIG_HOME", &self.config)
             .env("XDG_DATA_HOME", &self.data)
@@ -77,7 +80,7 @@ impl Sandbox {
             .env_remove("GIT_WORK_TREE")
             .env_remove("VIRTUAL_ENV")
             .env_remove("CONDA_PREFIX");
-        command.output().unwrap()
+        command
     }
 
     fn theme_path(&self, name: &str) -> PathBuf {
@@ -205,6 +208,106 @@ fn wait_for_exit(child: &mut Child, timeout: Duration) -> Option<std::process::E
         }
         thread::sleep(Duration::from_millis(10));
     }
+}
+
+/// Compiles a tiny C helper into the sandbox's bin directory.
+fn compile_c(sandbox: &Sandbox, name: &str, source: &str) -> PathBuf {
+    let source_path = sandbox.home.join(format!("{name}.c"));
+    fs::write(&source_path, source).unwrap();
+    let out = sandbox.home.join("bin").join(name);
+    fs::create_dir_all(out.parent().unwrap()).unwrap();
+    let compiled = Command::new("cc")
+        .arg(&source_path)
+        .arg("-o")
+        .arg(&out)
+        .status()
+        .unwrap();
+    assert!(compiled.success(), "failed to compile {name}");
+    out
+}
+
+fn process_alive(pid: u32) -> bool {
+    Command::new("kill")
+        .args(["-0", &pid.to_string()])
+        .status()
+        .unwrap()
+        .success()
+}
+
+/// Polls until the process with `pid` no longer exists (kill -0 fails).
+fn wait_for_pid_exit(pid: u32, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if !process_alive(pid) {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// Spawns a non-interactive zsh that sources the generated integration, runs
+/// the given preamble, records the shell and client PIDs in a marker file,
+/// and then stays alive reading commands from its stdin. Returns the shell
+/// child and the client PID.
+fn spawn_live_shell(sandbox: &Sandbox, instance: &str, preamble: &str) -> (Child, u32) {
+    let marker = sandbox.home.join(format!("zt-marker-{instance}"));
+    let _ = fs::remove_file(&marker);
+    let mut command = sandbox.zsh_command();
+    command
+        .env("ZTHEME_TEST_MARKER", &marker)
+        .args(["-df"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = command.spawn().unwrap();
+    let script = format!(
+        r#"
+eval "$("$ZTHEME_TEST_BIN" init zsh --dev {instance})" || exit 80
+(( __ZTHEME_HAS_ASYNC )) || exit 81
+[[ -n "$ZTHEME_CLIENT_PID" ]] || exit 82
+{preamble}
+print -r -- "CLIENT_PID=$ZTHEME_CLIENT_PID" >> "$ZTHEME_TEST_MARKER"
+print -r -- "SHELL_PID=$$" >> "$ZTHEME_TEST_MARKER"
+print -r -- "READY" >> "$ZTHEME_TEST_MARKER"
+while true; do read -r __zt_line || break; done
+"#,
+        instance = instance,
+        preamble = preamble,
+    );
+    child
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(script.as_bytes())
+        .unwrap();
+
+    let deadline = Instant::now() + PROCESS_TIMEOUT;
+    let mut client_pid = 0;
+    let mut ready = false;
+    loop {
+        if let Ok(contents) = fs::read_to_string(&marker) {
+            for line in contents.lines() {
+                if let Some(pid) = line.strip_prefix("CLIENT_PID=") {
+                    client_pid = pid.parse().unwrap_or(0);
+                }
+                if line == "READY" {
+                    ready = true;
+                }
+            }
+            if ready && client_pid > 0 {
+                break;
+            }
+        }
+        if Instant::now() >= deadline {
+            break;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    assert!(ready && client_pid > 0, "live shell never became ready");
+    (child, client_pid)
 }
 
 fn wait_for_socket(child: &mut Child) -> PathBuf {
@@ -603,6 +706,8 @@ fn client_daemon_round_trips_requests_and_exits_on_eof() {
         .command()
         .args([
             "__client-daemon",
+            "--shell-pid",
+            &std::process::id().to_string(),
             "--theme",
             "0000",
             "--dev",
@@ -665,7 +770,15 @@ fn client_daemon_serves_git_requests_with_correct_generation() {
 
     let mut child = sandbox
         .command()
-        .args(["__client-daemon", "--theme", &hex, "--dev", &instance])
+        .args([
+            "__client-daemon",
+            "--shell-pid",
+            &std::process::id().to_string(),
+            "--theme",
+            &hex,
+            "--dev",
+            &instance,
+        ])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -913,7 +1026,15 @@ fn client_daemon_applies_per_request_environment() {
 
     let mut child = sandbox
         .command()
-        .args(["__client-daemon", "--theme", &hex, "--dev", &instance])
+        .args([
+            "__client-daemon",
+            "--shell-pid",
+            &std::process::id().to_string(),
+            "--theme",
+            &hex,
+            "--dev",
+            &instance,
+        ])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -1044,7 +1165,15 @@ fn client_daemon_cancels_in_flight_work_without_emitting_stale_records() {
 
     let mut child = sandbox
         .command()
-        .args(["__client-daemon", "--theme", &hex, "--dev", &instance])
+        .args([
+            "__client-daemon",
+            "--shell-pid",
+            &std::process::id().to_string(),
+            "--theme",
+            &hex,
+            "--dev",
+            &instance,
+        ])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -1113,6 +1242,461 @@ fn client_daemon_cancels_in_flight_work_without_emitting_stale_records() {
     drop(stdin);
     let status = wait_for_exit(&mut child, PROCESS_TIMEOUT).unwrap();
     assert!(status.success());
+
+    shutdown_outdated_daemon(&socket);
+    assert!(
+        wait_for_exit(server.child(), PROCESS_TIMEOUT)
+            .unwrap()
+            .success()
+    );
+    server.wait().unwrap();
+}
+
+fn stale_fifo_count() -> usize {
+    let base = std::env::var("TMPDIR").unwrap_or_else(|_| "/tmp".into());
+    let prefix = format!("ztheme-{}-", user_id());
+    fs::read_dir(&base)
+        .map(|entries| {
+            entries
+                .flatten()
+                .filter(|entry| {
+                    let name = entry.file_name().to_string_lossy().into_owned();
+                    name.starts_with(&prefix) && (name.ends_with(".req") || name.ends_with(".resp"))
+                })
+                .count()
+        })
+        .unwrap_or(0)
+}
+
+/// Polls until the shared $TMPDIR holds no ztheme FIFO entries beyond the
+/// baseline. Tests run in parallel, and a concurrent shell transiently
+/// creates entries in the tiny window between `mkfifo` and the immediate
+/// unlink, so the assertion must tolerate that and only require the entries
+/// to disappear shortly after.
+fn wait_for_no_stale_fifos(baseline: usize) {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        if stale_fifo_count() <= baseline {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "stale FIFO entries remain after the grace period"
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
+fn count_clients(instance: &str) -> usize {
+    let output = Command::new("pgrep")
+        .args(["-f", &format!("client-daemon.*{instance}")])
+        .output()
+        .unwrap();
+    if output.status.success() {
+        String::from_utf8_lossy(&output.stdout).lines().count()
+    } else {
+        0
+    }
+}
+
+#[test]
+fn shell_descriptors_are_closed_in_external_commands() {
+    let sandbox = Sandbox::new();
+    sandbox.install_fake_gitstatus();
+    compile_c(
+        &sandbox,
+        "fdprobe",
+        "#include <stdio.h>\n#include <stdlib.h>\n#include <fcntl.h>\n#include <unistd.h>\n\
+         int main(int argc, char **argv) { for (int i = 1; i < argc; i++) { int fd = atoi(argv[i]); \
+         int flags = fcntl(fd, F_GETFD); printf(\"%s=%s \", argv[i], flags == -1 ? \"EBADF\" : \"OPEN\"); } \
+         printf(\"\\n\"); return 0; }\n",
+    );
+    let instance = format!("fdprobe-{}", SEQUENCE.fetch_add(1, Ordering::Relaxed));
+    let server = sandbox
+        .command()
+        .args(["__daemon", "--dev", &instance])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut server = ChildGuard::new(server);
+    let socket = wait_for_socket(server.child());
+
+    let script = format!(
+        r#"
+eval "$("$ZTHEME_TEST_BIN" init zsh --dev {instance})" || exit 80
+(( __ZTHEME_HAS_ASYNC )) || exit 81
+"$HOME/bin/fdprobe" "$ZTHEME_REQ_FD" "$ZTHEME_RESP_FD" > "$HOME/fdprobe.out"
+"#,
+        instance = instance
+    );
+    let output = sandbox.zsh(&script);
+    assert_success(&output);
+    let probe = fs::read_to_string(sandbox.home.join("fdprobe.out")).unwrap();
+    let fields: Vec<&str> = probe.split_whitespace().collect();
+    assert_eq!(
+        fields.len(),
+        2,
+        "expected both prompt descriptors probed: {probe}"
+    );
+    assert!(
+        fields.iter().all(|field| field.ends_with("=EBADF")),
+        "prompt descriptors leaked into an external command: {probe}"
+    );
+
+    shutdown_outdated_daemon(&socket);
+    assert!(
+        wait_for_exit(server.child(), PROCESS_TIMEOUT)
+            .unwrap()
+            .success()
+    );
+    server.wait().unwrap();
+}
+
+#[test]
+fn client_exits_on_normal_shell_exit() {
+    let sandbox = Sandbox::new();
+    sandbox.install_fake_gitstatus();
+    let instance = format!("life-normal-{}", SEQUENCE.fetch_add(1, Ordering::Relaxed));
+    let (mut shell, client_pid) = spawn_live_shell(&sandbox, &instance, "");
+    // Closing the shell's stdin makes its read loop end; the shell exits
+    // normally and its request writer closes, so the client must terminate
+    // through stdin EOF. The parent watchdog fires no earlier than one second
+    // after startup, so a sub-second exit proves EOF is the mechanism.
+    drop(shell.stdin.take());
+    assert!(
+        wait_for_pid_exit(client_pid, Duration::from_millis(900)),
+        "client did not exit through EOF on normal shell exit"
+    );
+    let status = wait_for_exit(&mut shell, PROCESS_TIMEOUT).unwrap();
+    assert!(status.success());
+    wait_for_no_stale_fifos(0);
+}
+
+#[test]
+fn client_exits_when_shell_is_killed() {
+    let sandbox = Sandbox::new();
+    sandbox.install_fake_gitstatus();
+    let instance = format!("life-kill-{}", SEQUENCE.fetch_add(1, Ordering::Relaxed));
+    let (mut shell, client_pid) = spawn_live_shell(&sandbox, &instance, "");
+    shell.kill().unwrap();
+    shell.wait().unwrap();
+    assert!(
+        wait_for_pid_exit(client_pid, Duration::from_secs(2)),
+        "client survived a SIGKILLed shell"
+    );
+    wait_for_no_stale_fifos(0);
+}
+
+#[test]
+fn external_child_does_not_keep_client_alive() {
+    let sandbox = Sandbox::new();
+    sandbox.install_fake_gitstatus();
+    let instance = format!("life-child-{}", SEQUENCE.fetch_add(1, Ordering::Relaxed));
+    let server = sandbox
+        .command()
+        .args(["__daemon", "--dev", &instance])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut server = ChildGuard::new(server);
+    let socket = wait_for_socket(server.child());
+
+    let (mut shell, client_pid) = spawn_live_shell(
+        &sandbox,
+        &instance,
+        "/bin/sleep 30 &\n\
+         print -r -- \"CHILD_PID=$!\" >> \"$ZTHEME_TEST_MARKER\"\n",
+    );
+    let marker = fs::read_to_string(sandbox.home.join(format!("zt-marker-{instance}"))).unwrap();
+    let child_pid: u32 = marker
+        .lines()
+        .find_map(|line| line.strip_prefix("CHILD_PID="))
+        .unwrap()
+        .parse()
+        .unwrap();
+    shell.kill().unwrap();
+    shell.wait().unwrap();
+    assert!(
+        process_alive(child_pid),
+        "external child should survive the shell"
+    );
+    assert!(
+        wait_for_pid_exit(client_pid, Duration::from_secs(2)),
+        "client survived with a live external child holding shell descriptors"
+    );
+    let _ = Command::new("kill")
+        .args(["-9", &child_pid.to_string()])
+        .status();
+    assert!(wait_for_pid_exit(child_pid, Duration::from_secs(2)));
+
+    shutdown_outdated_daemon(&socket);
+    assert!(
+        wait_for_exit(server.child(), PROCESS_TIMEOUT)
+            .unwrap()
+            .success()
+    );
+    server.wait().unwrap();
+}
+
+#[test]
+fn long_lived_subshell_does_not_keep_client_alive() {
+    let sandbox = Sandbox::new();
+    sandbox.install_fake_gitstatus();
+    let instance = format!("life-sub-{}", SEQUENCE.fetch_add(1, Ordering::Relaxed));
+    let server = sandbox
+        .command()
+        .args(["__daemon", "--dev", &instance])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut server = ChildGuard::new(server);
+    let socket = wait_for_socket(server.child());
+
+    let (mut shell, client_pid) = spawn_live_shell(
+        &sandbox,
+        &instance,
+        "( while true; do /bin/sleep 30; done ) &\n\
+         print -r -- \"SUB_PID=$!\" >> \"$ZTHEME_TEST_MARKER\"\n",
+    );
+    let marker = fs::read_to_string(sandbox.home.join(format!("zt-marker-{instance}"))).unwrap();
+    let sub_pid: u32 = marker
+        .lines()
+        .find_map(|line| line.strip_prefix("SUB_PID="))
+        .unwrap()
+        .parse()
+        .unwrap();
+    shell.kill().unwrap();
+    shell.wait().unwrap();
+    // On zsh >= 5.9 the close-on-exec descriptors do not survive the subshell
+    // fork either, so EOF terminates the client; the parent watchdog remains
+    // the fallback if a future change reintroduces writer inheritance.
+    assert!(process_alive(sub_pid), "subshell should survive the shell");
+    assert!(
+        wait_for_pid_exit(client_pid, Duration::from_secs(3)),
+        "client survived with a live subshell"
+    );
+    let _ = Command::new("kill")
+        .args(["-9", &sub_pid.to_string()])
+        .status();
+    assert!(wait_for_pid_exit(sub_pid, Duration::from_secs(2)));
+
+    shutdown_outdated_daemon(&socket);
+    assert!(
+        wait_for_exit(server.child(), PROCESS_TIMEOUT)
+            .unwrap()
+            .success()
+    );
+    server.wait().unwrap();
+}
+
+#[test]
+fn client_with_wrong_parent_pid_exits_immediately() {
+    let sandbox = Sandbox::new();
+    sandbox.install_fake_gitstatus();
+    let instance = format!("wrong-parent-{}", SEQUENCE.fetch_add(1, Ordering::Relaxed));
+    let mut child = sandbox
+        .command()
+        .args([
+            "__client-daemon",
+            "--shell-pid",
+            "4294967295",
+            "--theme",
+            "0000",
+            "--dev",
+            &instance,
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let status = wait_for_exit(&mut child, Duration::from_secs(2)).unwrap();
+    assert!(status.success());
+}
+
+#[test]
+fn parent_watchdog_terminates_client_when_eof_is_masked() {
+    let sandbox = Sandbox::new();
+    sandbox.install_fake_gitstatus();
+    let instance = format!("watchdog-{}", SEQUENCE.fetch_add(1, Ordering::Relaxed));
+    // The client's stdin is the wrapper's stdin, a pipe the test keeps open,
+    // so request EOF can never arrive. A wrapper zsh spawns the client with
+    // itself as the declared parent and then kills itself; the client is
+    // reparented, and the parent watchdog must terminate it.
+    let wrapper_script = format!(
+        "\"$ZTHEME_TEST_BIN\" __client-daemon --shell-pid $$ --theme 0000 --dev {instance} \
+         2>/dev/null &\n\
+         print -r -- \"$!\" > \"$HOME/zt-client-pid\"\n\
+         kill -9 $$\n"
+    );
+    let mut wrapper = sandbox
+        .zsh_command()
+        .args(["-dfc", &wrapper_script])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    // The wrapper kills itself with SIGKILL, so the exit status is a signal
+    // death rather than a clean zero; only prompt termination is asserted.
+    assert!(wait_for_exit(&mut wrapper, PROCESS_TIMEOUT).is_some());
+    let client_pid: u32 = fs::read_to_string(sandbox.home.join("zt-client-pid"))
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    assert!(
+        wait_for_pid_exit(client_pid, Duration::from_secs(3)),
+        "parent watchdog did not terminate the client"
+    );
+    // Dropping the wrapper closes the stdin pipe that masked EOF.
+    drop(wrapper);
+}
+
+#[test]
+fn many_shells_do_not_accumulate_clients() {
+    let sandbox = Sandbox::new();
+    sandbox.install_fake_gitstatus();
+    let instance = format!("many-{}", SEQUENCE.fetch_add(1, Ordering::Relaxed));
+    let server = sandbox
+        .command()
+        .args(["__daemon", "--dev", &instance])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut server = ChildGuard::new(server);
+    let socket = wait_for_socket(server.child());
+
+    let mut shells = Vec::new();
+    let mut clients = Vec::new();
+    for _ in 0..20 {
+        let (shell, client_pid) = spawn_live_shell(&sandbox, &instance, "");
+        shells.push(shell);
+        clients.push(client_pid);
+    }
+    assert_eq!(
+        count_clients(&instance),
+        20,
+        "expected exactly one client per shell"
+    );
+
+    for (index, mut shell) in shells.into_iter().enumerate() {
+        if index % 2 == 0 {
+            // Normal exit: close stdin, the shell's read loop ends.
+            drop(shell.stdin.take());
+        } else {
+            let _ = shell.kill();
+        }
+        let _ = wait_for_exit(&mut shell, PROCESS_TIMEOUT);
+    }
+    for client_pid in &clients {
+        assert!(
+            wait_for_pid_exit(*client_pid, Duration::from_secs(3)),
+            "client {client_pid} accumulated after its shell exited"
+        );
+    }
+    assert_eq!(count_clients(&instance), 0, "clients accumulated");
+    wait_for_no_stale_fifos(0);
+
+    shutdown_outdated_daemon(&socket);
+    assert!(
+        wait_for_exit(server.child(), PROCESS_TIMEOUT)
+            .unwrap()
+            .success()
+    );
+    server.wait().unwrap();
+}
+
+#[test]
+fn client_exits_after_shell_killed_during_active_request() {
+    let sandbox = Sandbox::new();
+    let instance = format!("life-active-{}", SEQUENCE.fetch_add(1, Ordering::Relaxed));
+    let delayed = sandbox.data.join("ztheme/gitstatus/v1.5/gitstatusd");
+    fs::create_dir_all(delayed.parent().unwrap()).unwrap();
+    fs::write(&delayed, "#!/bin/sh\n/bin/sleep 0.15\nexec cat\n").unwrap();
+    fs::set_permissions(&delayed, fs::Permissions::from_mode(0o700)).unwrap();
+    let server = sandbox
+        .command()
+        .args(["__daemon", "--dev", &instance])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut server = ChildGuard::new(server);
+    let socket = wait_for_socket(server.child());
+
+    // A request whose git query is still in flight when the shell dies.
+    let preamble = "print -rn -- \"ZTREQ\"$'\\0'\"1\"$'\\0'\"1\"$'\\0'\"$PWD\"$'\\0' \\\n\
+         \"${PATH:-}\"$'\\0'\"${HOME:-}\"$'\\0'\"${GIT_DIR:-}\"$'\\0'\"${GIT_WORK_TREE:-}\"$'\\0' \\\n\
+         \"${GIT_CEILING_DIRECTORIES:-}\"$'\\0'\"${VIRTUAL_ENV:-}\"$'\\0'\"${CONDA_PREFIX:-}\"$'\\0' \\\n\
+         \"${CONDA_DEFAULT_ENV:-}\"$'\\0'\"${PERLBREW_PERL:-}\"$'\\0'\"${PLENV_VERSION:-}\"$'\\0' \\\n\
+         \"${RUSTUP_TOOLCHAIN:-}\"$'\\0'\"${RBENV_VERSION:-}\"$'\\0'\"${RUBY_VERSION:-}\"$'\\0' \\\n\
+         >&\"$ZTHEME_REQ_FD\"\n";
+    let (mut shell, client_pid) = spawn_live_shell(&sandbox, &instance, preamble);
+    thread::sleep(Duration::from_millis(100));
+    shell.kill().unwrap();
+    shell.wait().unwrap();
+    assert!(
+        wait_for_pid_exit(client_pid, Duration::from_secs(3)),
+        "client did not exit after the shell died during a request"
+    );
+    wait_for_no_stale_fifos(0);
+
+    shutdown_outdated_daemon(&socket);
+    assert!(
+        wait_for_exit(server.child(), PROCESS_TIMEOUT)
+            .unwrap()
+            .success()
+    );
+    server.wait().unwrap();
+}
+
+#[test]
+fn stop_client_is_idempotent() {
+    let sandbox = Sandbox::new();
+    sandbox.install_fake_gitstatus();
+    let instance = format!("stop-idem-{}", SEQUENCE.fetch_add(1, Ordering::Relaxed));
+    let server = sandbox
+        .command()
+        .args(["__daemon", "--dev", &instance])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut server = ChildGuard::new(server);
+    let socket = wait_for_socket(server.child());
+
+    let script = format!(
+        r#"
+eval "$("$ZTHEME_TEST_BIN" init zsh --dev {instance})" || exit 80
+(( __ZTHEME_HAS_ASYNC )) || exit 81
+_ztheme_stop_client
+_ztheme_stop_client
+[[ -z "$ZTHEME_CLIENT_PID" ]] || exit 83
+(( ZTHEME_REQ_FD < 0 )) || exit 84
+(( ZTHEME_RESP_FD < 0 )) || exit 85
+print -u1 -- "OK"
+"#,
+        instance = instance
+    );
+    let output = sandbox.zsh(&script);
+    assert_success(&output);
+    assert!(String::from_utf8_lossy(&output.stdout).contains("OK"));
+    assert!(
+        String::from_utf8_lossy(&output.stderr).is_empty(),
+        "double stop produced stderr noise: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 
     shutdown_outdated_daemon(&socket);
     assert!(

@@ -2,12 +2,14 @@ use std::env;
 use std::ffi::{OsStr, OsString};
 use std::io;
 use std::os::unix::ffi::OsStringExt as _;
+use std::os::unix::process::parent_id;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
-use tokio::io::{AsyncBufReadExt as _, BufReader};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
+use tokio::time::{Instant, MissedTickBehavior, interval_at};
 
 use crate::daemon;
 use crate::prompt::snapshot;
@@ -16,81 +18,141 @@ use crate::theme::AsyncTheme;
 const REQUEST_MAGIC: &[u8] = b"ZTREQ";
 const REQUEST_VERSION: &[u8] = b"1";
 
+/// How often the client verifies that the shell that spawned it is still its
+/// parent. EOF on the request pipe is the primary lifetime signal; this
+/// watchdog is an independent fallback for cases where EOF propagation could
+/// be masked, such as descriptor leakage, transport changes, or an
+/// unexpected wrapper process.
+const PARENT_CHECK_INTERVAL: Duration = Duration::from_secs(1);
+
 /// Serves one shell's prompt requests for the shell's lifetime.
 ///
 /// Requests arrive on stdin as NUL-delimited fields (see `read_request`);
 /// rendered records go to stdout using the same `ZTHEME1` line protocol the
 /// shell integration consumes. The shell owns the request pipe's write end,
-/// so EOF on stdin means the shell is gone and the client exits.
-pub async fn serve_client(instance: daemon::Instance, theme: Arc<AsyncTheme>) -> io::Result<()> {
+/// so EOF on stdin means the shell is gone and the client exits. The parent
+/// watchdog is an independent fallback: when the shell dies, the client is
+/// reparented, so comparing `parent_id` against `shell_pid` detects the death
+/// even if EOF propagation is ever masked by descriptor leakage, transport
+/// changes, or an unexpected wrapper process.
+pub async fn serve_client(
+    instance: daemon::Instance,
+    shell_pid: u32,
+    theme: Arc<AsyncTheme>,
+) -> io::Result<()> {
+    // A client spawned by anything other than the intended shell is a stale
+    // or misconfigured process: exit without doing any work.
+    if parent_id() != shell_pid {
+        return Ok(());
+    }
+
     let (sender, mut receiver) = mpsc::channel(4);
-    let reader = tokio::spawn(read_requests(sender));
+    spawn_request_reader(sender);
 
     let mut current: Option<JoinHandle<io::Result<()>>> = None;
+    let mut parent_check = interval_at(
+        Instant::now() + PARENT_CHECK_INTERVAL,
+        PARENT_CHECK_INTERVAL,
+    );
+    parent_check.set_missed_tick_behavior(MissedTickBehavior::Skip);
+
     loop {
-        match receiver.recv().await {
-            Some(request) => {
-                // A new request supersedes any in-flight work: the records
-                // of an older generation would be ignored by the shell, and
-                // letting the work run on would waste time and read the new
-                // request's environment. The superseded task is aborted and
-                // awaited before the environment is touched: its JoinSet
-                // drops only when the task is actually destroyed, and the
-                // request tasks read environment values after awaits, so
-                // without the await they could resume after the mutation
-                // below with the new request's environment. This ordering
-                // (destroy the request task and its JoinSet, then mutate the
-                // environment) is the correctness invariant; the integration
-                // tests can only observe its black-box consequences (no stale
-                // records, clean per-request environment), so this comment
-                // carries the stronger guarantee.
-                if let Some(handle) = current.take() {
-                    handle.abort();
-                    if let Ok(Err(error)) = handle.await {
-                        // The request's records could not be written, so the
-                        // response pipe is gone; keep serving has no point.
-                        return Err(error);
+        tokio::select! {
+            request = receiver.recv() => {
+                match request {
+                    Some(request) => {
+                        // A new request supersedes any in-flight work: the records
+                        // of an older generation would be ignored by the shell, and
+                        // letting the work run on would waste time and read the new
+                        // request's environment. The superseded task is aborted and
+                        // awaited before the environment is touched: its JoinSet
+                        // drops only when the task is actually destroyed, and the
+                        // request tasks read environment values after awaits, so
+                        // without the await they could resume after the mutation
+                        // below with the new request's environment. This ordering
+                        // (destroy the request task and its JoinSet, then mutate
+                        // the environment) is the correctness invariant; the
+                        // integration tests can only observe its black-box
+                        // consequences (no stale records, clean per-request
+                        // environment), so this comment carries the stronger
+                        // guarantee.
+                        if let Some(handle) = current.take() {
+                            handle.abort();
+                            if let Ok(Err(error)) = handle.await {
+                                // The request's records could not be written, so
+                                // the response pipe is gone; keep serving has no
+                                // point.
+                                return Err(error);
+                            }
+                        }
+                        apply_request_env(&request.env);
+                        let instance = instance.clone();
+                        let theme = Arc::clone(&theme);
+                        current = Some(tokio::spawn(async move {
+                            snapshot(request.generation, request.cwd, instance, &theme).await
+                        }));
+                    }
+                    None => {
+                        // EOF only arrives after the writer closes, so finish any
+                        // in-flight request first: its records still have a reader,
+                        // or its writes fail with EPIPE if the shell is really gone.
+                        cancel_current(&mut current).await;
+                        break;
                     }
                 }
-                apply_request_env(&request.env);
-                let instance = instance.clone();
-                let theme = Arc::clone(&theme);
-                current = Some(tokio::spawn(async move {
-                    snapshot(request.generation, request.cwd, instance, &theme).await
-                }));
             }
-            None => {
-                // EOF only arrives after the writer closes, so finish any
-                // in-flight request first: its records still have a reader, or
-                // its writes fail with EPIPE if the shell is really gone.
-                if let Some(handle) = current.take() {
-                    handle.abort();
-                    let _ = handle.await;
+            _ = parent_check.tick() => {
+                if parent_id() != shell_pid {
+                    // The shell is gone even though EOF may not have arrived;
+                    // stop the current request and exit rather than waiting on
+                    // the primary signal. The shell integration respawns a
+                    // fresh client on the next prompt. The request reader is a
+                    // plain OS thread, so returning drops the runtime without
+                    // waiting on its blocked stdin read.
+                    cancel_current(&mut current).await;
+                    return Ok(());
                 }
-                break;
             }
         }
     }
-    reader.abort();
     Ok(())
 }
 
-async fn read_requests(sender: mpsc::Sender<Request>) {
-    let mut reader = BufReader::new(tokio::io::stdin());
-    loop {
-        match read_request(&mut reader).await {
-            Ok(Some(request)) => {
-                if sender.send(request).await.is_err() {
-                    return;
+/// Aborts and awaits the in-flight request task, destroying its JoinSet and
+/// the request tasks it spawned.
+async fn cancel_current(current: &mut Option<JoinHandle<io::Result<()>>>) {
+    if let Some(handle) = current.take() {
+        handle.abort();
+        let _ = handle.await;
+    }
+}
+
+/// Reads requests from stdin on a dedicated thread. A plain OS thread rather
+/// than a Tokio task or blocking task is used so that dropping the runtime
+/// never waits on the stdin read: when the parent watchdog exits the client
+/// while the request pipe is still open, the runtime must shut down without
+/// joining a read that can never return.
+fn spawn_request_reader(sender: mpsc::Sender<Request>) {
+    std::thread::Builder::new()
+        .name("ztheme-client-requests".into())
+        .spawn(move || {
+            let mut reader = std::io::BufReader::new(std::io::stdin());
+            loop {
+                match read_request(&mut reader) {
+                    Ok(Some(request)) => {
+                        if sender.blocking_send(request).is_err() {
+                            return;
+                        }
+                    }
+                    Ok(None) => return,
+                    Err(error) => {
+                        eprintln!("ztheme: client daemon request failed: {error}");
+                        return;
+                    }
                 }
             }
-            Ok(None) => return,
-            Err(error) => {
-                eprintln!("ztheme: client daemon request failed: {error}");
-                return;
-            }
-        }
-    }
+        })
+        .expect("spawning the request reader thread cannot fail");
 }
 
 struct Request {
@@ -119,48 +181,48 @@ struct RequestEnv {
 /// Parses one NUL-delimited request. `Ok(None)` means a clean EOF before any
 /// field; every field after the magic is required, so a request that is cut
 /// short is rejected rather than silently accepted with missing values.
-async fn read_request<R>(reader: &mut R) -> io::Result<Option<Request>>
+fn read_request<R>(reader: &mut R) -> io::Result<Option<Request>>
 where
-    R: tokio::io::AsyncBufRead + Unpin,
+    R: std::io::BufRead,
 {
-    let magic = read_field(reader).await?;
+    let magic = read_field(reader)?;
     let Some(magic) = magic else {
         return Ok(None);
     };
     if magic != REQUEST_MAGIC {
         return Err(invalid_data("client request magic is invalid"));
     }
-    let version = read_field(reader).await?.ok_or_else(truncated)?;
+    let version = read_field(reader)?.ok_or_else(truncated)?;
     if version != REQUEST_VERSION {
         return Err(invalid_data("client request version is unsupported"));
     }
 
-    let generation = read_field(reader).await?.ok_or_else(truncated)?;
+    let generation = read_field(reader)?.ok_or_else(truncated)?;
     let generation = std::str::from_utf8(&generation)
         .ok()
         .and_then(|value| value.parse().ok())
         .ok_or_else(|| invalid_data("client request generation is invalid"))?;
 
-    let cwd = read_field(reader).await?.ok_or_else(truncated)?;
+    let cwd = read_field(reader)?.ok_or_else(truncated)?;
     let cwd = PathBuf::from(OsString::from_vec(cwd));
     if !cwd.is_absolute() {
         return Err(invalid_data("client request cwd is not absolute"));
     }
 
     let env = RequestEnv {
-        path: env_field(read_field(reader).await?)?,
-        home: env_field(read_field(reader).await?)?,
-        git_dir: env_field(read_field(reader).await?)?,
-        git_work_tree: env_field(read_field(reader).await?)?,
-        git_ceilings: env_field(read_field(reader).await?)?,
-        virtual_env: env_field(read_field(reader).await?)?,
-        conda_prefix: env_field(read_field(reader).await?)?,
-        conda_default_env: env_field(read_field(reader).await?)?,
-        perlbrew_perl: env_field(read_field(reader).await?)?,
-        plenv_version: env_field(read_field(reader).await?)?,
-        rustup_toolchain: env_field(read_field(reader).await?)?,
-        rbenv_version: env_field(read_field(reader).await?)?,
-        ruby_version: env_field(read_field(reader).await?)?,
+        path: env_field(read_field(reader)?)?,
+        home: env_field(read_field(reader)?)?,
+        git_dir: env_field(read_field(reader)?)?,
+        git_work_tree: env_field(read_field(reader)?)?,
+        git_ceilings: env_field(read_field(reader)?)?,
+        virtual_env: env_field(read_field(reader)?)?,
+        conda_prefix: env_field(read_field(reader)?)?,
+        conda_default_env: env_field(read_field(reader)?)?,
+        perlbrew_perl: env_field(read_field(reader)?)?,
+        plenv_version: env_field(read_field(reader)?)?,
+        rustup_toolchain: env_field(read_field(reader)?)?,
+        rbenv_version: env_field(read_field(reader)?)?,
+        ruby_version: env_field(read_field(reader)?)?,
     };
 
     Ok(Some(Request {
@@ -170,12 +232,12 @@ where
     }))
 }
 
-async fn read_field<R>(reader: &mut R) -> io::Result<Option<Vec<u8>>>
+fn read_field<R>(reader: &mut R) -> io::Result<Option<Vec<u8>>>
 where
-    R: tokio::io::AsyncBufRead + Unpin,
+    R: std::io::BufRead,
 {
     let mut field = Vec::with_capacity(64);
-    if reader.read_until(0, &mut field).await? == 0 {
+    if reader.read_until(0, &mut field)? == 0 {
         return Ok(None);
     }
     if field.pop() != Some(0) {
@@ -235,7 +297,7 @@ mod tests {
     use std::os::unix::ffi::OsStrExt as _;
     use std::path::Path;
 
-    use tokio::io::BufReader;
+    use std::io::BufReader;
 
     use super::{REQUEST_MAGIC, REQUEST_VERSION, read_request};
 
@@ -258,8 +320,8 @@ mod tests {
         bytes
     }
 
-    #[tokio::test(flavor = "current_thread")]
-    async fn parses_a_complete_request_with_environment() {
+    #[test]
+    fn parses_a_complete_request_with_environment() {
         let fields: [&[u8]; ENV_FIELD_COUNT] = [
             b"/opt/bin:/usr/bin",
             b"/home/user",
@@ -277,7 +339,7 @@ mod tests {
         ];
         let bytes = request(b"/work/project", &fields);
         let mut reader = BufReader::new(&bytes[..]);
-        let request = read_request(&mut reader).await.unwrap().unwrap();
+        let request = read_request(&mut reader).unwrap().unwrap();
 
         assert_eq!(request.generation, 42);
         assert_eq!(request.cwd, Path::new("/work/project"));
@@ -291,11 +353,11 @@ mod tests {
             request.env.git_work_tree.as_deref(),
             Some(OsStr::new("/work/tree"))
         );
-        assert!(read_request(&mut reader).await.unwrap().is_none());
+        assert!(read_request(&mut reader).unwrap().is_none());
     }
 
-    #[tokio::test(flavor = "current_thread")]
-    async fn non_utf8_cwd_and_environment_round_trip() {
+    #[test]
+    fn non_utf8_cwd_and_environment_round_trip() {
         let mut git_dir = b"/repo-".to_vec();
         git_dir.push(0xff);
         let fields: [&[u8]; ENV_FIELD_COUNT] = [
@@ -305,7 +367,7 @@ mod tests {
         cwd.push(0xfe);
         let bytes = request(&cwd, &fields);
         let mut reader = BufReader::new(&bytes[..]);
-        let request = read_request(&mut reader).await.unwrap().unwrap();
+        let request = read_request(&mut reader).unwrap().unwrap();
 
         assert_eq!(request.cwd.as_os_str(), OsStr::from_bytes(&cwd));
         assert_eq!(
@@ -314,61 +376,40 @@ mod tests {
         );
     }
 
-    #[tokio::test(flavor = "current_thread")]
-    async fn malformed_requests_are_rejected() {
+    #[test]
+    fn malformed_requests_are_rejected() {
         let empty: [&[u8]; ENV_FIELD_COUNT] = [b""; ENV_FIELD_COUNT];
         let valid = request(b"/work", &empty);
 
         // bytes: ZTREQ\0 1\0 42\0 /work\0 then 13 empty fields
         let mut bad_magic = valid.clone();
         bad_magic[0] = b'X';
-        assert!(
-            read_request(&mut BufReader::new(&bad_magic[..]))
-                .await
-                .is_err()
-        );
+        assert!(read_request(&mut BufReader::new(&bad_magic[..])).is_err());
 
         let mut bad_version = valid.clone();
         bad_version[6] = b'2';
-        assert!(
-            read_request(&mut BufReader::new(&bad_version[..]))
-                .await
-                .is_err()
-        );
+        assert!(read_request(&mut BufReader::new(&bad_version[..])).is_err());
 
         let mut bad_generation = valid.clone();
         bad_generation[8] = b'x';
-        assert!(
-            read_request(&mut BufReader::new(&bad_generation[..]))
-                .await
-                .is_err()
-        );
+        assert!(read_request(&mut BufReader::new(&bad_generation[..])).is_err());
 
         let mut relative_cwd = valid.clone();
         relative_cwd[11] = b'.';
-        assert!(
-            read_request(&mut BufReader::new(&relative_cwd[..]))
-                .await
-                .is_err()
-        );
+        assert!(read_request(&mut BufReader::new(&relative_cwd[..])).is_err());
 
         let truncated = &valid[..valid.len() - 3];
-        assert!(read_request(&mut BufReader::new(truncated)).await.is_err());
+        assert!(read_request(&mut BufReader::new(truncated)).is_err());
     }
 
-    #[tokio::test(flavor = "current_thread")]
-    async fn clean_eof_is_a_normal_stop_but_partial_requests_are_rejected() {
+    #[test]
+    fn clean_eof_is_a_normal_stop_but_partial_requests_are_rejected() {
         assert!(
             read_request(&mut BufReader::new(&b""[..]))
-                .await
                 .unwrap()
                 .is_none()
         );
         let partial = b"ZTREQ\0";
-        assert!(
-            read_request(&mut BufReader::new(&partial[..]))
-                .await
-                .is_err()
-        );
+        assert!(read_request(&mut BufReader::new(&partial[..])).is_err());
     }
 }

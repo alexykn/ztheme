@@ -96,6 +96,9 @@ struct InstanceArgs {
 
 #[derive(Args)]
 struct ClientDaemonArgs {
+    #[arg(long, value_name = "PID")]
+    shell_pid: u32,
+
     #[arg(long, value_name = "HEX")]
     theme: String,
 
@@ -138,6 +141,7 @@ enum Request {
     },
     ClientDaemon {
         instance: daemon::Instance,
+        shell_pid: u32,
         theme: Box<theme::AsyncTheme>,
     },
     Daemon {
@@ -193,9 +197,11 @@ pub(crate) fn run() {
         } => prompt::theme_zsh(&instance, &selector, persist)
             .and_then(|script| write_stdout(&script)),
         Request::Clear { instance } => run_async(daemon::reset(&instance)),
-        Request::ClientDaemon { instance, theme } => {
-            run_async(prompt::serve_client(instance, Arc::new(*theme)))
-        }
+        Request::ClientDaemon {
+            instance,
+            shell_pid,
+            theme,
+        } => run_async(prompt::serve_client(instance, shell_pid, Arc::new(*theme))),
         Request::Daemon { instance } => run_async(daemon::serve(&instance)),
     };
     finish(result);
@@ -233,6 +239,7 @@ fn request(command: Command) -> Result<Request, &'static str> {
                 .map_err(|_| "invalid compiled theme")?;
             Ok(Request::ClientDaemon {
                 instance: instance(arguments.instance)?,
+                shell_pid: arguments.shell_pid,
                 theme: Box::new(theme),
             })
         }
@@ -320,6 +327,8 @@ mod tests {
             vec![
                 "ztheme",
                 "__client-daemon",
+                "--shell-pid",
+                "12345",
                 "--theme",
                 "0000",
                 "--dev",

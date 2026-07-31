@@ -30,7 +30,8 @@ arrive in the background without blocking input.
 
 ## Install
 
-ztheme supports Zsh on macOS and Linux. A
+ztheme supports Zsh 5.9 or newer (including the `zsh/system` module, which
+ships with Zsh) on macOS and Linux. A
 [Nerd Font](https://www.nerdfonts.com/) is recommended for the default symbols.
 
 ```console

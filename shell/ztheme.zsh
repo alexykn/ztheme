@@ -8,9 +8,22 @@ _ztheme_initialize() {
 autoload -Uz colors
 autoload -Uz add-zsh-hook
 autoload -Uz add-zle-hook-widget
+autoload -Uz is-at-least
 
 colors
 setopt PROMPT_SUBST
+
+# The client spawn relies on zsh/system's sysopen with close-on-exec so the
+# prompt descriptors cannot leak into external commands or keep the client
+# alive after the shell dies.
+if (( $+functions[is-at-least] )) && ! is-at-least 5.9 "$ZSH_VERSION"; then
+    print -u2 -- "ztheme: requires Zsh 5.9 or newer (running $ZSH_VERSION)"
+    return 1
+fi
+if ! zmodload zsh/system 2>/dev/null; then
+    print -u2 -- "ztheme: requires the zsh/system module"
+    return 1
+fi
 
 if (( $+functions[_ztheme_stop_client] )); then
     { _ztheme_stop_client } 2>/dev/null
@@ -70,37 +83,65 @@ _ztheme_start_client() {
     local prefix="$base/ztheme-$UID-$$-$sequence"
     local request="$prefix.req"
     local response="$prefix.resp"
+    local -i request_client_fd=-1
+    local -i response_bootstrap_fd=-1
+    local -i response_client_fd=-1
+
     command rm -f "$request" "$response" 2>/dev/null
     if ! command mkfifo -m 600 "$request" "$response" 2>/dev/null; then
         return 1
     fi
 
-    # The request FIFO is opened read-write so the open never blocks: the
-    # shell is the request writer and an early reader, which lets the client
-    # start without either side waiting on the other. The error suppression is
-    # scoped to a brace group: `exec` without a command applies its own
-    # redirections to the shell permanently, so `exec ... 2>/dev/null` would
-    # swallow the shell's stderr for its whole lifetime. zsh reports a failed
-    # `exec` redirection with a message and a zero status, so the failure is
-    # detected through the fd variable, which keeps its previous value (-1)
-    # when the open does not succeed.
-    { exec {ZTHEME_REQ_FD}<>"$request"; } 2>/dev/null
-    if (( ZTHEME_REQ_FD < 0 )); then
+    # Every descriptor is opened with close-on-exec so it cannot leak into
+    # the client (which must not inherit a request writer, or EOF on its
+    # stdin would never arrive) or into ordinary external commands. sysopen
+    # reports open failures through its exit status, which commandless
+    # `exec` redirections do not. Holding an O_RDWR endpoint on each FIFO
+    # until both ends are open keeps every other open below from blocking.
+    if ! sysopen -r -w -o cloexec -u ZTHEME_REQ_FD "$request" 2>/dev/null; then
+        command rm -f "$request" "$response" 2>/dev/null
+        return 1
+    fi
+    if ! sysopen -r -o cloexec -u request_client_fd "$request" 2>/dev/null; then
+        _ztheme_close_client_fds "$request_client_fd" "$response_bootstrap_fd" "$response_client_fd"
+        command rm -f "$request" "$response" 2>/dev/null
+        return 1
+    fi
+    if ! sysopen -r -w -o cloexec -u response_bootstrap_fd "$response" 2>/dev/null; then
+        _ztheme_close_client_fds "$request_client_fd" "$response_bootstrap_fd" "$response_client_fd"
+        command rm -f "$request" "$response" 2>/dev/null
+        return 1
+    fi
+    if ! sysopen -w -o cloexec -u response_client_fd "$response" 2>/dev/null; then
+        _ztheme_close_client_fds "$request_client_fd" "$response_bootstrap_fd" "$response_client_fd"
+        command rm -f "$request" "$response" 2>/dev/null
+        return 1
+    fi
+    if ! sysopen -r -o cloexec -u ZTHEME_RESP_FD "$response" 2>/dev/null; then
+        _ztheme_close_client_fds "$request_client_fd" "$response_bootstrap_fd" "$response_client_fd"
         command rm -f "$request" "$response" 2>/dev/null
         return 1
     fi
 
-    # The client blocks opening the response FIFO for writing until the shell
-    # opens it for reading below; the two opens complete together, so this
-    # cannot deadlock. Keeping the shell's end read-only is what lets client
-    # death surface as EOF on ZTHEME_RESP_FD: if the shell also held a write
-    # end, its own writer would keep the read side open forever.
+    # All endpoints are open. Drop the temporary bootstrap and unlink the
+    # paths so a shell killed with SIGKILL leaves no entries in $TMPDIR, and
+    # the predictable names cannot be interfered with.
+    exec {response_bootstrap_fd}>&-
+    response_bootstrap_fd=-1
+    command rm -f "$request" "$response" 2>/dev/null
+
+    # Spawn the client from the already-open endpoints: it receives the
+    # request read end as stdin and the response write end as stdout. Every
+    # other descriptor is close-on-exec and disappears during exec, so the
+    # client never holds its own request writer. The shell passes its own PID
+    # so the client can detect reparenting as a fallback to stdin EOF.
     local ztheme_bg_nice="$options[bgnice]"
     unsetopt BG_NICE
     command "$__ZTHEME_BIN" __client-daemon \
+        --shell-pid "$$" \
         --theme "$__ZTHEME_ASYNC_THEME" \
         "${__ZTHEME_INSTANCE_ARGS[@]}" \
-        <"$request" >"$response" 2>/dev/null &!
+        <&"$request_client_fd" >&"$response_client_fd" 2>/dev/null &!
     [[ "$ztheme_bg_nice" == on ]] && setopt BG_NICE
     unset ztheme_bg_nice
 
@@ -109,29 +150,44 @@ _ztheme_start_client() {
     if (( ZTHEME_CLIENT_PID <= 0 )) ||
         ! kill -0 "$ZTHEME_CLIENT_PID" 2>/dev/null
     then
-        # The fork failed, so nothing will ever open the response FIFO for
-        # writing; opening it read-only below would block the shell forever.
-        exec {ZTHEME_REQ_FD}<&-
-        ZTHEME_REQ_FD=-1
-        command rm -f "$request" "$response" 2>/dev/null
-        return 1
-    fi
-    { exec {ZTHEME_RESP_FD}<"$response"; } 2>/dev/null
-    if (( ZTHEME_RESP_FD < 0 )); then
-        exec {ZTHEME_REQ_FD}<&-
-        ZTHEME_REQ_FD=-1
-        command rm -f "$request" "$response" 2>/dev/null
+        _ztheme_close_client_fds "$request_client_fd" "$response_bootstrap_fd" "$response_client_fd"
         return 1
     fi
 
-    # Both sides are open now, so the directory entries can be unlinked:
-    # the descriptors keep the FIFO objects alive for the rest of the shell's
-    # life. A shell killed with SIGKILL therefore leaves no stale paths in
-    # $TMPDIR, and the predictable names cannot be interfered with either.
-    command rm -f "$request" "$response" 2>/dev/null
+    # The client holds the endpoints as its stdin/stdout; close the shell's
+    # copies so the descriptors are not inherited twice.
+    exec {request_client_fd}<&-
+    request_client_fd=-1
+    exec {response_client_fd}>&-
+    response_client_fd=-1
 
     if builtin zle -F "$ZTHEME_RESP_FD" _ztheme_async_callback 2>/dev/null; then
         ZTHEME_CLIENT_READY=1
+    fi
+    return 0
+}
+
+# Closes the descriptors opened by _ztheme_start_client on its failure paths.
+# The three client-side endpoint copies are passed as arguments because they
+# are local to the caller; ZTHEME_REQ_FD and ZTHEME_RESP_FD are global. Each
+# fd is only closed when its variable is non-negative, which sysopen sets
+# exclusively on success.
+_ztheme_close_client_fds() {
+    emulate -L zsh
+
+    local -i request_client_fd="${1:--1}"
+    local -i response_bootstrap_fd="${2:--1}"
+    local -i response_client_fd="${3:--1}"
+    (( request_client_fd >= 0 )) && { exec {request_client_fd}<&-; } 2>/dev/null
+    (( response_bootstrap_fd >= 0 )) && { exec {response_bootstrap_fd}>&-; } 2>/dev/null
+    (( response_client_fd >= 0 )) && { exec {response_client_fd}>&-; } 2>/dev/null
+    if (( ZTHEME_REQ_FD >= 0 )); then
+        { exec {ZTHEME_REQ_FD}<&-; } 2>/dev/null
+        ZTHEME_REQ_FD=-1
+    fi
+    if (( ZTHEME_RESP_FD >= 0 )); then
+        { exec {ZTHEME_RESP_FD}<&-; } 2>/dev/null
+        ZTHEME_RESP_FD=-1
     fi
     return 0
 }
@@ -140,23 +196,28 @@ _ztheme_stop_client() {
     emulate -L zsh
 
     local -i client_pid="${ZTHEME_CLIENT_PID:-0}"
+    local -i request_fd="${ZTHEME_REQ_FD:--1}"
+    local -i response_fd="${ZTHEME_RESP_FD:--1}"
     ZTHEME_CLIENT_PID=""
     ZTHEME_CLIENT_READY=0
     ZTHEME_ASYNC_PENDING=0
-    if (( client_pid > 0 )); then
-        kill "$client_pid" 2>/dev/null
-    fi
-
-    local -i request_fd="${ZTHEME_REQ_FD:--1}"
-    local -i response_fd="${ZTHEME_RESP_FD:--1}"
     ZTHEME_REQ_FD=-1
     ZTHEME_RESP_FD=-1
+
+    # Unregister the callback, then close the request writer first so the
+    # client sees stdin EOF and exits on its own; the explicit kill is a
+    # final guarantee for a client whose EOF was masked by a leaked writer.
     if (( response_fd >= 0 )); then
         builtin zle -F "$response_fd" 2>/dev/null
-        exec {response_fd}<&-
     fi
     if (( request_fd >= 0 )); then
         exec {request_fd}<&-
+    fi
+    if (( response_fd >= 0 )); then
+        exec {response_fd}<&-
+    fi
+    if (( client_pid > 0 )); then
+        kill "$client_pid" 2>/dev/null
     fi
     return 0
 }
