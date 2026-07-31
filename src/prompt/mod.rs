@@ -1,4 +1,7 @@
+mod client;
 mod protocol;
+
+pub(crate) use client::serve_client;
 
 use std::env;
 use std::io;
@@ -22,7 +25,7 @@ pub async fn snapshot(
     generation: u64,
     cwd: PathBuf,
     instance: daemon::Instance,
-    theme: Box<theme::AsyncTheme>,
+    theme: &theme::AsyncTheme,
 ) -> io::Result<()> {
     let git_enabled = theme.git_enabled();
     let active_runtimes = theme.runtimes();
@@ -61,7 +64,6 @@ pub async fn snapshot(
         });
     }
 
-    let mut output = io::stdout().lock();
     while !tasks.is_empty() {
         let Ok(Some(result)) = timeout_at(deadline, tasks.join_next()).await else {
             break;
@@ -69,14 +71,19 @@ pub async fn snapshot(
         match result {
             Ok(SnapshotResult::Git(Ok(snapshot))) => {
                 protocol::write_segment(
-                    &mut output,
+                    &mut io::stdout().lock(),
                     generation,
                     "git",
                     &theme.render_git(snapshot.as_ref()),
                 )?;
             }
             Ok(SnapshotResult::Git(Err(error))) => {
-                protocol::write_error(&mut output, generation, "git", &record_error(&error))?;
+                protocol::write_error(
+                    &mut io::stdout().lock(),
+                    generation,
+                    "git",
+                    &record_error(&error),
+                )?;
             }
             Ok(SnapshotResult::Runtimes(Ok(values))) => {
                 for runtime in &active_runtimes {
@@ -85,15 +92,25 @@ pub async fn snapshot(
                         .find(|value| value.runtime == *runtime)
                         .and_then(|value| theme.render_runtime(value))
                         .unwrap_or_default();
-                    protocol::write_segment(&mut output, generation, runtime.name(), &fragment)?;
+                    protocol::write_segment(
+                        &mut io::stdout().lock(),
+                        generation,
+                        runtime.name(),
+                        &fragment,
+                    )?;
                 }
             }
             Ok(SnapshotResult::Runtimes(Err(error))) => {
-                protocol::write_error(&mut output, generation, "runtime", &record_error(&error))?;
+                protocol::write_error(
+                    &mut io::stdout().lock(),
+                    generation,
+                    "runtime",
+                    &record_error(&error),
+                )?;
             }
             Err(error) => {
                 protocol::write_error(
-                    &mut output,
+                    &mut io::stdout().lock(),
                     generation,
                     "snapshot",
                     &record_error(&io::Error::other(error)),
@@ -103,7 +120,7 @@ pub async fn snapshot(
     }
 
     tasks.abort_all();
-    protocol::write_done(&mut output, generation)
+    protocol::write_done(&mut io::stdout().lock(), generation)
 }
 
 pub fn init_zsh(instance: &daemon::Instance, selector: Option<&str>) -> io::Result<String> {

@@ -1,5 +1,6 @@
 use std::io::{self, Write as _};
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use clap::{Args, CommandFactory as _, Parser, Subcommand, error::ErrorKind};
 use tokio::runtime::Builder;
@@ -29,6 +30,9 @@ enum Command {
 
     #[command(name = "__snapshot", hide = true)]
     Snapshot(SnapshotArgs),
+
+    #[command(name = "__client-daemon", hide = true)]
+    ClientDaemon(ClientDaemonArgs),
 
     #[command(name = "__theme-apply-zsh", hide = true)]
     ThemeApplyZsh(InternalThemeArgs),
@@ -110,6 +114,15 @@ struct SnapshotArgs {
 }
 
 #[derive(Args)]
+struct ClientDaemonArgs {
+    #[arg(long, value_name = "HEX")]
+    theme: String,
+
+    #[command(flatten)]
+    instance: InstanceArgs,
+}
+
+#[derive(Args)]
 struct InternalThemeArgs {
     #[arg(long, value_name = "THEME")]
     theme: String,
@@ -145,6 +158,10 @@ enum Request {
     Snapshot {
         generation: u64,
         cwd: PathBuf,
+        instance: daemon::Instance,
+        theme: Box<theme::AsyncTheme>,
+    },
+    ClientDaemon {
         instance: daemon::Instance,
         theme: Box<theme::AsyncTheme>,
     },
@@ -206,7 +223,10 @@ pub(crate) fn run() {
             cwd,
             instance,
             theme,
-        } => run_async(prompt::snapshot(generation, cwd, instance, theme)),
+        } => run_async(prompt::snapshot(generation, cwd, instance, &theme)),
+        Request::ClientDaemon { instance, theme } => {
+            run_async(prompt::serve_client(instance, Arc::new(*theme)))
+        }
         Request::Daemon { instance } => run_async(daemon::serve(&instance)),
     };
     finish(result);
@@ -248,6 +268,14 @@ fn request(command: Command) -> Result<Request, &'static str> {
             Ok(Request::Snapshot {
                 generation: arguments.generation,
                 cwd: arguments.cwd,
+                instance: instance(arguments.instance)?,
+                theme: Box::new(theme),
+            })
+        }
+        Command::ClientDaemon(arguments) => {
+            let theme = theme::AsyncTheme::decode_hex(&arguments.theme)
+                .map_err(|_| "invalid compiled theme")?;
+            Ok(Request::ClientDaemon {
                 instance: instance(arguments.instance)?,
                 theme: Box::new(theme),
             })
@@ -347,6 +375,14 @@ mod tests {
             ],
             vec![
                 "ztheme",
+                "__client-daemon",
+                "--theme",
+                "0000",
+                "--dev",
+                "test",
+            ],
+            vec![
+                "ztheme",
                 "__theme-apply-zsh",
                 "--theme",
                 "vesper",
@@ -406,6 +442,7 @@ mod tests {
         assert!(help.contains("theme"));
         assert!(!help.contains("__daemon"));
         assert!(!help.contains("__snapshot"));
+        assert!(!help.contains("__client-daemon"));
         assert!(!help.contains("__theme-apply-zsh"));
     }
 }

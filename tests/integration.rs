@@ -1,6 +1,6 @@
 use std::ffi::OsStr;
 use std::fs;
-use std::io::{Read as _, Write as _};
+use std::io::{BufRead as _, BufReader, Read as _, Write as _};
 use std::os::unix::fs::PermissionsExt as _;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
@@ -496,7 +496,7 @@ ztheme theme reload >/dev/null || exit 35
 }
 
 #[test]
-fn deferred_plugins_load_once_and_worker_cleanup_preserves_standard_streams() {
+fn deferred_plugins_load_once() {
     let sandbox = Sandbox::new();
     sandbox.install_fake_gitstatus();
     sandbox.install_fake_input_plugins();
@@ -511,8 +511,6 @@ _ztheme_load_shell_plugins
 [[ "$ZTHEME_TEST_AUTOSUGGEST_STARTS" == 1 ]] || exit 42
 [[ "$ZTHEME_TEST_HIGHLIGHT_LOADS" == 1 ]] || exit 43
 (( $+widgets[autosuggest-accept] )) || exit 44
-exec {ZTHEME_ASYNC_FD}< <(sleep 1)
-_ztheme_preexec
 print -r -- stdout-sentinel
 print -u2 -r -- stderr-sentinel
 "#;
@@ -576,4 +574,574 @@ fn daemon_enforces_single_ownership_and_restarts_after_version_shutdown() {
 
 fn shell_word(path: &Path) -> String {
     format!("'{}'", path.to_string_lossy().replace('\'', "'\\''"))
+}
+
+const REQUEST_ENV_NAMES: [&str; 13] = [
+    "PATH",
+    "HOME",
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_CEILING_DIRECTORIES",
+    "VIRTUAL_ENV",
+    "CONDA_PREFIX",
+    "CONDA_DEFAULT_ENV",
+    "PERLBREW_PERL",
+    "PLENV_VERSION",
+    "RUSTUP_TOOLCHAIN",
+    "RBENV_VERSION",
+    "RUBY_VERSION",
+];
+
+fn client_request(generation: u64, cwd: &[u8]) -> Vec<u8> {
+    client_request_with_env(generation, cwd, &[])
+}
+
+fn client_request_with_env(generation: u64, cwd: &[u8], env: &[(&str, &str)]) -> Vec<u8> {
+    let mut fields: [&[u8]; 13] = [b""; 13];
+    for (name, value) in env {
+        let index = REQUEST_ENV_NAMES
+            .iter()
+            .position(|candidate| *candidate == *name)
+            .unwrap();
+        fields[index] = value.as_bytes();
+    }
+    let mut bytes = b"ZTREQ\0".to_vec();
+    bytes.extend_from_slice(b"1\0");
+    bytes.extend_from_slice(generation.to_string().as_bytes());
+    bytes.push(0);
+    bytes.extend_from_slice(cwd);
+    bytes.push(0);
+    for field in fields {
+        bytes.extend_from_slice(field);
+        bytes.push(0);
+    }
+    bytes
+}
+
+#[test]
+fn client_daemon_round_trips_requests_and_exits_on_eof() {
+    let sandbox = Sandbox::new();
+    sandbox.install_fake_gitstatus();
+    let mut child = sandbox
+        .command()
+        .args([
+            "__client-daemon",
+            "--theme",
+            "0000",
+            "--dev",
+            "client-round-trip",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+
+    stdin
+        .write_all(&client_request(
+            7,
+            sandbox.home.to_str().unwrap().as_bytes(),
+        ))
+        .unwrap();
+    let mut line = String::new();
+    stdout.read_line(&mut line).unwrap();
+    assert_eq!(line, "ZTHEME1\t7\tdone\n");
+
+    drop(stdin);
+    let status = wait_for_exit(&mut child, PROCESS_TIMEOUT).unwrap();
+    assert!(status.success());
+}
+
+#[test]
+fn client_daemon_serves_git_requests_with_correct_generation() {
+    let sandbox = Sandbox::new();
+    sandbox.install_fake_gitstatus();
+    let instance = format!("client-git-{}", SEQUENCE.fetch_add(1, Ordering::Relaxed));
+
+    // Pre-spawn the server so it can be shut down deterministically at the end.
+    let server = sandbox
+        .command()
+        .args(["__daemon", "--dev", &instance])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut server = ChildGuard::new(server);
+    let socket = wait_for_socket(server.child());
+
+    let generated = sandbox
+        .command()
+        .args(["init", "zsh", "--dev", &instance])
+        .output()
+        .unwrap();
+    assert_success(&generated);
+    let source = String::from_utf8(generated.stdout).unwrap();
+    let hex = source
+        .lines()
+        .find_map(|line| line.strip_prefix("typeset -g __ZTHEME_ASYNC_THEME='"))
+        .and_then(|rest| rest.strip_suffix('\''))
+        .unwrap()
+        .to_owned();
+
+    let mut child = sandbox
+        .command()
+        .args(["__client-daemon", "--theme", &hex, "--dev", &instance])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+
+    stdin
+        .write_all(&client_request(
+            23,
+            sandbox.home.to_str().unwrap().as_bytes(),
+        ))
+        .unwrap();
+    let mut records = Vec::new();
+    loop {
+        let mut line = String::new();
+        assert_ne!(
+            stdout.read_line(&mut line).unwrap(),
+            0,
+            "client closed its output before done"
+        );
+        let fields: Vec<&str> = line.trim_end().split('\t').collect();
+        assert_eq!(fields[0], "ZTHEME1");
+        assert_eq!(fields[1], "23");
+        records.push(line.clone());
+        if fields[2] == "done" {
+            break;
+        }
+    }
+    assert!(records.len() >= 2, "expected records before done");
+
+    drop(stdin);
+    let status = wait_for_exit(&mut child, PROCESS_TIMEOUT).unwrap();
+    assert!(status.success());
+
+    shutdown_outdated_daemon(&socket);
+    assert!(
+        wait_for_exit(server.child(), PROCESS_TIMEOUT)
+            .unwrap()
+            .success()
+    );
+    server.wait().unwrap();
+}
+
+#[test]
+fn client_daemon_renders_async_segments_through_the_shell_integration() {
+    let sandbox = Sandbox::new();
+    sandbox.install_fake_gitstatus();
+    let instance = format!("client-zsh-{}", SEQUENCE.fetch_add(1, Ordering::Relaxed));
+    sandbox.write_theme(
+        "asynctheme",
+        "version = 1\n\
+         [layout]\n\
+         lines = [[\"directory\", \"git\"], [\"character\"]]\n\
+         right = [\"status\"]\n\
+         separator = \" | \"\n\
+         blank_line_before = false\n",
+    );
+
+    let server = sandbox
+        .command()
+        .args(["__daemon", "--dev", &instance])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut server = ChildGuard::new(server);
+    let socket = wait_for_socket(server.child());
+
+    let script = format!(
+        r#"
+eval "$("$ZTHEME_TEST_BIN" init zsh --dev {instance} --theme asynctheme)" || exit 80
+add-zsh-hook -D preexec _ztheme_preexec 2>/dev/null
+(( __ZTHEME_HAS_ASYNC )) || exit 81
+[[ -n "$ZTHEME_CLIENT_PID" ]] || exit 82
+# Write the request directly instead of _ztheme_start_worker: that function
+# requires zle -F registration, which is only meaningful in an interactive
+# shell, and the test drives the wire protocol itself.
+typeset -i request_generation=5
+local request_line="ZTREQ"$'\0'"1"$'\0'"$request_generation"$'\0'"$PWD"$'\0'
+request_line+="${{PATH:-}}"$'\0'"${{HOME:-}}"$'\0'
+request_line+="${{GIT_DIR:-}}"$'\0'"${{GIT_WORK_TREE:-}}"$'\0'
+request_line+="${{GIT_CEILING_DIRECTORIES:-}}"$'\0'
+request_line+="${{VIRTUAL_ENV:-}}"$'\0'"${{CONDA_PREFIX:-}}"$'\0'
+request_line+="${{CONDA_DEFAULT_ENV:-}}"$'\0'
+request_line+="${{PERLBREW_PERL:-}}"$'\0'"${{PLENV_VERSION:-}}"$'\0'
+request_line+="${{RUSTUP_TOOLCHAIN:-}}"$'\0'"${{RBENV_VERSION:-}}"$'\0'
+request_line+="${{RUBY_VERSION:-}}"$'\0'
+if ! print -rn -- "$request_line" >&"$ZTHEME_REQ_FD"; then
+    exit 83
+fi
+typeset -i found_done=0
+typeset protocol generation kind segment fragment
+while (( ! found_done )); do
+    if ! IFS=$'\t' read -r -t 10 -u "$ZTHEME_RESP_FD" \
+        protocol generation kind segment fragment
+    then
+        exit 84
+    fi
+    [[ "$protocol" == ZTHEME1 ]] || exit 85
+    (( generation == request_generation )) || exit 86
+    case "$kind" in
+        segment) ;;
+        error) ;;
+        done) found_done=1 ;;
+        *) exit 87 ;;
+    esac
+done
+_ztheme_stop_client
+"#,
+        instance = instance
+    );
+    let output = sandbox.zsh(&script);
+    assert_success(&output);
+
+    shutdown_outdated_daemon(&socket);
+    assert!(
+        wait_for_exit(server.child(), PROCESS_TIMEOUT)
+            .unwrap()
+            .success()
+    );
+    server.wait().unwrap();
+}
+
+#[test]
+fn client_death_surfaces_eof_on_the_response_fifo() {
+    let sandbox = Sandbox::new();
+    sandbox.install_fake_gitstatus();
+    let instance = format!("client-eof-{}", SEQUENCE.fetch_add(1, Ordering::Relaxed));
+
+    let server = sandbox
+        .command()
+        .args(["__daemon", "--dev", &instance])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut server = ChildGuard::new(server);
+    let socket = wait_for_socket(server.child());
+
+    // The shell opens the response FIFO read-only, so when the client (the
+    // only writer) dies, the shell's next read must see EOF immediately.
+    // With the old O_RDWR shell-side open this would time out instead.
+    let script = format!(
+        r#"
+eval "$("$ZTHEME_TEST_BIN" init zsh --dev {instance})" || exit 80
+add-zsh-hook -D preexec _ztheme_preexec 2>/dev/null
+(( __ZTHEME_HAS_ASYNC )) || exit 81
+[[ -n "$ZTHEME_CLIENT_PID" ]] || exit 82
+# The client spawn must not permanently redirect the shell's stderr
+# (regression check for the `exec ... 2>/dev/null` bug).
+echo "stderr-alive" >&2 || exit 87
+kill -9 "$ZTHEME_CLIENT_PID" 2>/dev/null || exit 83
+zmodload zsh/datetime 2>/dev/null || exit 84
+typeset -F start_time=EPOCHREALTIME
+typeset line
+if read -r -t 2 -u "$ZTHEME_RESP_FD" line 2>/dev/null; then
+    exit 85  # got data, expected EOF
+fi
+typeset -F elapsed=$(( EPOCHREALTIME - start_time ))
+(( elapsed < 1.5 )) || exit 86  # timed out instead of seeing EOF
+_ztheme_stop_client
+"#,
+        instance = instance
+    );
+    let output = sandbox.zsh(&script);
+    assert_success(&output);
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("stderr-alive"),
+        "shell stderr was swallowed by the client spawn\nstderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    shutdown_outdated_daemon(&socket);
+    assert!(
+        wait_for_exit(server.child(), PROCESS_TIMEOUT)
+            .unwrap()
+            .success()
+    );
+    server.wait().unwrap();
+}
+
+#[test]
+fn client_daemon_applies_per_request_environment() {
+    let sandbox = Sandbox::new();
+    sandbox.install_fake_gitstatus();
+    let instance = format!("client-env-{}", SEQUENCE.fetch_add(1, Ordering::Relaxed));
+    sandbox.write_theme(
+        "slowpython",
+        "version = 1\n[layout]\nlines = [[\"python\"]]\nright = []\nseparator = \" | \"\nblank_line_before = false\n[segments.python]\nsymbol = \"py\"\nstyle = { foreground = \"accent\" }\nenvironment = { prefix = \"env:\" }\n",
+    );
+
+    // The version command must finish well inside the runtime command
+    // timeout (250 ms). The first exec of a freshly compiled binary under a
+    // stripped environment is slow (dyld warmup), so it is executed once
+    // before the client starts.
+    let bin = sandbox.home.join("bin");
+    fs::create_dir_all(&bin).unwrap();
+    let fake_source = sandbox.home.join("fake_python.c");
+    fs::write(
+        &fake_source,
+        "#include <stdio.h>\nint main(void) { printf(\"Python 3.12.0\\n\"); return 0; }\n",
+    )
+    .unwrap();
+    let fake_python = bin.join("python");
+    let compiled = Command::new("cc")
+        .arg(&fake_source)
+        .arg("-o")
+        .arg(&fake_python)
+        .status()
+        .unwrap();
+    assert!(compiled.success(), "failed to compile fake python");
+    // Warm the dyld cache so the first request's exec is fast.
+    assert!(Command::new(&fake_python).status().unwrap().success());
+    // Marker so the python runtime is detected in the request cwd.
+    fs::write(sandbox.home.join("pyproject.toml"), "[]\n").unwrap();
+
+    let server = sandbox
+        .command()
+        .args(["__daemon", "--dev", &instance])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut server = ChildGuard::new(server);
+    let socket = wait_for_socket(server.child());
+
+    let generated = sandbox
+        .command()
+        .args(["init", "zsh", "--dev", &instance, "--theme", "slowpython"])
+        .output()
+        .unwrap();
+    assert_success(&generated);
+    let source = String::from_utf8(generated.stdout).unwrap();
+    let hex = source
+        .lines()
+        .find_map(|line| line.strip_prefix("typeset -g __ZTHEME_ASYNC_THEME='"))
+        .and_then(|rest| rest.strip_suffix('\''))
+        .unwrap()
+        .to_owned();
+
+    let mut child = sandbox
+        .command()
+        .args(["__client-daemon", "--theme", &hex, "--dev", &instance])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    let cwd = sandbox.home.to_str().unwrap().as_bytes().to_vec();
+    let fake_path = bin.to_str().unwrap();
+
+    fn read_until_done(
+        stdout: &mut BufReader<std::process::ChildStdout>,
+        generation: u64,
+    ) -> Vec<String> {
+        let mut fragments = Vec::new();
+        loop {
+            let mut line = String::new();
+            assert_ne!(
+                stdout.read_line(&mut line).unwrap(),
+                0,
+                "client closed its output before done"
+            );
+            let fields: Vec<&str> = line.trim_end().split('\t').collect();
+            assert_eq!(fields[0], "ZTHEME1");
+            assert_eq!(fields[1], generation.to_string());
+            if fields[2] == "segment" {
+                assert_eq!(fields[3], "python");
+                fragments.push(fields[4].to_owned());
+            }
+            if fields[2] == "done" {
+                return fragments;
+            }
+        }
+    }
+
+    // Request 1: VIRTUAL_ENV unset -> no environment label.
+    stdin
+        .write_all(&client_request_with_env(1, &cwd, &[("PATH", fake_path)]))
+        .unwrap();
+    let first = read_until_done(&mut stdout, 1);
+    assert!(
+        first.iter().all(|fragment| !fragment.contains("env:")),
+        "unexpected label without VIRTUAL_ENV: {first:?}"
+    );
+
+    // Request 2: VIRTUAL_ENV set -> the label must reflect the new value.
+    stdin
+        .write_all(&client_request_with_env(
+            2,
+            &cwd,
+            &[("PATH", fake_path), ("VIRTUAL_ENV", "/venv-b")],
+        ))
+        .unwrap();
+    let second = read_until_done(&mut stdout, 2);
+    assert!(
+        second
+            .iter()
+            .any(|fragment| fragment.contains("env:venv-b")),
+        "request environment was not applied: {second:?}"
+    );
+
+    // Request 3: back to the unset state; the previous value must not leak.
+    stdin
+        .write_all(&client_request_with_env(3, &cwd, &[("PATH", fake_path)]))
+        .unwrap();
+    let third = read_until_done(&mut stdout, 3);
+    assert!(
+        third
+            .iter()
+            .all(|fragment| !fragment.contains("env:venv-b")),
+        "stale environment leaked into a later request: {third:?}"
+    );
+
+    drop(stdin);
+    let status = wait_for_exit(&mut child, PROCESS_TIMEOUT).unwrap();
+    assert!(status.success());
+
+    shutdown_outdated_daemon(&socket);
+    assert!(
+        wait_for_exit(server.child(), PROCESS_TIMEOUT)
+            .unwrap()
+            .success()
+    );
+    server.wait().unwrap();
+}
+
+#[test]
+fn client_daemon_cancels_in_flight_work_without_emitting_stale_records() {
+    let sandbox = Sandbox::new();
+    let instance = format!("client-cancel-{}", SEQUENCE.fetch_add(1, Ordering::Relaxed));
+    sandbox.write_theme(
+        "gitonly",
+        "version = 1\n[layout]\nlines = [[\"git\"]]\nright = []\nseparator = \" | \"\nblank_line_before = false\n",
+    );
+
+    // A gitstatusd that answers after a delay: the daemon spawns it with a
+    // normal environment, so the delay is reliable (unlike a runtime command
+    // in the client's stripped request environment).
+    let delayed = sandbox.data.join("ztheme/gitstatus/v1.5/gitstatusd");
+    fs::create_dir_all(delayed.parent().unwrap()).unwrap();
+    fs::write(&delayed, "#!/bin/sh\n/bin/sleep 0.15\nexec cat\n").unwrap();
+    fs::set_permissions(&delayed, fs::Permissions::from_mode(0o700)).unwrap();
+
+    let server = sandbox
+        .command()
+        .args(["__daemon", "--dev", &instance])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut server = ChildGuard::new(server);
+    let socket = wait_for_socket(server.child());
+
+    let generated = sandbox
+        .command()
+        .args(["init", "zsh", "--dev", &instance, "--theme", "gitonly"])
+        .output()
+        .unwrap();
+    assert_success(&generated);
+    let source = String::from_utf8(generated.stdout).unwrap();
+    let hex = source
+        .lines()
+        .find_map(|line| line.strip_prefix("typeset -g __ZTHEME_ASYNC_THEME='"))
+        .and_then(|rest| rest.strip_suffix('\''))
+        .unwrap()
+        .to_owned();
+
+    let mut child = sandbox
+        .command()
+        .args(["__client-daemon", "--theme", &hex, "--dev", &instance])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    let cwd = sandbox.home.to_str().unwrap().as_bytes().to_vec();
+    let fake_path = sandbox.data.to_str().unwrap();
+
+    // Request A: its git query is still in flight (the fake gitstatusd
+    // delays 150 ms) when B arrives and supersedes it, so A must contribute
+    // no records at all.
+    stdin
+        .write_all(&client_request_with_env(1, &cwd, &[("PATH", fake_path)]))
+        .unwrap();
+    thread::sleep(Duration::from_millis(50));
+    stdin
+        .write_all(&client_request_with_env(
+            2,
+            &cwd,
+            &[("PATH", fake_path), ("VIRTUAL_ENV", "/venv-b")],
+        ))
+        .unwrap();
+
+    let mut records = Vec::new();
+    loop {
+        let mut line = String::new();
+        assert_ne!(
+            stdout.read_line(&mut line).unwrap(),
+            0,
+            "client closed its output before done"
+        );
+        let fields: Vec<&str> = line.trim_end().split('\t').collect();
+        assert_eq!(fields[0], "ZTHEME1");
+        assert_eq!(fields[1], "2", "superseded request leaked records: {line}");
+        records.push(line.clone());
+        if fields[2] == "done" {
+            break;
+        }
+    }
+    assert!(records.len() >= 2, "expected records before done");
+
+    // Request C: the client still serves normally after the supersede.
+    stdin
+        .write_all(&client_request_with_env(3, &cwd, &[("PATH", fake_path)]))
+        .unwrap();
+    let mut c_records = Vec::new();
+    loop {
+        let mut line = String::new();
+        assert_ne!(
+            stdout.read_line(&mut line).unwrap(),
+            0,
+            "client closed its output before done"
+        );
+        let fields: Vec<&str> = line.trim_end().split('\t').collect();
+        assert_eq!(fields[0], "ZTHEME1");
+        assert_eq!(fields[1], "3");
+        c_records.push(line.clone());
+        if fields[2] == "done" {
+            break;
+        }
+    }
+    assert!(c_records.len() >= 2, "expected records before done");
+
+    drop(stdin);
+    let status = wait_for_exit(&mut child, PROCESS_TIMEOUT).unwrap();
+    assert!(status.success());
+
+    shutdown_outdated_daemon(&socket);
+    assert!(
+        wait_for_exit(server.child(), PROCESS_TIMEOUT)
+            .unwrap()
+            .success()
+    );
+    server.wait().unwrap();
 }

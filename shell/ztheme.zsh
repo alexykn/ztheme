@@ -1,8 +1,8 @@
 # ztheme shell integration
 #
 # Immediate prompt state is rendered in Zsh. Git and runtime values are styled
-# in Rust and arrive as finished fragments through the hidden asynchronous
-# `ztheme __snapshot` protocol.
+# in Rust and arrive as finished fragments from the per-shell
+# `ztheme __client-daemon` process.
 
 _ztheme_initialize() {
 autoload -Uz colors
@@ -12,8 +12,8 @@ autoload -Uz add-zle-hook-widget
 colors
 setopt PROMPT_SUBST
 
-if (( $+functions[_ztheme_close_worker] )); then
-    { _ztheme_close_worker } 2>/dev/null
+if (( $+functions[_ztheme_stop_client] )); then
+    { _ztheme_stop_client } 2>/dev/null
 fi
 
 # ---------------------------------------------------------------------------
@@ -35,8 +35,12 @@ typeset -g ZTHEME_RPROMPT=""
 typeset -g ZTHEME_CONTEXT_KEY=""
 typeset -g ZTHEME_LAST_ERROR=""
 typeset -gi ZTHEME_GENERATION=0
-typeset -gi ZTHEME_ASYNC_FD=-1
 typeset -gi ZTHEME_ASYNC_PENDING=0
+typeset -g ZTHEME_CLIENT_PID=""
+typeset -gi ZTHEME_CLIENT_READY=0
+typeset -gi ZTHEME_REQ_FD=-1
+typeset -gi ZTHEME_RESP_FD=-1
+typeset -gi ZTHEME_FIFO_SEQUENCE=0
 typeset -gi ZTHEME_AUTOSUGGESTIONS_WARNING_SHOWN=${ZTHEME_AUTOSUGGESTIONS_WARNING_SHOWN:-0}
 typeset -gi ZTHEME_SYNTAX_WARNING_SHOWN=${ZTHEME_SYNTAX_WARNING_SHOWN:-0}
 typeset -g ZSH_AUTOSUGGEST_MANUAL_REBIND=1
@@ -54,16 +58,106 @@ fi
 
 @ZTHEME_SHELL_DEFAULTS@
 
-_ztheme_close_worker() {
+_ztheme_start_client() {
+    emulate -L zsh
+    setopt localoptions no_shwordsplit
+
+    (( __ZTHEME_HAS_ASYNC )) || return 1
+    [[ -x "$__ZTHEME_BIN" ]] || return 1
+
+    local base="${TMPDIR:-/tmp}"
+    local -i sequence=$(( ++ZTHEME_FIFO_SEQUENCE ))
+    local prefix="$base/ztheme-$UID-$$-$sequence"
+    local request="$prefix.req"
+    local response="$prefix.resp"
+    command rm -f "$request" "$response" 2>/dev/null
+    if ! command mkfifo -m 600 "$request" "$response" 2>/dev/null; then
+        return 1
+    fi
+
+    # The request FIFO is opened read-write so the open never blocks: the
+    # shell is the request writer and an early reader, which lets the client
+    # start without either side waiting on the other. The error suppression is
+    # scoped to a brace group: `exec` without a command applies its own
+    # redirections to the shell permanently, so `exec ... 2>/dev/null` would
+    # swallow the shell's stderr for its whole lifetime. zsh reports a failed
+    # `exec` redirection with a message and a zero status, so the failure is
+    # detected through the fd variable, which keeps its previous value (-1)
+    # when the open does not succeed.
+    { exec {ZTHEME_REQ_FD}<>"$request"; } 2>/dev/null
+    if (( ZTHEME_REQ_FD < 0 )); then
+        command rm -f "$request" "$response" 2>/dev/null
+        return 1
+    fi
+
+    # The client blocks opening the response FIFO for writing until the shell
+    # opens it for reading below; the two opens complete together, so this
+    # cannot deadlock. Keeping the shell's end read-only is what lets client
+    # death surface as EOF on ZTHEME_RESP_FD: if the shell also held a write
+    # end, its own writer would keep the read side open forever.
+    local ztheme_bg_nice="$options[bgnice]"
+    unsetopt BG_NICE
+    command "$__ZTHEME_BIN" __client-daemon \
+        --theme "$__ZTHEME_ASYNC_THEME" \
+        "${__ZTHEME_INSTANCE_ARGS[@]}" \
+        <"$request" >"$response" 2>/dev/null &!
+    [[ "$ztheme_bg_nice" == on ]] && setopt BG_NICE
+    unset ztheme_bg_nice
+
+    ZTHEME_CLIENT_PID=$!
+    ZTHEME_CLIENT_READY=0
+    if (( ZTHEME_CLIENT_PID <= 0 )) ||
+        ! kill -0 "$ZTHEME_CLIENT_PID" 2>/dev/null
+    then
+        # The fork failed, so nothing will ever open the response FIFO for
+        # writing; opening it read-only below would block the shell forever.
+        exec {ZTHEME_REQ_FD}<&-
+        ZTHEME_REQ_FD=-1
+        command rm -f "$request" "$response" 2>/dev/null
+        return 1
+    fi
+    { exec {ZTHEME_RESP_FD}<"$response"; } 2>/dev/null
+    if (( ZTHEME_RESP_FD < 0 )); then
+        exec {ZTHEME_REQ_FD}<&-
+        ZTHEME_REQ_FD=-1
+        command rm -f "$request" "$response" 2>/dev/null
+        return 1
+    fi
+
+    # Both sides are open now, so the directory entries can be unlinked:
+    # the descriptors keep the FIFO objects alive for the rest of the shell's
+    # life. A shell killed with SIGKILL therefore leaves no stale paths in
+    # $TMPDIR, and the predictable names cannot be interfered with either.
+    command rm -f "$request" "$response" 2>/dev/null
+
+    if builtin zle -F "$ZTHEME_RESP_FD" _ztheme_async_callback 2>/dev/null; then
+        ZTHEME_CLIENT_READY=1
+    fi
+    return 0
+}
+
+_ztheme_stop_client() {
     emulate -L zsh
 
-    local -i fd=$ZTHEME_ASYNC_FD
-    ZTHEME_ASYNC_FD=-1
+    local -i client_pid="${ZTHEME_CLIENT_PID:-0}"
+    ZTHEME_CLIENT_PID=""
+    ZTHEME_CLIENT_READY=0
     ZTHEME_ASYNC_PENDING=0
-    (( fd >= 0 )) || return 0
+    if (( client_pid > 0 )); then
+        kill "$client_pid" 2>/dev/null
+    fi
 
-    builtin zle -F "$fd" 2>/dev/null
-    exec {fd}<&-
+    local -i request_fd="${ZTHEME_REQ_FD:--1}"
+    local -i response_fd="${ZTHEME_RESP_FD:--1}"
+    ZTHEME_REQ_FD=-1
+    ZTHEME_RESP_FD=-1
+    if (( response_fd >= 0 )); then
+        builtin zle -F "$response_fd" 2>/dev/null
+        exec {response_fd}<&-
+    fi
+    if (( request_fd >= 0 )); then
+        exec {request_fd}<&-
+    fi
     return 0
 }
 
@@ -77,15 +171,16 @@ _ztheme_async_callback() {
 
     if ! IFS=$'\t' read -r -u "$fd" \
         protocol generation kind segment fragment; then
-        _ztheme_close_worker
+        _ztheme_stop_client
         _ztheme_render_layout
         builtin zle reset-prompt
         return
     fi
 
+    # Records from superseded generations are ignored, never rendered; the
+    # client daemon itself is long-lived, so nothing is torn down here.
     if [[ "$protocol" != ZTHEME1 ||
           "$generation" != "$ZTHEME_GENERATION" ]]; then
-        _ztheme_close_worker
         return
     fi
 
@@ -93,14 +188,6 @@ _ztheme_async_callback() {
         segment)
             ZTHEME_LAST_ERROR=""
             _ztheme_assign_async_segment "$segment" "$fragment"
-            case $? in
-                0) ;;
-                1) ;;
-                *)
-                    _ztheme_close_worker
-                    return
-                    ;;
-            esac
             ;;
         error)
             _ztheme_clear_async_segments
@@ -110,16 +197,15 @@ _ztheme_async_callback() {
             fi
             ;;
         done)
-            _ztheme_close_worker
             redraw=1
             ;;
         *)
-            _ztheme_close_worker
             return
             ;;
     esac
 
     if (( redraw )); then
+        ZTHEME_ASYNC_PENDING=0
         _ztheme_render_layout
         builtin zle reset-prompt
     fi
@@ -129,31 +215,47 @@ _ztheme_start_worker() {
     emulate -L zsh
     setopt localoptions no_shwordsplit
 
-    _ztheme_close_worker
     (( ++ZTHEME_GENERATION ))
     _ztheme_clear_async_segments
     (( __ZTHEME_HAS_ASYNC )) || return 1
     [[ -x "$__ZTHEME_BIN" ]] || return 1
 
+    if [[ -z "$ZTHEME_CLIENT_PID" ]] ||
+        ! kill -0 "$ZTHEME_CLIENT_PID" 2>/dev/null
+    then
+        _ztheme_stop_client
+        _ztheme_start_client || return 1
+    fi
+    if (( ! ZTHEME_CLIENT_READY )); then
+        if builtin zle -F "$ZTHEME_RESP_FD" _ztheme_async_callback 2>/dev/null; then
+            ZTHEME_CLIENT_READY=1
+        else
+            # Without a registered callback nobody will ever consume the
+            # response records, so the prompt would stay empty; stop the
+            # client and let the caller render without async segments.
+            _ztheme_stop_client
+            return 1
+        fi
+    fi
+
     local -i generation=$ZTHEME_GENERATION
-    local cwd="$PWD"
-    if ! exec {ZTHEME_ASYNC_FD}< <(
-        command "$__ZTHEME_BIN" __snapshot \
-            --generation "$generation" \
-            --cwd "$cwd" \
-            --theme "$__ZTHEME_ASYNC_THEME" \
-            "${__ZTHEME_INSTANCE_ARGS[@]}" 2>/dev/null
-    ); then
-        ZTHEME_ASYNC_FD=-1
+    # zsh strings can hold NUL bytes, and backslash continuations would join
+    # separate arguments, so the NUL-delimited request is assembled with
+    # incremental appends, one assignment per line.
+    local request_line="ZTREQ"$'\0'"1"$'\0'"$generation"$'\0'"$PWD"$'\0'
+    request_line+="${PATH:-}"$'\0'"${HOME:-}"$'\0'
+    request_line+="${GIT_DIR:-}"$'\0'"${GIT_WORK_TREE:-}"$'\0'
+    request_line+="${GIT_CEILING_DIRECTORIES:-}"$'\0'
+    request_line+="${VIRTUAL_ENV:-}"$'\0'"${CONDA_PREFIX:-}"$'\0'
+    request_line+="${CONDA_DEFAULT_ENV:-}"$'\0'
+    request_line+="${PERLBREW_PERL:-}"$'\0'"${PLENV_VERSION:-}"$'\0'
+    request_line+="${RUSTUP_TOOLCHAIN:-}"$'\0'"${RBENV_VERSION:-}"$'\0'
+    request_line+="${RUBY_VERSION:-}"$'\0'
+    if ! print -rn -- "$request_line" >&"$ZTHEME_REQ_FD" 2>/dev/null; then
+        _ztheme_stop_client
         return 1
     fi
 
-    if ! builtin zle -F "$ZTHEME_ASYNC_FD" \
-        _ztheme_async_callback 2>/dev/null
-    then
-        _ztheme_close_worker
-        return 1
-    fi
     ZTHEME_ASYNC_PENDING=1
     ZTHEME_PROMPT=""
     ZTHEME_RPROMPT=""
@@ -312,14 +414,12 @@ _ztheme_initialize_autosuggestions() {
 _ztheme_preexec() {
     emulate -L zsh
 
-    _ztheme_close_worker
     (( ++ZTHEME_GENERATION ))
 }
 
 _ztheme_chpwd() {
     emulate -L zsh
 
-    _ztheme_close_worker
     (( ++ZTHEME_GENERATION ))
     ZTHEME_CONTEXT_KEY=""
     _ztheme_clear_async_segments
@@ -328,7 +428,7 @@ _ztheme_chpwd() {
 _ztheme_zshexit() {
     emulate -L zsh
 
-    _ztheme_close_worker
+    _ztheme_stop_client
     if [[ -o interactive &&
           -n "$__ZTHEME_TERM_LEAVE$__ZTHEME_FOCUS_LEAVE" ]]
     then
@@ -466,6 +566,7 @@ if (( __ZTHEME_HAS_ASYNC )); then
     unsetopt BG_NICE
     command "$__ZTHEME_BIN" __daemon \
         "${__ZTHEME_INSTANCE_ARGS[@]}" >/dev/null 2>&1 &!
+    _ztheme_start_client
     [[ "$ztheme_bg_nice" == on ]] && setopt BG_NICE
     unset ztheme_bg_nice
 fi

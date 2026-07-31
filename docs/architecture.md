@@ -1,9 +1,10 @@
 # Architecture
 
-ztheme has two process layers:
+ztheme has three process layers:
 
-1. Short-lived CLI and snapshot-helper processes.
-2. A per-user background daemon.
+1. Short-lived CLI processes.
+2. A per-shell client daemon that owns the prompt protocol and rendering.
+3. A per-user background server daemon hosting shared cache and Git state.
 
 This division exists because prompt rendering has conflicting requirements.
 The shell-facing path must start quickly, finish within a strict deadline, and
@@ -12,19 +13,23 @@ inspection, however, benefit from state that survives a single prompt render
 and can be shared by multiple shells.
 
 Zsh computes the immediate directory, character, and status segments itself.
-For asynchronous segments it starts a short-lived `__snapshot` helper before
-rendering the next prompt. The helper starts the Git request first, starts
-runtime detection immediately after that, and exits after one shared deadline.
-The helper does not keep background state of its own.
+For asynchronous segments it sends a request to its per-shell client daemon
+before rendering the next prompt. The client starts the Git request first,
+starts runtime detection immediately after that, renders the completed
+fragments with the compiled theme, and finishes each request when the shared
+deadline expires or the last fragment is written; the client itself keeps
+running and serves the shell's next request. The client does not keep
+per-request state between prompts other than its compiled theme and its
+connection to the server daemon.
 
 The shell stores the incoming fragments but does not redraw the prompt for each
-one. It waits for the helper's final `done` record, then renders the complete
+one. It waits for the client's final `done` record, then renders the complete
 prompt once. While a snapshot is pending, Zsh leaves the prompt empty; it only
 appears once every requested async segment has completed or the deadline has
 expired. This makes the update atomic without adding a second animation
 protocol.
 
-The daemon provides that shared background state. It hosts two independent
+The server daemon provides shared background state. It hosts two independent
 long-lived capabilities:
 
 - a persistent runtime-value cache, so runtime version commands are not
@@ -32,32 +37,41 @@ long-lived capabilities:
 - a persistent `gitstatusd` client, so Git status queries reuse one optimized
   repository-status process instead of starting Git tooling for every prompt.
 
-The daemon is not responsible for rendering. It returns structured Git data
-and opaque encoded runtime snapshots; the short-lived helper renders those
+The server daemon is not responsible for rendering. It returns structured Git
+data and opaque encoded runtime snapshots; the client daemon renders those
 values with the compiled theme.
+
+Keeping a separate client daemon per shell removes the cost of spawning a
+process for every prompt: on this project's benchmarks, the per-prompt spawn
+was the largest single cost of a warm prompt, and a long-lived client turns it
+into a one-time cost per shell. The client also isolates per-shell state
+(generation counters, the active request, cancellation) and keeps slow runtime
+command execution out of the shared daemon, where it would couple shells
+through one event loop.
 
 ## End-to-end prompt flow
 
 ```text
 Zsh precmd/chpwd
-├── start ztheme __snapshot
-│   ├── start Git task first
-│   │   └── daemon::git_status
-│   │       └── persistent gitstatus::Client
-│   │           └── gitstatusd
-│   └── start runtime task immediately after Git begins
-│       ├── detect project and active runtimes
-│       ├── daemon::runtime_cache_get
-│       ├── on miss: execute runtime snapshots
-│       └── daemon::runtime_cache_put
-├── compute synchronous shell segments while the helper runs
+├── send a request to the per-shell client daemon
+│   └── ztheme __client-daemon (one per shell, spawned once at shell init)
+│       ├── start Git task first
+│       │   └── daemon::git_status
+│       │       └── persistent gitstatus::Client
+│       │           └── gitstatusd
+│       └── start runtime task immediately after Git begins
+│           ├── detect project and active runtimes
+│           ├── daemon::runtime_cache_get
+│           ├── on miss: execute runtime snapshots
+│           └── daemon::runtime_cache_put
+├── compute synchronous shell segments while the client works
 └── leave the prompt empty until the snapshot finishes
 
 prompt protocol records
 └── Zsh stores current-generation fragments without redrawing
 
 shared 550 ms deadline
-├── cancel unfinished helper tasks
+├── cancel unfinished client tasks
 └── write final done record
 
 done record
@@ -66,17 +80,18 @@ done record
 
 Git and runtime records may still arrive in either order on the prompt
 protocol, but neither one is rendered by itself. Generation IDs prevent a slow
-helper for an old working directory from overwriting a newer prompt.
+request for an old working directory from overwriting a newer prompt.
 
 ## Why a daemon
 
-The daemon is an optimization boundary and an ownership boundary, not a second
-application tier.
+The server daemon is an optimization boundary and an ownership boundary, not a
+second application tier.
 
-Without it, every snapshot helper would have to start its own `gitstatusd`,
+Without it, every prompt request would have to start its own `gitstatusd`,
 load and rewrite its own runtime cache, and coordinate concurrent shell
 processes directly. That would put setup cost and filesystem races on the
-latency-sensitive prompt path. A single per-user daemon instead provides:
+latency-sensitive prompt path. A single per-user server daemon instead
+provides:
 
 - one owner for the `gitstatusd` subprocess;
 - one in-memory runtime-cache state shared by all shells;
@@ -84,10 +99,24 @@ latency-sensitive prompt path. A single per-user daemon instead provides:
 - a single place for daemon compatibility, startup, retry, and shutdown;
 - isolation between production and explicitly named development instances.
 
-The daemon starts lazily on the first ordinary request and exits after one hour
-without a newly accepted connection. It is therefore not a permanently
-installed system service and requires no service manager. The same `ztheme`
-binary launches its hidden `__daemon` command with standard streams detached.
+The per-shell client daemon exists for a different reason: to keep the
+short-lived process out of the prompt path. Spawning one process per prompt
+was the largest single cost of a warm prompt; the client turns it into a
+one-time cost per shell. It also keeps per-shell prompt state (generation,
+active request, cancellation) in a process that owns it, and keeps runtime
+command execution out of the shared daemon so one shell's cache miss cannot
+slow another shell's prompt through a shared event loop.
+
+The server daemon starts lazily on the first ordinary request and exits after
+one hour without a newly accepted connection. It is therefore not a
+permanently installed system service and requires no service manager. The
+same `ztheme` binary launches its hidden `__daemon` command with standard
+streams detached. The client daemon is spawned by the shell integration once
+per shell; it exits when the shell's request pipe closes, which happens even
+when the shell is killed without running cleanup hooks. The shell and the
+client communicate over a pair of named pipes that are unlinked as soon as
+both sides have opened them, so a killed shell leaves no stale filesystem
+entries behind.
 
 ## Source layout
 
@@ -107,6 +136,9 @@ src/
 │   └── detect.rs
 ├── gitstatus/
 ├── prompt/
+│   ├── mod.rs
+│   ├── client.rs
+│   └── protocol.rs
 ├── setup/
 └── theme/
 ```
@@ -127,9 +159,13 @@ Hidden commands are shell implementation details and do not appear in public
 help:
 
 - `__daemon`
+- `__client-daemon`
 - `__snapshot`
 - `__theme-apply-zsh`
 - `__theme-reload-zsh`
+
+`__snapshot` is retained for compatibility with integrations generated by
+older binaries; the per-shell client daemon replaces it for new shells.
 
 ### Daemon
 
@@ -222,7 +258,7 @@ them manually starts the daemon. The common request path:
 
 An older client does not kill a newer daemon. It receives an unsupported
 client error instead. This asymmetry lets a newly installed binary replace an
-old background process while preventing an older still-running shell helper
+old background process while preventing an older still-running shell client
 from downgrading the daemon.
 
 `reset` is deliberately different. When the daemon exists it sends `RESET`,
@@ -322,7 +358,7 @@ needs repository metadata and working-tree change summaries on a path where
 repeated `git status` process startup and repository scanning would be visible.
 `gitstatusd` is designed to remain alive, reuse repository state, and answer
 successive queries efficiently. That persistent design is the main reason Git
-access belongs behind the daemon rather than in each snapshot helper.
+access belongs behind the server daemon rather than in each prompt request.
 
 `ztheme setup` installs the managed binary. `ztheme init zsh` refuses to
 generate an integration when it is absent, so the daemon never silently
@@ -350,14 +386,16 @@ the same as either ztheme protocol.
 
 The client retries a failed query once after replacing `gitstatusd`. The daemon
 also places a 30-second safety timeout around the process query and restarts
-the child if that limit is exceeded. The snapshot helper's 550 ms deadline is
+the child if that limit is exceeded. The prompt request's 550 ms deadline is
 much shorter: it can stop waiting and keep the prompt responsive without
 discarding the daemon or its Git process merely because one prompt no longer
 needs the result.
 
 ### Prompt
 
-`prompt/mod.rs` is the application-level coordinator. It:
+`prompt/mod.rs` is the application-level coordinator. Its `snapshot` function
+is the per-request engine used by both the short-lived `__snapshot` helper and
+the long-lived client daemon:
 
 - starts the Git task first and lets it begin its daemon request;
 - starts runtime detection immediately afterward;
@@ -367,15 +405,21 @@ needs the result.
 - always writes the final `done` record;
 - sanitizes errors before sending them to Zsh.
 
-It does not manage daemon sockets, process startup, cache persistence, or the
+`prompt/client.rs` owns the per-shell client daemon: it parses requests from
+the shell, applies the requested environment subset, dispatches each request to
+`snapshot`, and aborts the in-flight request when a newer generation arrives.
+The client's records go to its stdout, which the shell integration connects to
+its response pipe.
+
+It does not manage server sockets, process startup, cache persistence, or the
 `gitstatusd` process.
 
 The 550 ms limit is one deadline shared by both jobs, not 550 ms per operation.
-Once it expires, the helper aborts unfinished Tokio tasks and writes `done`.
+Once it expires, the engine aborts unfinished Tokio tasks and writes `done`.
 The shell treats that record as the rendering barrier, so a slow or missing
-result cannot leave the prompt waiting forever. Dropping an in-flight daemon
-request closes that helper's socket connection; the daemon remains independent
-and available to later prompts.
+result cannot leave the prompt waiting forever. Dropping an in-flight server
+request closes that request's socket connection; the server daemon remains
+independent and available to later prompts.
 
 Runtime-cache failures are soft on the rendering path. A failed read falls
 back to executing the runtime snapshot, and a failed write does not discard
@@ -440,12 +484,12 @@ In particular:
 
 ## Protocol boundaries
 
-ztheme has two unrelated protocols.
+ztheme has three unrelated protocols.
 
 ### Daemon binary protocol
 
 `daemon/protocol.rs` defines the versioned binary protocol used between
-short-lived ztheme processes and the daemon. Each operation opens one Unix
+ztheme processes and the server daemon. Each operation opens one Unix
 stream connection, writes one request, reads one response, and drops the
 connection. There is no multiplexing or connection pool: state is held by the
 daemon services, while per-request connections keep client cancellation and
@@ -476,7 +520,7 @@ Paths remain bytes across the protocol so valid non-UTF-8 Unix paths round-trip
 without lossy conversion. Human-readable Git fields must be UTF-8.
 
 The normal cache/reset exchange deadline is 25 ms. Git uses 500 ms because it
-may require repository work, while still fitting beneath the helper's 550 ms
+may require repository work, while still fitting beneath the request's 550 ms
 overall deadline in the usual case.
 
 Compatibility is negotiated before reading an operation:
@@ -494,8 +538,9 @@ disk-format and cache-identity versions.
 
 ### Prompt-to-Zsh protocol
 
-`prompt/protocol.rs` defines the line-oriented records written by
-`__snapshot` to stdout and consumed by the Zsh integration:
+`prompt/protocol.rs` defines the line-oriented records written by the
+`__snapshot` helper and the client daemon to stdout and consumed by the Zsh
+integration:
 
 ```text
 ZTHEME1<TAB>generation<TAB>segment<TAB>name<TAB>rendered-fragment<NL>
@@ -517,16 +562,38 @@ the immediate segments rather than leaving the prompt stuck.
 
 The generation is allocated by the shell integration. Zsh ignores records from
 superseded generations, allowing directory changes to cancel or outlive an
-older helper safely. `done` is always emitted, including when there are no
+older request safely. `done` is always emitted, including when there are no
 asynchronous segments or the shared deadline expires, so the shell can finish
 that generation's worker lifecycle.
 
+### Zsh-to-client request protocol
+
+`prompt/client.rs` defines the request the shell writes to the client daemon's
+stdin for every asynchronous prompt. It is a single NUL-delimited record, so
+fields need no escaping and non-UTF-8 paths round-trip byte-exact:
+
+```text
+ZTREQ<NUL>1<NUL>generation<NUL>cwd<NUL>
+PATH<NUL>HOME<NUL>GIT_DIR<NUL>GIT_WORK_TREE<NUL>GIT_CEILING_DIRECTORIES<NUL>
+VIRTUAL_ENV<NUL>CONDA_PREFIX<NUL>CONDA_DEFAULT_ENV<NUL>
+PERLBREW_PERL<NUL>PLENV_VERSION<NUL>RUSTUP_TOOLCHAIN<NUL>
+RBENV_VERSION<NUL>RUBY_VERSION<NUL>
+```
+
+`ZTREQ` and version `1` guard against garbage input. The environment subset is
+exactly what runtime detection, command resolution, and the Git query read;
+the client applies it to its own process environment for the duration of that
+request because it outlives the shell's per-prompt environment changes. An
+empty environment field means the variable is unset. The shell owns the write
+end of the request pipe, so EOF on the client's stdin means the shell is gone
+and the client exits.
+
 These protocols remain separate because they solve different compatibility
 problems. The daemon protocol is a local service API carrying binary structured
-data between Rust processes. The prompt protocol is a streaming rendering API
-carrying generation-scoped text into Zsh. Changing prompt rendering must not
-invalidate a daemon, and changing daemon transport must not redefine shell
-record parsing.
+data between Rust processes. The prompt protocols are streaming rendering APIs
+carrying generation-scoped text and requests between the shell and its client.
+Changing prompt rendering must not invalidate a daemon, and changing daemon
+transport must not redefine shell record parsing.
 
 ## Adding a runtime
 
