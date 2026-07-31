@@ -20,8 +20,8 @@ const REQUEST_VERSION: &[u8] = b"1";
 ///
 /// Requests arrive on stdin as NUL-delimited fields (see `read_request`);
 /// rendered records go to stdout using the same `ZTHEME1` line protocol the
-/// short-lived `__snapshot` helper uses. The shell owns the request pipe's
-/// write end, so EOF on stdin means the shell is gone and the client exits.
+/// shell integration consumes. The shell owns the request pipe's write end,
+/// so EOF on stdin means the shell is gone and the client exits.
 pub async fn serve_client(instance: daemon::Instance, theme: Arc<AsyncTheme>) -> io::Result<()> {
     let (sender, mut receiver) = mpsc::channel(4);
     let reader = tokio::spawn(read_requests(sender));
@@ -30,19 +30,20 @@ pub async fn serve_client(instance: daemon::Instance, theme: Arc<AsyncTheme>) ->
     loop {
         match receiver.recv().await {
             Some(request) => {
-                // A new request supersedes any in-flight work, matching the
-                // previous design where zsh killed the short-lived helper of
-                // an older prompt. The superseded task is aborted and awaited
-                // before the environment is touched: its JoinSet drops only
-                // when the task is actually destroyed, and the request tasks
-                // read environment values after awaits, so without the await
-                // they could resume after the mutation below with the new
-                // request's environment. This ordering (destroy the request
-                // task and its JoinSet, then mutate the environment) is the
-                // correctness invariant; the integration tests can only
-                // observe its black-box consequences (no stale records, clean
-                // per-request environment), so this comment carries the
-                // stronger guarantee.
+                // A new request supersedes any in-flight work: the records
+                // of an older generation would be ignored by the shell, and
+                // letting the work run on would waste time and read the new
+                // request's environment. The superseded task is aborted and
+                // awaited before the environment is touched: its JoinSet
+                // drops only when the task is actually destroyed, and the
+                // request tasks read environment values after awaits, so
+                // without the await they could resume after the mutation
+                // below with the new request's environment. This ordering
+                // (destroy the request task and its JoinSet, then mutate the
+                // environment) is the correctness invariant; the integration
+                // tests can only observe its black-box consequences (no stale
+                // records, clean per-request environment), so this comment
+                // carries the stronger guarantee.
                 if let Some(handle) = current.take() {
                     handle.abort();
                     if let Ok(Err(error)) = handle.await {

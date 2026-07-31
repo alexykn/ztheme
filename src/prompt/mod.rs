@@ -17,7 +17,7 @@ use crate::{daemon, gitstatus, setup, theme};
 
 pub(crate) use protocol::prompt_text;
 
-const HELPER_TIMEOUT: Duration = Duration::from_millis(550);
+const REQUEST_TIMEOUT: Duration = Duration::from_millis(550);
 const ZSH_DEFAULTS: &str = include_str!("../../shell/defaults.zsh");
 const ZSH_INTEGRATION: &str = include_str!("../../shell/ztheme.zsh");
 
@@ -29,7 +29,7 @@ pub async fn snapshot(
 ) -> io::Result<()> {
     let git_enabled = theme.git_enabled();
     let active_runtimes = theme.runtimes();
-    let deadline = Instant::now() + HELPER_TIMEOUT;
+    let deadline = Instant::now() + REQUEST_TIMEOUT;
     let mut tasks = JoinSet::new();
 
     let git_started = if git_enabled {

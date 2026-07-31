@@ -1,5 +1,4 @@
 use std::io::{self, Write as _};
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use clap::{Args, CommandFactory as _, Parser, Subcommand, error::ErrorKind};
@@ -27,9 +26,6 @@ enum Command {
 
     #[command(name = "__daemon", hide = true)]
     Daemon(InstanceArgs),
-
-    #[command(name = "__snapshot", hide = true)]
-    Snapshot(SnapshotArgs),
 
     #[command(name = "__client-daemon", hide = true)]
     ClientDaemon(ClientDaemonArgs),
@@ -99,21 +95,6 @@ struct InstanceArgs {
 }
 
 #[derive(Args)]
-struct SnapshotArgs {
-    #[arg(long)]
-    generation: u64,
-
-    #[arg(long, value_name = "PATH")]
-    cwd: PathBuf,
-
-    #[arg(long, value_name = "HEX")]
-    theme: String,
-
-    #[command(flatten)]
-    instance: InstanceArgs,
-}
-
-#[derive(Args)]
 struct ClientDaemonArgs {
     #[arg(long, value_name = "HEX")]
     theme: String,
@@ -154,12 +135,6 @@ enum Request {
     },
     Clear {
         instance: daemon::Instance,
-    },
-    Snapshot {
-        generation: u64,
-        cwd: PathBuf,
-        instance: daemon::Instance,
-        theme: Box<theme::AsyncTheme>,
     },
     ClientDaemon {
         instance: daemon::Instance,
@@ -218,12 +193,6 @@ pub(crate) fn run() {
         } => prompt::theme_zsh(&instance, &selector, persist)
             .and_then(|script| write_stdout(&script)),
         Request::Clear { instance } => run_async(daemon::reset(&instance)),
-        Request::Snapshot {
-            generation,
-            cwd,
-            instance,
-            theme,
-        } => run_async(prompt::snapshot(generation, cwd, instance, &theme)),
         Request::ClientDaemon { instance, theme } => {
             run_async(prompt::serve_client(instance, Arc::new(*theme)))
         }
@@ -259,19 +228,6 @@ fn request(command: Command) -> Result<Request, &'static str> {
         Command::Daemon(arguments) => Ok(Request::Daemon {
             instance: instance(arguments)?,
         }),
-        Command::Snapshot(arguments) => {
-            if !arguments.cwd.is_absolute() || !arguments.cwd.is_dir() {
-                return Err("cwd must be an existing absolute directory");
-            }
-            let theme = theme::AsyncTheme::decode_hex(&arguments.theme)
-                .map_err(|_| "invalid compiled theme")?;
-            Ok(Request::Snapshot {
-                generation: arguments.generation,
-                cwd: arguments.cwd,
-                instance: instance(arguments.instance)?,
-                theme: Box::new(theme),
-            })
-        }
         Command::ClientDaemon(arguments) => {
             let theme = theme::AsyncTheme::decode_hex(&arguments.theme)
                 .map_err(|_| "invalid compiled theme")?;
@@ -363,18 +319,6 @@ mod tests {
             vec!["ztheme", "__daemon", "--dev", "test"],
             vec![
                 "ztheme",
-                "__snapshot",
-                "--generation",
-                "4",
-                "--cwd",
-                "/",
-                "--theme",
-                "0000",
-                "--dev",
-                "test",
-            ],
-            vec![
-                "ztheme",
                 "__client-daemon",
                 "--theme",
                 "0000",
@@ -429,7 +373,8 @@ mod tests {
             &["ztheme", "theme", "unknown"],
             &["ztheme", "clear", "--dev"],
             &["ztheme", "clear", "--dev", "one", "--dev", "two"],
-            &["ztheme", "__snapshot", "--generation", "x"],
+            &["ztheme", "__client-daemon"],
+            &["ztheme", "__theme-reload-zsh", "--theme"],
         ] {
             assert!(Cli::try_parse_from(arguments).is_err(), "{arguments:?}");
         }
