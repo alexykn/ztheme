@@ -146,7 +146,10 @@ fn write_result(
 pub fn init_zsh(instance: &daemon::Instance, selector: Option<&str>) -> io::Result<String> {
     let theme = theme::CompiledTheme::load(selector)?;
     let theme_zsh = theme.zsh()?;
-    if !gitstatus::ensure_installed(false)? {
+    // gitstatusd is required only when the selected layout actually includes a
+    // Git segment; a runtime-only or fully synchronous theme initializes
+    // without the managed binary.
+    if theme.git_enabled() && !gitstatus::ensure_installed(false)? {
         return Err(io::Error::other(
             "gitstatusd is required; initialization skipped (`ztheme setup --yes`)",
         ));
@@ -190,8 +193,25 @@ async fn runtime_values(
     active: Vec<Runtime>,
     environment: Arc<PromptEnvironment>,
 ) -> io::Result<Vec<RuntimeValue>> {
-    let git_root = runtime::detect::worktree_root(&cwd, &environment);
-    let project = runtime::detect::detect(&cwd, git_root.as_deref(), &environment);
+    // Runtime discovery walks the filesystem synchronously (up to 32
+    // directories) and would otherwise block the client's single-threaded
+    // event loop, preventing the shared 550 ms deadline from firing and
+    // writing `done`. Running it on Tokio's blocking pool restores that
+    // deadline; aborting this task does not stop the underlying closure, so a
+    // superseded or expired request may briefly keep scanning before the
+    // result is dropped. That bounded worst case is accepted here because it
+    // only costs a discarded filesystem walk, while the pre-fix behavior
+    // could stall every prompt on one slow directory read.
+    let project = {
+        let cwd = cwd.clone();
+        let environment = Arc::clone(&environment);
+        tokio::task::spawn_blocking(move || {
+            let git_root = runtime::detect::worktree_root(&cwd, &environment);
+            runtime::detect::detect(&cwd, git_root.as_deref(), &environment)
+        })
+        .await
+        .map_err(|error| io::Error::other(format!("runtime discovery task failed: {error}")))?
+    };
     let detected = active
         .into_iter()
         .filter(|runtime| project.runtimes.contains(runtime))

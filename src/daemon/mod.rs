@@ -261,7 +261,7 @@ fn replacement_transition(error: &io::Error) -> bool {
 struct Shared {
     cache: Arc<RuntimeCache>,
     shutdown: Notify,
-    gitstatus: Mutex<gitstatus::Client>,
+    gitstatus: Mutex<Option<gitstatus::Client>>,
 }
 
 struct LockGuard {
@@ -288,7 +288,7 @@ async fn serve_socket(socket: PathBuf) -> io::Result<()> {
     let shared = Arc::new(Shared {
         cache: Arc::clone(&cache),
         shutdown: Notify::new(),
-        gitstatus: Mutex::new(gitstatus::Client::start()?),
+        gitstatus: Mutex::new(None),
     });
 
     let load_task = tokio::spawn(Arc::clone(&cache).load());
@@ -346,33 +346,53 @@ async fn handle_client(mut stream: UnixStream, shared: Arc<Shared>) -> io::Resul
         }
         protocol::RequestHeader::Operation(protocol::RESET) => {
             shared.cache.clear().await?;
-            shared.gitstatus.lock().await.restart()?;
+            // Restart gitstatusd only when it was already started; resetting
+            // an unused Git capability must not spawn a process for it.
+            let mut client = shared.gitstatus.lock().await;
+            if let Some(client) = client.as_mut() {
+                client.restart()?;
+            }
             protocol::write_ok(&mut stream).await
         }
         protocol::RequestHeader::Operation(protocol::GIT_STATUS) => {
             let query = protocol::read_query(&mut stream).await?;
-            let mut client = shared.gitstatus.lock().await;
-            let result = if let Ok(result) = timeout(GITSTATUS_TIMEOUT, client.query(&query)).await
-            {
-                result
-            } else {
-                let restart = client.restart();
-                match restart {
-                    Ok(()) => Err(io::Error::new(
-                        io::ErrorKind::TimedOut,
-                        "gitstatusd query exceeded 30 seconds",
-                    )),
-                    Err(error) => Err(io::Error::other(format!(
-                        "gitstatusd query timed out and restart failed: {error}"
-                    ))),
-                }
-            };
+            let result = git_query(&shared, &query).await;
             protocol::write_git_result(&mut stream, result).await
         }
         protocol::RequestHeader::Operation(_) => Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "unknown daemon operation",
         )),
+    }
+}
+
+/// Runs one Git query against the lazily started `gitstatusd` client. The
+/// client is created on the first real Git request, so a daemon that only
+/// serves runtime-cache operations never requires the managed binary. Startup
+/// and restart failures surface as explicit Git errors without taking down
+/// the daemon.
+async fn git_query(
+    shared: &Shared,
+    query: &gitstatus::Query,
+) -> io::Result<Option<gitstatus::Snapshot>> {
+    let mut client = shared.gitstatus.lock().await;
+    if client.is_none() {
+        *client = Some(gitstatus::Client::start()?);
+    }
+    let client = client
+        .as_mut()
+        .ok_or_else(|| io::Error::other("gitstatusd client is unavailable"))?;
+    if let Ok(result) = timeout(GITSTATUS_TIMEOUT, client.query(query)).await {
+        return result;
+    }
+    match client.restart() {
+        Ok(()) => Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "gitstatusd query exceeded 30 seconds",
+        )),
+        Err(error) => Err(io::Error::other(format!(
+            "gitstatusd query timed out and restart failed: {error}"
+        ))),
     }
 }
 

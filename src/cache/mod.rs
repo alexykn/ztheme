@@ -169,12 +169,18 @@ impl RuntimeCache {
     }
 
     pub(crate) async fn clear(&self) -> io::Result<()> {
-        {
+        // The revision produced by this in-memory clear, captured under the
+        // state lock. A concurrent put after the lock is released advances the
+        // state revision again; `saved_revision` must record the clear's
+        // revision, not the state's current one, so the concurrent entry stays
+        // dirty and is later persisted by `flush_latest`.
+        let clear_revision = {
             let mut state = self.state.lock().await;
             state.entries.clear();
             state.load_epoch = state.load_epoch.wrapping_add(1);
             state.revision = state.revision.wrapping_add(1);
-        }
+            state.revision
+        };
 
         let path = self.path.clone();
         let _disk = self.disk_io.lock().await;
@@ -183,7 +189,7 @@ impl RuntimeCache {
             .map_err(io::Error::other)?;
         if result.is_ok() {
             let mut state = self.state.lock().await;
-            state.saved_revision = state.revision;
+            state.saved_revision = clear_revision;
         } else {
             self.changed.notify_one();
         }
@@ -305,8 +311,127 @@ fn epoch_duration(time: SystemTime) -> Option<Duration> {
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt as _;
+    use std::path::{Path, PathBuf};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
 
-    use super::{CacheKey, Entry, MAX_VALUE_BYTES, RuntimeCache, SAFETY_EXPIRY, trim_lru};
+    use tokio::sync::{Mutex, Notify};
+
+    use super::{
+        CACHE_FILE_PREFIX, CACHE_FILE_SUFFIX, CacheKey, Entry, MAX_VALUE_BYTES, RuntimeCache,
+        SAFETY_EXPIRY, State, disk, trim_lru,
+    };
+
+    static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+    struct TestDirectory(PathBuf);
+
+    impl TestDirectory {
+        fn new() -> Self {
+            let sequence = SEQUENCE.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "ztheme-cache-race-test-{}-{sequence}",
+                std::process::id()
+            ));
+            fs::create_dir(&path).unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+            Self(path)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TestDirectory {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn disk_backed_cache(path: PathBuf) -> Arc<RuntimeCache> {
+        Arc::new(RuntimeCache {
+            state: Mutex::new(State::default()),
+            disk_io: Mutex::new(()),
+            changed: Notify::new(),
+            path: Some(path),
+        })
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn clear_keeps_concurrent_puts_dirty_until_flushed() {
+        let directory = TestDirectory::new();
+        let path = directory.path().join(format!(
+            "{CACHE_FILE_PREFIX}{:016x}{CACHE_FILE_SUFFIX}",
+            1_u64
+        ));
+        let cache = disk_backed_cache(path.clone());
+
+        // Seed a persisted entry so the disk file exists before the clear.
+        cache
+            .put(CacheKey::from_value(1), b"first".to_vec())
+            .await
+            .unwrap();
+        cache.flush_latest().await.unwrap();
+
+        // Hold the disk lock so clear's in-memory phase is separated from its
+        // disk deletion; the spawned clear must block before touching disk.
+        let disk_guard = cache.disk_io.lock().await;
+        let clear_task = {
+            let cache = Arc::clone(&cache);
+            tokio::spawn(async move { cache.clear().await })
+        };
+        loop {
+            if cache.state.lock().await.entries.is_empty() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+
+        // A put while deletion is pending is a concurrent mutation: it must
+        // stay dirty even after clear reports success.
+        cache
+            .put(CacheKey::from_value(2), b"second".to_vec())
+            .await
+            .unwrap();
+        drop(disk_guard);
+        clear_task.await.unwrap().unwrap();
+
+        // The state revision advanced past the clear's captured revision, so
+        // the concurrent entry is still dirty and must be persisted by a later
+        // flush rather than being silently marked as saved.
+        {
+            let state = cache.state.lock().await;
+            assert_ne!(state.revision, state.saved_revision);
+        }
+        cache.flush_latest().await.unwrap();
+        let loaded = disk::load(&path).unwrap();
+        assert_eq!(loaded.entries.len(), 1);
+        assert_eq!(&*loaded.entries[&CacheKey::from_value(2)].value, b"second");
+        assert!(!loaded.entries.contains_key(&CacheKey::from_value(1)));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn clear_without_concurrent_mutation_is_fully_persisted() {
+        let directory = TestDirectory::new();
+        let path = directory.path().join(format!(
+            "{CACHE_FILE_PREFIX}{:016x}{CACHE_FILE_SUFFIX}",
+            2_u64
+        ));
+        let cache = disk_backed_cache(path.clone());
+
+        cache
+            .put(CacheKey::from_value(1), b"value".to_vec())
+            .await
+            .unwrap();
+        cache.flush_latest().await.unwrap();
+
+        cache.clear().await.unwrap();
+        assert!(!path.exists());
+        assert!(!cache.flush_latest().await.unwrap());
+    }
 
     #[test]
     fn entry_freshness_has_an_exact_safety_boundary() {

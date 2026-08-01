@@ -1,6 +1,7 @@
 use std::ffi::OsStr;
 use std::fs;
 use std::io::{BufRead as _, BufReader, Read as _, Write as _};
+use std::os::unix::ffi::OsStrExt as _;
 use std::os::unix::fs::PermissionsExt as _;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
@@ -353,6 +354,29 @@ fn shutdown_outdated_daemon(socket: &Path) {
     let mut response = [0];
     stream.read_exact(&mut response).unwrap();
     assert_eq!(response[0], 0xfe);
+}
+
+/// Sends one raw daemon-protocol request and reads the response until the
+/// connection closes. The read timeout keeps a broken daemon from hanging the
+/// suite; the caller's assertions catch an incomplete response.
+fn protocol_exchange(socket: &Path, parts: &[&[u8]]) -> Vec<u8> {
+    let mut stream = UnixStream::connect(socket).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    for part in parts {
+        stream.write_all(part).unwrap();
+    }
+    let _ = stream.shutdown(std::net::Shutdown::Write);
+    let mut response = Vec::new();
+    let mut buffer = [0u8; 4096];
+    while let Ok(read) = stream.read(&mut buffer) {
+        if read == 0 {
+            break;
+        }
+        response.extend_from_slice(&buffer[..read]);
+    }
+    response
 }
 
 fn user_id() -> u32 {
@@ -1831,5 +1855,146 @@ fn two_clients_share_one_server_without_environment_contamination() {
             .unwrap()
             .success()
     );
+    shutdown_server(server, &socket);
+}
+
+#[test]
+fn runtime_only_init_does_not_require_gitstatusd_but_git_themes_still_do() {
+    let sandbox = Sandbox::new();
+    // No fake gitstatusd is installed: the data root must never receive one.
+    sandbox.write_theme("runtimeonly", &minimal_theme(""));
+    write_python_env_theme(&sandbox, "pythononly");
+
+    let synchronous = sandbox
+        .command()
+        .args(["init", "zsh", "--theme", "runtimeonly"])
+        .output()
+        .unwrap();
+    assert_success(&synchronous);
+
+    let runtime_only = sandbox
+        .command()
+        .args(["init", "zsh", "--theme", "pythononly"])
+        .output()
+        .unwrap();
+    assert_success(&runtime_only);
+    assert!(
+        !sandbox
+            .data
+            .join("ztheme/gitstatus/v1.5/gitstatusd")
+            .exists(),
+        "init installed gitstatusd for a runtime-only theme"
+    );
+
+    write_git_theme(&sandbox, "gitonly");
+    let refused = sandbox
+        .command()
+        .args(["init", "zsh", "--theme", "gitonly"])
+        .env("PATH", "/usr/bin:/bin")
+        .env_remove("HOMEBREW_PREFIX")
+        .output()
+        .unwrap();
+    assert!(!refused.status.success());
+    assert!(
+        String::from_utf8_lossy(&refused.stderr).contains("gitstatusd is required"),
+        "stderr: {}",
+        String::from_utf8_lossy(&refused.stderr)
+    );
+}
+
+#[test]
+fn daemon_without_gitstatusd_starts_and_serves_the_runtime_cache() {
+    let sandbox = Sandbox::new();
+    let instance = format!("cache-only-{}", SEQUENCE.fetch_add(1, Ordering::Relaxed));
+    let (server, socket) = spawn_server(&sandbox, &instance);
+
+    // A daemon needed only for runtime caching must not require or create the
+    // managed Git binary.
+    assert!(
+        !sandbox
+            .data
+            .join("ztheme/gitstatus/v1.5/gitstatusd")
+            .exists(),
+        "runtime-only daemon created a gitstatusd binary"
+    );
+
+    let key = 7_u64;
+    let value = b"runtime-value";
+    let put = protocol_exchange(
+        &socket,
+        &[
+            b"ZT",
+            &1_u16.to_be_bytes(),
+            &[2],
+            &key.to_be_bytes(),
+            &(u32::try_from(value.len()).unwrap()).to_be_bytes(),
+            value,
+        ],
+    );
+    assert_eq!(put, [2]);
+
+    let get = protocol_exchange(
+        &socket,
+        &[b"ZT", &1_u16.to_be_bytes(), &[1], &key.to_be_bytes()],
+    );
+    assert_eq!(get[0], 1, "expected a cache hit");
+    let length = u32::from_be_bytes(get[1..5].try_into().unwrap()) as usize;
+    assert_eq!(&get[5..5 + length], value);
+
+    shutdown_server(server, &socket);
+}
+
+#[test]
+fn gitstatusd_starts_lazily_and_reset_does_not_start_it() {
+    let sandbox = Sandbox::new();
+    let marker = sandbox.home.join("gitstatusd-started");
+    let fake = sandbox.data.join("ztheme/gitstatus/v1.5/gitstatusd");
+    fs::create_dir_all(fake.parent().unwrap()).unwrap();
+    fs::write(
+        &fake,
+        format!(
+            "#!/bin/sh\ntouch '{}'\nprintf '0\\0370\\036'\nexec cat >/dev/null\n",
+            marker.display()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&fake, fs::Permissions::from_mode(0o700)).unwrap();
+
+    let instance = format!("lazy-git-{}", SEQUENCE.fetch_add(1, Ordering::Relaxed));
+    let server = sandbox
+        .command()
+        .args(["__daemon", "--dev", &instance])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut server = ChildGuard::new(server);
+    let socket = wait_for_socket(server.child(), &sandbox.runtime);
+
+    assert!(!marker.exists(), "gitstatusd started during daemon startup");
+
+    let reset = protocol_exchange(&socket, &[b"ZT", &1_u16.to_be_bytes(), &[4]]);
+    assert_eq!(reset, [2]);
+    assert!(!marker.exists(), "RESET started an unused gitstatusd");
+
+    let path = sandbox.home.as_os_str().as_bytes();
+    let git = protocol_exchange(
+        &socket,
+        &[
+            b"ZT",
+            &1_u16.to_be_bytes(),
+            &[5],
+            &[0],
+            &(u32::try_from(path.len()).unwrap()).to_be_bytes(),
+            path,
+        ],
+    );
+    assert_eq!(git, [0], "expected a non-repository Git response");
+    assert!(
+        marker.exists(),
+        "first Git request did not start gitstatusd"
+    );
+
     shutdown_server(server, &socket);
 }

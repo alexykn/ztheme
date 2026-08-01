@@ -140,6 +140,11 @@ impl CompiledTheme {
             selector,
         })
     }
+
+    /// Whether the validated asynchronous layout includes a Git segment.
+    pub(crate) fn git_enabled(&self) -> bool {
+        self.layout.asynchronous.contains(&SegmentId::Git)
+    }
 }
 
 fn bundled_theme(selector: &str) -> Option<&'static BundledTheme> {
@@ -453,6 +458,31 @@ mod tests {
         assert!(zsh.contains("_ztheme_render_layout()"));
         assert!(zsh.contains("ZSH_HIGHLIGHT_STYLES[command]"));
         assert!(!zsh.contains("@ZTHEME_"));
+    }
+
+    #[test]
+    fn compiled_theme_reports_whether_git_is_in_the_async_layout() {
+        let git_theme = merged_theme("version = 1\n[layout]\nlines = [[\"git\"]]").unwrap();
+        let git_layout = validate(&git_theme).unwrap();
+        assert!(
+            CompiledTheme {
+                theme: git_theme,
+                layout: git_layout,
+                selector: "git".to_owned(),
+            }
+            .git_enabled()
+        );
+
+        let runtime_theme = merged_theme("version = 1\n[layout]\nlines = [[\"python\"]]").unwrap();
+        let runtime_layout = validate(&runtime_theme).unwrap();
+        assert!(
+            !CompiledTheme {
+                theme: runtime_theme,
+                layout: runtime_layout,
+                selector: "runtime".to_owned(),
+            }
+            .git_enabled()
+        );
     }
 
     #[test]

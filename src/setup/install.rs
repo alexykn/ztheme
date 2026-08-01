@@ -1,6 +1,7 @@
 use std::env;
+use std::fmt::Write as _;
 use std::fs::{self, OpenOptions};
-use std::io::{self, Write as _};
+use std::io::{self, Read as _, Write as _};
 use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -140,29 +141,54 @@ pub fn download(
     maximum_bytes: u64,
     component: &str,
 ) -> io::Result<()> {
-    require_command("curl", component)?;
-    run(
-        Command::new("curl")
-            .args([
-                "--proto",
-                "=https",
-                "--tlsv1.2",
-                "--fail",
-                "--location",
-                "--silent",
-                "--show-error",
-                "--connect-timeout",
-                "5",
-                "--max-time",
-                "60",
-                "--output",
-            ])
-            .arg(destination)
-            .arg(url),
-        &format!("download {component}"),
-    )?;
+    if !url.starts_with("https://") {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{component} download URL is not HTTPS"),
+        ));
+    }
+    // The agent enforces HTTPS on every request, including redirect hops, so
+    // an HTTPS source cannot be downgraded to a plaintext transfer.
+    let agent = ureq::Agent::config_builder()
+        .https_only(true)
+        .timeout_connect(Some(Duration::from_secs(5)))
+        .timeout_global(Some(Duration::from_mins(1)))
+        .build()
+        .new_agent();
+    download_inner(&agent, url, destination, maximum_bytes, component)
+}
+
+/// Performs the bounded transfer. The caller owns the agent so the HTTPS-only
+/// policy cannot be bypassed while the transfer logic stays testable against a
+/// local plain-HTTP server.
+fn download_inner(
+    agent: &ureq::Agent,
+    url: &str,
+    destination: &Path,
+    maximum_bytes: u64,
+    component: &str,
+) -> io::Result<()> {
+    let mut response = agent
+        .get(url)
+        .call()
+        .map_err(|error| io::Error::other(format!("failed to download {component}: {error}")))?;
+
+    // Stream at most maximum_bytes + 1 bytes: the extra byte is the signal
+    // that the archive exceeds the cap, so the destination never grows more
+    // than one byte beyond the limit during the transfer.
+    let copied = {
+        let mut destination_file = fs::File::create(destination)?;
+        let mut body = response
+            .body_mut()
+            .as_reader()
+            .take(maximum_bytes.saturating_add(1));
+        io::copy(&mut body, &mut destination_file)
+            .map_err(|error| io::Error::other(format!("failed to download {component}: {error}")))?
+    };
+    // Defense in depth: re-validate the written file after the transfer.
     let size = destination.metadata()?.len();
-    if size == 0 || size > maximum_bytes {
+    if copied > maximum_bytes || size == 0 || size > maximum_bytes {
+        let _ = fs::remove_file(destination);
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!("{component} archive has an invalid size"),
@@ -203,26 +229,14 @@ pub fn run(command: &mut Command, description: &str) -> io::Result<()> {
 }
 
 fn sha256(path: &Path) -> io::Result<String> {
-    for (program, arguments) in [("shasum", &["-a", "256"][..]), ("sha256sum", &[][..])] {
-        let Ok(output) = Command::new(program).args(arguments).arg(path).output() else {
-            continue;
-        };
-        if !output.status.success() {
-            continue;
-        }
-        let output = String::from_utf8(output.stdout)
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid SHA-256 output"))?;
-        if let Some(hash) = output.split_whitespace().next()
-            && hash.len() == 64
-            && hash.bytes().all(|byte| byte.is_ascii_hexdigit())
-        {
-            return Ok(hash.to_ascii_lowercase());
-        }
+    use sha2::{Digest, Sha256};
+
+    let digest = Sha256::digest(fs::read(path)?);
+    let mut output = String::with_capacity(64);
+    for byte in &digest {
+        write!(output, "{byte:02x}").expect("writing to a String cannot fail");
     }
-    Err(io::Error::new(
-        io::ErrorKind::NotFound,
-        "neither shasum nor sha256sum is available",
-    ))
+    Ok(output)
 }
 
 fn find_in_path(command: &str) -> Option<PathBuf> {
@@ -255,11 +269,13 @@ fn user_id() -> u32 {
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::io::{self, Read as _, Write as _};
+    use std::net::TcpListener;
     use std::os::unix::fs::PermissionsExt as _;
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering};
 
-    use super::{TemporaryDirectory, verify_sha256};
+    use super::{TemporaryDirectory, download, download_inner, verify_sha256};
 
     static SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
@@ -285,6 +301,101 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
         }
+    }
+
+    /// Serves one HTTP response over a local listener and returns its URL.
+    fn serve_once(payload: Vec<u8>) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let Ok((mut stream, _)) = listener.accept() else {
+                return;
+            };
+            let mut request = [0u8; 4096];
+            let mut consumed = 0;
+            while consumed < request.len()
+                && !request[..consumed]
+                    .windows(4)
+                    .any(|window| window == b"\r\n\r\n")
+            {
+                let Ok(read) = stream.read(&mut request[consumed..]) else {
+                    return;
+                };
+                if read == 0 {
+                    return;
+                }
+                consumed += read;
+            }
+            let _ = stream.write_all(
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    payload.len()
+                )
+                .as_bytes(),
+            );
+            let _ = stream.write_all(&payload);
+        });
+        format!("http://{address}/archive")
+    }
+
+    /// An agent without the HTTPS-only policy, for exercising the transfer
+    /// logic against the local plain-HTTP test server.
+    fn plain_agent() -> ureq::Agent {
+        ureq::Agent::config_builder().build().new_agent()
+    }
+
+    #[test]
+    fn download_is_bounded_and_leaves_no_partial_destination() {
+        let directory = TestDirectory::new();
+        let agent = plain_agent();
+        let maximum = 64 * 1024;
+
+        let valid: Vec<u8> = (0..256).map(|index| u8::try_from(index).unwrap()).collect();
+        let destination = directory.path().join("valid.bin");
+        download_inner(
+            &agent,
+            &serve_once(valid.clone()),
+            &destination,
+            maximum,
+            "fixture",
+        )
+        .unwrap();
+        assert_eq!(fs::read(&destination).unwrap(), valid);
+
+        let destination = directory.path().join("oversized.bin");
+        let error = download_inner(
+            &agent,
+            &serve_once(vec![b'x'; usize::try_from(maximum + 100).unwrap()]),
+            &destination,
+            maximum,
+            "fixture",
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(!destination.exists());
+
+        let destination = directory.path().join("empty.bin");
+        let error = download_inner(
+            &agent,
+            &serve_once(Vec::new()),
+            &destination,
+            maximum,
+            "fixture",
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(!destination.exists());
+    }
+
+    #[test]
+    fn download_rejects_non_https_urls() {
+        let directory = TestDirectory::new();
+        let destination = directory.path().join("http.bin");
+
+        let error =
+            download("http://127.0.0.1:1/archive", &destination, 1024, "fixture").unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert!(!destination.exists());
     }
 
     #[test]

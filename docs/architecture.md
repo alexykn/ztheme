@@ -34,8 +34,9 @@ long-lived capabilities:
 
 - a persistent runtime-value cache, so runtime version commands are not
   executed for every prompt;
-- a persistent `gitstatusd` client, so Git status queries reuse one optimized
-  repository-status process instead of starting Git tooling for every prompt.
+- a `gitstatusd` client started lazily on the first Git request, so Git status
+  queries reuse one optimized repository-status process instead of starting
+  Git tooling for every prompt.
 
 The server daemon is not responsible for rendering. It returns structured Git
 data and opaque encoded runtime snapshots; the client daemon renders those
@@ -228,10 +229,12 @@ daemon exits successfully. This handles several clients racing to lazily start
 the same instance without requiring coordination in the callers.
 
 The lock owner removes a stale socket path, binds a new listener, creates the
-runtime cache and `gitstatus::Client`, and starts cache load and flush tasks.
-Each accepted connection is handled in its own Tokio task. Runtime-cache
-requests can proceed concurrently; Git queries are serialized by the mutex
-around the single stateful `gitstatusd` client.
+runtime cache, and starts cache load and flush tasks. `gitstatusd` is started
+lazily on the first Git request rather than during startup, so a daemon that
+only serves runtime-cache operations never requires the managed binary. Each
+accepted connection is handled in its own Tokio task. Runtime-cache requests
+can proceed concurrently; Git queries are serialized by the mutex around the
+single stateful `gitstatusd` client.
 
 The daemon stops when:
 
@@ -263,9 +266,10 @@ old background process while preventing an older still-running shell client
 from downgrading the daemon.
 
 `reset` is deliberately different. When the daemon exists it sends `RESET`,
-which clears runtime cache state and restarts `gitstatusd`. When no daemon is
-available it deletes persistent runtime-cache files directly and does not
-start a process merely to clear state.
+which clears runtime cache state and restarts `gitstatusd` only when one is
+already running. When no daemon is available it deletes persistent
+runtime-cache files directly and does not start a process merely to clear
+state.
 
 ### Cache
 
@@ -361,13 +365,16 @@ repeated `git status` process startup and repository scanning would be visible.
 successive queries efficiently. That persistent design is the main reason Git
 access belongs behind the server daemon rather than in each prompt request.
 
-`ztheme setup` installs the managed binary. `ztheme init zsh` refuses to
-generate an integration when it is absent, so the daemon never silently
-substitutes a different Git implementation with different behavior.
+`ztheme setup` installs the managed binary. When the selected layout includes
+Git, `ztheme init zsh` refuses to generate an integration while the binary is
+absent, so the daemon never silently substitutes a different Git
+implementation with different behavior; runtime-only layouts initialize
+without it.
 
-At daemon startup, `gitstatus::Client` launches the managed binary with piped
-stdin and stdout, protocol compatibility restricted to `v1.5.*`, and its
-parent PID. The child is killed when its owning Rust process is dropped.
+On the first Git request, the daemon lazily starts `gitstatus::Client`, which
+launches the managed binary with piped stdin and stdout, protocol
+compatibility restricted to `v1.5.*`, and its parent PID. The child is killed
+when its owning Rust process is dropped.
 Repository-related environment variables are removed from the child; each
 request carries the intended directory or explicit `GIT_DIR`, rather than
 letting the daemon's own launch environment accidentally select a repository.
@@ -426,10 +433,13 @@ It does not manage server sockets, process startup, cache persistence, or the
 
 The 550 ms limit is one deadline shared by both jobs, not 550 ms per operation.
 Once it expires, the engine aborts unfinished Tokio tasks and writes `done`.
-The shell treats that record as the rendering barrier, so a slow or missing
-result cannot leave the prompt waiting forever. Dropping an in-flight server
-request closes that request's socket connection; the server daemon remains
-independent and available to later prompts.
+Runtime discovery runs on Tokio's blocking pool, so a slow filesystem walk
+cannot stall the client event loop or the deadline; the walk may outlive the
+expired request, but its result is simply discarded. The shell treats `done`
+as the rendering barrier, so a slow or missing result cannot leave the prompt
+waiting forever. Dropping an in-flight server request closes that request's
+socket connection; the server daemon remains independent and available to
+later prompts.
 
 Runtime-cache failures are soft on the rendering path. A failed read falls
 back to executing the runtime snapshot, and a failed write does not discard

@@ -147,24 +147,50 @@ impl Process {
     }
 
     async fn read_response(&mut self) -> io::Result<Vec<u8>> {
-        let mut response = Vec::with_capacity(256);
-        let read = self
-            .stdout
-            .read_until(MESSAGE_SEPARATOR, &mut response)
-            .await?;
-        if read == 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "gitstatusd closed its output",
-            ));
-        }
-        if response.len() > MAX_RESPONSE_BYTES {
-            return Err(invalid_data("gitstatusd response is too large"));
-        }
-        if response.pop() != Some(MESSAGE_SEPARATOR) {
+        read_bounded_response(&mut self.stdout).await
+    }
+}
+
+/// Reads one gitstatusd response without ever growing past roughly
+/// `MAX_RESPONSE_BYTES + 1` bytes. The previous `read_until` could buffer
+/// without bound when a broken child never emitted the message separator,
+/// leaving the daemon's 30-second safety timeout as the only cap. Reading in
+/// bounded chunks keeps a runaway child from consuming unbounded memory while
+/// still distinguishing the four outcomes: a clean EOF with no bytes, an
+/// oversized response, a response within the limit that lacks the separator,
+/// and a valid terminated response.
+async fn read_bounded_response<R>(reader: &mut R) -> io::Result<Vec<u8>>
+where
+    R: tokio::io::AsyncBufRead + Unpin,
+{
+    let limit = MAX_RESPONSE_BYTES + 1;
+    let mut response = Vec::with_capacity(256);
+    loop {
+        let buffer = reader.fill_buf().await?;
+        if buffer.is_empty() {
+            if response.is_empty() {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "gitstatusd closed its output",
+                ));
+            }
             return Err(invalid_data("unterminated gitstatusd response"));
         }
-        Ok(response)
+
+        if let Some(separator) = buffer.iter().position(|byte| *byte == MESSAGE_SEPARATOR)
+            && response.len() + separator < MAX_RESPONSE_BYTES
+        {
+            response.extend_from_slice(&buffer[..separator]);
+            reader.consume(separator + 1);
+            return Ok(response);
+        }
+
+        let take = buffer.len().min(limit.saturating_sub(response.len()));
+        response.extend_from_slice(&buffer[..take]);
+        reader.consume(take);
+        if response.len() >= limit {
+            return Err(invalid_data("gitstatusd response is too large"));
+        }
     }
 }
 
@@ -263,7 +289,7 @@ fn invalid_data_with_field(field: &'static str, message: &'static str) -> io::Er
 
 #[cfg(test)]
 mod tests {
-    use super::parse_response;
+    use super::{MAX_RESPONSE_BYTES, parse_response, read_bounded_response};
     use crate::gitstatus::{CONFLICTED, DELETED, STAGED, UNSTAGED, UNTRACKED};
 
     fn response(request_id: u64, fields: &[String]) -> Vec<u8> {
@@ -296,6 +322,70 @@ mod tests {
         ]
         .map(str::to_owned)
         .to_vec()
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn response_reading_is_bounded_and_distinguishes_outcomes() {
+        use std::io;
+        use tokio::io::BufReader;
+
+        let empty = read_bounded_response(&mut BufReader::new(&b""[..]))
+            .await
+            .unwrap_err();
+        assert_eq!(empty.kind(), io::ErrorKind::UnexpectedEof);
+
+        let unterminated = read_bounded_response(&mut BufReader::new(&b"abc"[..]))
+            .await
+            .unwrap_err();
+        assert_eq!(unterminated.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(unterminated.to_string(), "unterminated gitstatusd response");
+
+        let valid = read_bounded_response(&mut BufReader::new(&b"abc\x1e"[..]))
+            .await
+            .unwrap();
+        assert_eq!(valid, b"abc");
+
+        let mut at_limit = vec![b'x'; MAX_RESPONSE_BYTES - 1];
+        at_limit.push(0x1e);
+        let at_limit_content = read_bounded_response(&mut BufReader::new(&at_limit[..]))
+            .await
+            .unwrap();
+        assert_eq!(at_limit_content.len(), MAX_RESPONSE_BYTES - 1);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn oversized_and_unterminated_responses_never_grow_unbounded() {
+        use std::io;
+        use tokio::io::BufReader;
+
+        // Content exactly at the limit with the separator after it: the total
+        // response exceeds the cap, so it must be rejected as too large.
+        let mut oversized = vec![b'x'; MAX_RESPONSE_BYTES];
+        oversized.push(0x1e);
+        let error = read_bounded_response(&mut BufReader::new(&oversized[..]))
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(error.to_string(), "gitstatusd response is too large");
+
+        // A response larger than the cap without a separator must also be
+        // rejected, and the reader must stop consuming near the cap instead of
+        // buffering the whole runaway stream.
+        let mut runaway = vec![b'y'; MAX_RESPONSE_BYTES + 10_000];
+        runaway.push(0x1e);
+        let error = read_bounded_response(&mut BufReader::new(&runaway[..]))
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+
+        // Exactly the cap of content without a separator is unterminated, not
+        // oversized, matching the pre-fix boundary.
+        let at_cap = vec![b'z'; MAX_RESPONSE_BYTES];
+        let unterminated = read_bounded_response(&mut BufReader::new(&at_cap[..]))
+            .await
+            .unwrap_err();
+        assert_eq!(unterminated.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(unterminated.to_string(), "unterminated gitstatusd response");
     }
 
     #[test]
