@@ -17,8 +17,8 @@ use crate::runtime::Runtime;
 pub use async_theme::AsyncTheme;
 pub(crate) use manage::{apply, edit, list, persist};
 use schema::{
-    Config, CustomSegmentsConfig, GitSymbols, InputTheme, Layout, RuntimeTheme, Segments, Spacing,
-    Style, SyntaxStyle, Theme,
+    CharacterTheme, Config, CustomSegmentTheme, CustomSegmentsConfig, DirectoryTheme, GitSymbols,
+    InputTheme, Layout, RuntimeTheme, Segments, Spacing, StatusTheme, Style, SyntaxStyle, Theme,
 };
 pub(crate) use segments::ResolvedCustomSegment;
 use segments::{resolve_custom_segments, validate_enabled_segments};

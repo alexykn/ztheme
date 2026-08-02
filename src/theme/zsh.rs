@@ -3,9 +3,9 @@ use std::fmt::Write as _;
 use std::io;
 
 use super::{
-    CompiledTheme, InputTheme, Layout, LayoutSegment, STYLE_RESET, SegmentId, Segments, Theme,
-    ValidatedLayout, async_theme, highlight_style, line_editor_style, prompt_literal, shell_quote,
-    style_open,
+    CharacterTheme, CompiledTheme, CustomSegmentTheme, DirectoryTheme, InputTheme, Layout,
+    LayoutSegment, STYLE_RESET, SegmentId, Segments, StatusTheme, Theme, ValidatedLayout,
+    async_theme, highlight_style, line_editor_style, prompt_literal, shell_quote, style_open,
 };
 
 impl CompiledTheme {
@@ -82,7 +82,20 @@ fn emit_segment_themes(
     output.push_str("typeset -gA __ZTHEME_SEGMENT_OPEN\n");
     output.push_str("typeset -gA __ZTHEME_SEGMENT_CLOSE\n");
 
-    let directory = &segments.directory;
+    emit_directory_themes(output, theme, &segments.directory)?;
+    emit_clock_themes(output, theme, &segments.clock)?;
+    emit_character_themes(output, theme, &segments.character)?;
+    emit_status_themes(output, theme, &segments.status)?;
+    emit_custom_style_entries(output, theme, segments, layout)
+}
+
+/// Emits the directory scalars (home symbol, truncation symbol, and the
+/// width parameters) plus its default style entry.
+fn emit_directory_themes(
+    output: &mut String,
+    theme: &Theme,
+    directory: &DirectoryTheme,
+) -> io::Result<()> {
     scalar(
         output,
         "__ZTHEME_DIRECTORY_HOME",
@@ -116,9 +129,16 @@ fn emit_segment_themes(
         &directory.suffix,
         directory.spacing,
         "directory:default",
-    )?;
+    )
+}
 
-    let clock = &segments.clock;
+/// Emits the clock style entry; clock shares `CustomSegmentTheme` with
+/// custom segments, so this is a single default entry.
+fn emit_clock_themes(
+    output: &mut String,
+    theme: &Theme,
+    clock: &CustomSegmentTheme,
+) -> io::Result<()> {
     emit_style_entry(
         output,
         theme,
@@ -127,9 +147,16 @@ fn emit_segment_themes(
         &clock.suffix,
         clock.spacing,
         "clock:default",
-    )?;
+    )
+}
 
-    let character = &segments.character;
+/// Emits the character success/error symbols plus both variant style
+/// entries.
+fn emit_character_themes(
+    output: &mut String,
+    theme: &Theme,
+    character: &CharacterTheme,
+) -> io::Result<()> {
     scalar(
         output,
         "__ZTHEME_CHARACTER_SUCCESS_SYMBOL",
@@ -157,9 +184,11 @@ fn emit_segment_themes(
         &character.suffix,
         character.spacing,
         "character:error",
-    )?;
+    )
+}
 
-    let status = &segments.status;
+/// Emits the status flag, success symbol, and both variant style entries.
+fn emit_status_themes(output: &mut String, theme: &Theme, status: &StatusTheme) -> io::Result<()> {
     integer(
         output,
         "__ZTHEME_STATUS_SHOW_SUCCESS",
@@ -187,9 +216,7 @@ fn emit_segment_themes(
         &status.suffix,
         status.spacing,
         "status:error",
-    )?;
-
-    emit_custom_style_entries(output, theme, segments, layout)
+    )
 }
 
 fn emit_custom_style_entries(
