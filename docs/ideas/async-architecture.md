@@ -1,5 +1,10 @@
 # Async Architecture
 
+> Historical design record. The benchmark numbers below predate the
+> persistent per-shell client and the runtime snapshot cache; they do not
+> reflect the current release. See [Benchmarks](../benchmarks.md) for current
+> measurements.
+
 ## Is async still worth it?
 
 Prompt rendering now waits until every requested segment is ready. Async work

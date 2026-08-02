@@ -313,7 +313,9 @@ Cache changes should preserve these properties:
   resolution on the warm prompt path;
 - shallow and deep warm-prompt latency remain within the benchmark gates.
 
-The benchmark harness is `tools/benchmark-runtime-cache.zsh`.
+The benchmark harness is `tools/benchmark-runtime-cache.zsh`; see
+[Benchmarks](benchmarks.md) for current measured values and how to reproduce
+them.
 
 Benchmark note: the first invocation can include host CPU and filesystem/cache
 warm-up, and the candidate is measured after the baseline. For manual latency

@@ -276,7 +276,8 @@ Keeping the client alive avoids spawning a process for every prompt.
 See [Architecture](docs/architecture.md) for subsystem ownership, protocols,
 and the runtime-extension workflow. See [Runtime cache](docs/cache.md) for
 cache identities, persistence, and limitations. See [Segments](docs/segments.md)
-for the synchronous segment system, including user-defined segments.
+for the synchronous segment system, including user-defined segments. See
+[Benchmarks](docs/benchmarks.md) for measured prompt latency and cache behavior.
 
 ## Built with
 
