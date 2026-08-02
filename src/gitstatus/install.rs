@@ -1,6 +1,6 @@
 use std::env;
 use std::fs::{self, OpenOptions};
-use std::io::{self, BufRead as _, BufReader, Write as _};
+use std::io::{self, BufRead as _, BufReader, IsTerminal as _, Write as _};
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -147,6 +147,12 @@ fn compatible(binary: &Path) -> bool {
 }
 
 fn confirm_install() -> io::Result<bool> {
+    // Only prompt on a real terminal. Scripts and pipe-driven callers must
+    // not block on a /dev/tty read that will never be answered; they get a
+    // refusal instead and surface the requirement as an error.
+    if !std::io::stdin().is_terminal() {
+        return Ok(false);
+    }
     let Ok(mut tty) = OpenOptions::new().read(true).write(true).open("/dev/tty") else {
         return Ok(false);
     };
