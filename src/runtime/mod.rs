@@ -1,5 +1,4 @@
-use std::env;
-use std::ffi::{OsStr, OsString};
+use std::ffi::OsString;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -11,9 +10,9 @@ use tokio::process::Command;
 use tokio::task::JoinSet;
 use tokio::time::timeout;
 
+pub(crate) mod cache;
 pub(crate) mod detect;
 
-use crate::cache::CacheKey;
 use crate::environment::PromptEnvironment;
 
 const COMMAND_TIMEOUT: Duration = Duration::from_millis(250);
@@ -88,83 +87,72 @@ pub(crate) struct RuntimeValue {
     pub(crate) environment: Option<String>,
 }
 
-pub(crate) async fn snapshot(
-    project: detect::Project,
-    active: Vec<Runtime>,
+#[derive(Clone, Debug)]
+pub(crate) struct CachedRuntimeValue {
+    pub(crate) runtime: Runtime,
+    pub(crate) version: String,
+    pub(crate) label: Option<String>,
+}
+
+#[derive(Debug)]
+pub(crate) enum RuntimeOutcome {
+    Value(CachedRuntimeValue),
+    MissingExecutable,
+    TransientFailure,
+}
+
+#[derive(Debug)]
+pub(crate) struct RuntimeExecution {
+    pub(crate) runtime: Runtime,
+    pub(crate) outcome: RuntimeOutcome,
+}
+
+pub(crate) fn materialize(
+    cached: CachedRuntimeValue,
+    environment: &PromptEnvironment,
+) -> RuntimeValue {
+    RuntimeValue {
+        runtime: cached.runtime,
+        version: cached.version,
+        label: cached.label,
+        environment: runtime_environment(cached.runtime, environment),
+    }
+}
+
+fn runtime_environment(runtime: Runtime, environment: &PromptEnvironment) -> Option<String> {
+    match runtime {
+        Runtime::Python => python_environment(environment),
+        Runtime::Perl => perl_environment(environment),
+        Runtime::Rust => rust_environment(environment),
+        Runtime::Ruby => ruby_environment(environment),
+        _ => None,
+    }
+}
+
+pub(crate) async fn execute_plans(
+    plans: Vec<cache::RuntimePlan>,
+    cwd: PathBuf,
     environment: Arc<PromptEnvironment>,
-) -> Vec<RuntimeValue> {
+) -> Vec<RuntimeExecution> {
     let mut tasks = JoinSet::new();
 
-    for runtime in active {
-        let cwd = project.cwd.clone();
+    for plan in plans {
+        let cwd = cwd.clone();
         let environment = Arc::clone(&environment);
-        tasks.spawn(async move {
-            let spec = spec(runtime, &environment);
-            let output = capture(&cwd, &spec, &environment).await?;
-            let version = (spec.parse_version)(&output)?;
-            Some(RuntimeValue {
-                runtime,
-                version,
-                label: spec.label.map(str::to_owned),
-                environment: spec
-                    .environment
-                    .and_then(|environment_fn| environment_fn(&environment)),
-            })
-        });
+        tasks.spawn(async move { execute_plan(plan, &cwd, &environment).await });
     }
 
-    let mut values = Vec::new();
+    let mut executions = Vec::new();
     while let Some(result) = tasks.join_next().await {
-        if let Ok(Some(value)) = result {
-            values.push(value);
+        if let Ok(execution) = result {
+            executions.push(execution);
         }
     }
-    values.sort_unstable_by_key(|value| value.runtime);
-    values
+    executions.sort_unstable_by_key(|execution| execution.runtime);
+    executions
 }
 
-pub(crate) fn cache_key(
-    project: &detect::Project,
-    active: &[Runtime],
-    environment: &PromptEnvironment,
-) -> CacheKey {
-    let mut hash = project.hash.clone();
-    hash.add_u64(b"runtime-snapshot-version", 1);
-
-    for runtime in active {
-        hash.add_u64(b"runtime-command", u64::from(runtime.id()));
-        let spec = spec(*runtime, environment);
-        hash.add_os(b"runtime-program", &spec.program);
-        hash.add_u64(
-            b"runtime-argument-count",
-            u64::try_from(spec.arguments.len()).unwrap_or(u64::MAX),
-        );
-        for argument in spec.arguments {
-            hash.add_bytes(b"runtime-argument", argument.as_bytes());
-        }
-        hash.add_u64(b"runtime-merge-stderr", u64::from(spec.merge_stderr));
-        let executable = resolve_program(&spec.program, environment);
-        if let Some(executable) = executable.as_deref() {
-            hash.add_path(b"resolved-executable", executable);
-            let link_metadata = executable.symlink_metadata().ok();
-            hash.add_metadata(b"executable-link-metadata", link_metadata.as_ref());
-
-            if let Ok(canonical) = executable.canonicalize() {
-                hash.add_path(b"canonical-executable", &canonical);
-                let metadata = canonical.metadata().ok();
-                hash.add_metadata(b"executable-metadata", metadata.as_ref());
-            } else {
-                hash.add_bytes(b"canonical-executable", b"unavailable");
-            }
-        } else {
-            hash.add_bytes(b"resolved-executable", b"missing");
-        }
-    }
-
-    CacheKey::from_value(hash.finish())
-}
-
-pub(crate) fn encode(values: &[RuntimeValue]) -> io::Result<Vec<u8>> {
+pub(crate) fn encode(values: &[CachedRuntimeValue]) -> io::Result<Vec<u8>> {
     let count = u8::try_from(values.len()).map_err(|_| invalid_data("too many runtime values"))?;
     let mut output = Vec::with_capacity(128);
     output.push(count);
@@ -172,12 +160,11 @@ pub(crate) fn encode(values: &[RuntimeValue]) -> io::Result<Vec<u8>> {
         output.push(value.runtime.id());
         write_text(&mut output, &value.version)?;
         write_optional_text(&mut output, value.label.as_deref())?;
-        write_optional_text(&mut output, value.environment.as_deref())?;
     }
     Ok(output)
 }
 
-pub(crate) fn decode(bytes: &[u8]) -> io::Result<Vec<RuntimeValue>> {
+pub(crate) fn decode(bytes: &[u8]) -> io::Result<Vec<CachedRuntimeValue>> {
     let mut decoder = Decoder::new(bytes);
     let count = usize::from(decoder.u8()?);
     if count > Runtime::ALL.len() {
@@ -187,11 +174,10 @@ pub(crate) fn decode(bytes: &[u8]) -> io::Result<Vec<RuntimeValue>> {
     for _ in 0..count {
         let runtime = Runtime::from_id(decoder.u8()?)
             .ok_or_else(|| invalid_data("runtime cache contains an unknown runtime"))?;
-        values.push(RuntimeValue {
+        values.push(CachedRuntimeValue {
             runtime,
             version: decoder.text()?,
             label: decoder.optional_text()?,
-            environment: decoder.optional_text()?,
         });
     }
     if !decoder.is_empty() {
@@ -207,24 +193,23 @@ pub(crate) fn decode(bytes: &[u8]) -> io::Result<Vec<RuntimeValue>> {
     Ok(values)
 }
 
-struct RuntimeSpec {
-    program: OsString,
-    arguments: &'static [&'static str],
-    merge_stderr: bool,
-    label: Option<&'static str>,
-    parse_version: fn(&str) -> Option<String>,
-    environment: Option<fn(&PromptEnvironment) -> Option<String>>,
+#[derive(Clone, Debug)]
+pub(super) struct RuntimeSpec {
+    pub(super) program: OsString,
+    pub(super) arguments: &'static [&'static str],
+    pub(super) merge_stderr: bool,
+    pub(super) label: Option<&'static str>,
+    pub(super) parse_version: fn(&str) -> Option<String>,
 }
 
-fn spec(runtime: Runtime, environment: &PromptEnvironment) -> RuntimeSpec {
+pub(super) fn spec(runtime: Runtime) -> RuntimeSpec {
     match runtime {
         Runtime::Python => RuntimeSpec {
-            program: python_program(environment),
+            program: OsString::from("python"),
             arguments: &["--version"],
             merge_stderr: true,
             label: None,
             parse_version: parse_python,
-            environment: Some(python_environment),
         },
         Runtime::Perl => RuntimeSpec {
             program: OsString::from("perl"),
@@ -232,27 +217,20 @@ fn spec(runtime: Runtime, environment: &PromptEnvironment) -> RuntimeSpec {
             merge_stderr: false,
             label: None,
             parse_version: parse_line,
-            environment: Some(perl_environment),
         },
         Runtime::Java => static_spec("java", &["-version"], true, parse_java),
         Runtime::Kotlin => static_spec("kotlinc", &["-version"], true, parse_numeric),
         Runtime::Scala => static_spec("scala", &["-version"], true, parse_numeric),
-        Runtime::Rust => RuntimeSpec {
-            environment: Some(rust_environment),
-            ..static_spec("rustc", &["--version"], false, parse_second_word)
-        },
+        Runtime::Rust => static_spec("rustc", &["--version"], false, parse_second_word),
         Runtime::Go => static_spec("go", &["version"], false, parse_go),
         Runtime::Bun => static_spec("bun", &["--version"], false, parse_line),
         Runtime::Deno => static_spec("deno", &["--version"], false, parse_second_word),
         Runtime::Node => static_spec("node", &["--version"], false, parse_node),
-        Runtime::Ruby => RuntimeSpec {
-            environment: Some(ruby_environment),
-            ..static_spec("ruby", &["--version"], false, parse_second_word)
-        },
+        Runtime::Ruby => static_spec("ruby", &["--version"], false, parse_second_word),
         Runtime::Php => static_spec("php", &["--version"], false, parse_second_word),
         Runtime::Dotnet => static_spec("dotnet", &["--version"], false, parse_line),
-        Runtime::C => compiler_spec(false, environment),
-        Runtime::Cpp => compiler_spec(true, environment),
+        Runtime::C => compiler_spec(false, true),
+        Runtime::Cpp => compiler_spec(true, true),
         Runtime::Swift => static_spec("swift", &["--version"], false, parse_numeric),
         Runtime::Lua => static_spec("lua", &["-v"], true, parse_second_word),
     }
@@ -270,26 +248,23 @@ fn static_spec(
         merge_stderr,
         label: None,
         parse_version,
-        environment: None,
     }
 }
 
-fn compiler_spec(cpp: bool, environment: &PromptEnvironment) -> RuntimeSpec {
-    let path = environment.path.as_deref().unwrap_or_default();
-    let clang = if cpp { "clang++" } else { "clang" };
-    let gcc = if cpp { "g++" } else { "gcc" };
-
-    if executable_on_path(clang, path) {
+pub(super) fn compiler_spec(cpp: bool, clang: bool) -> RuntimeSpec {
+    if clang {
+        let program = if cpp { "clang++" } else { "clang" };
         return RuntimeSpec {
             label: Some("clang"),
-            ..static_spec(clang, &["--version"], false, parse_numeric)
+            ..static_spec(program, &["--version"], false, parse_numeric)
         };
     }
 
+    let program = if cpp { "g++" } else { "gcc" };
     RuntimeSpec {
         label: Some("gcc"),
         ..static_spec(
-            gcc,
+            program,
             &["-dumpfullversion", "-dumpversion"],
             false,
             parse_numeric,
@@ -297,75 +272,67 @@ fn compiler_spec(cpp: bool, environment: &PromptEnvironment) -> RuntimeSpec {
     }
 }
 
-fn python_program(environment: &PromptEnvironment) -> OsString {
-    for prefix in [
-        environment.virtual_env.as_deref(),
-        environment.conda_prefix.as_deref(),
-    ]
-    .into_iter()
-    .flatten()
-    {
-        let candidate = std::path::PathBuf::from(prefix).join("bin/python");
-        if candidate.is_file() {
-            return candidate.into_os_string();
+async fn execute_plan(
+    plan: cache::RuntimePlan,
+    cwd: &Path,
+    environment: &PromptEnvironment,
+) -> RuntimeExecution {
+    let runtime = plan.runtime;
+    let result = capture(&plan, cwd, environment).await;
+    let outcome = match result {
+        Ok(output) => {
+            (plan.spec.parse_version)(&output).map_or(RuntimeOutcome::TransientFailure, |version| {
+                RuntimeOutcome::Value(CachedRuntimeValue {
+                    runtime,
+                    version,
+                    label: plan.spec.label.map(str::to_owned),
+                })
+            })
         }
-    }
-
-    let path = environment.path.as_deref().unwrap_or_default();
-    if executable_on_path("python", path) {
-        OsString::from("python")
-    } else {
-        OsString::from("python3")
-    }
+        Err(CaptureError::MissingExecutable) => RuntimeOutcome::MissingExecutable,
+        Err(CaptureError::TransientFailure) => RuntimeOutcome::TransientFailure,
+    };
+    RuntimeExecution { runtime, outcome }
 }
 
-fn executable_on_path(name: &str, path: &OsStr) -> bool {
-    env::split_paths(path).any(|directory| directory.join(name).is_file())
-}
-
-fn resolve_program(program: &OsString, environment: &PromptEnvironment) -> Option<PathBuf> {
-    let program = Path::new(program);
-    if program.components().count() > 1 {
-        return program.is_file().then(|| program.to_path_buf());
-    }
-
-    environment
-        .path
-        .as_deref()
-        .into_iter()
-        .flat_map(env::split_paths)
-        .map(|directory| directory.join(program))
-        .find(|candidate| candidate.is_file())
+enum CaptureError {
+    MissingExecutable,
+    TransientFailure,
 }
 
 async fn capture(
+    plan: &cache::RuntimePlan,
     cwd: &Path,
-    spec: &RuntimeSpec,
     environment: &PromptEnvironment,
-) -> Option<String> {
-    let mut command = Command::new(&spec.program);
-    environment.apply_to_command(&mut command);
+) -> Result<String, CaptureError> {
+    let mut command = Command::new(&plan.program);
+    if plan.is_cacheable() {
+        cache::apply_cacheable_environment(&mut command, plan, environment);
+    } else {
+        environment.apply_to_command(&mut command);
+    }
     command
-        .args(spec.arguments)
+        .args(plan.spec.arguments)
         .current_dir(cwd)
-        .env("LC_ALL", "C")
-        .env("TERM", "dumb")
-        .env("NO_COLOR", "1")
-        .env("DOTNET_NOLOGO", "1")
-        .env("DOTNET_CLI_TELEMETRY_OPTOUT", "1")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(if spec.merge_stderr {
+        .stderr(if plan.spec.merge_stderr {
             Stdio::piped()
         } else {
             Stdio::null()
         })
         .kill_on_drop(true);
 
-    let mut child = command.spawn().ok()?;
-    let stdout = child.stdout.take()?;
+    let mut child = command.spawn().map_err(|error| {
+        if error.kind() == io::ErrorKind::NotFound {
+            CaptureError::MissingExecutable
+        } else {
+            CaptureError::TransientFailure
+        }
+    })?;
+    let stdout = child.stdout.take().ok_or(CaptureError::TransientFailure)?;
     let mut stderr = child.stderr.take();
-    let merge_stderr = spec.merge_stderr;
+    let merge_stderr = plan.spec.merge_stderr;
 
     let collected = timeout(COMMAND_TIMEOUT, async move {
         let stdout_task = async {
@@ -374,8 +341,8 @@ async fn capture(
                 .take(OUTPUT_LIMIT)
                 .read_to_end(&mut bytes)
                 .await
-                .ok()?;
-            Some(bytes)
+                .map_err(|_| CaptureError::TransientFailure)?;
+            Ok(bytes)
         };
         let stderr_task = async {
             let mut bytes = Vec::new();
@@ -384,25 +351,29 @@ async fn capture(
                     .take(OUTPUT_LIMIT)
                     .read_to_end(&mut bytes)
                     .await
-                    .ok()?;
+                    .map_err(|_| CaptureError::TransientFailure)?;
             }
-            Some(bytes)
+            Ok(bytes)
         };
         let (stdout, stderr, status) = tokio::join!(stdout_task, stderr_task, child.wait());
-        status.ok()?.success().then_some((stdout?, stderr?))
+        let status = status.map_err(|_| CaptureError::TransientFailure)?;
+        if !status.success() {
+            return Err(CaptureError::TransientFailure);
+        }
+        Ok((stdout?, stderr?))
     })
     .await
-    .ok()??;
+    .map_err(|_| CaptureError::TransientFailure)??;
 
     let mut bytes = collected.0;
     if merge_stderr {
         bytes.extend_from_slice(&collected.1);
     }
-    if u64::try_from(bytes.len()).ok()? >= OUTPUT_LIMIT {
-        return None;
+    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) >= OUTPUT_LIMIT {
+        return Err(CaptureError::TransientFailure);
     }
 
-    String::from_utf8(bytes).ok()
+    String::from_utf8(bytes).map_err(|_| CaptureError::TransientFailure)
 }
 
 fn first_line(output: &str) -> Option<&str> {
@@ -588,11 +559,10 @@ fn invalid_data(message: &'static str) -> io::Error {
 mod tests {
     use std::collections::HashSet;
 
-    use super::{Runtime, RuntimeValue, decode, encode, spec};
-    use crate::environment::PromptEnvironment;
+    use super::{CachedRuntimeValue, Runtime, decode, encode, spec};
 
     fn parse_version(runtime: Runtime, output: &str) -> Option<String> {
-        (spec(runtime, &PromptEnvironment::default()).parse_version)(output)
+        (spec(runtime).parse_version)(output)
     }
 
     #[test]
@@ -676,17 +646,15 @@ mod tests {
     #[test]
     fn runtime_cache_round_trips_and_sorts_values() {
         let values = [
-            RuntimeValue {
+            CachedRuntimeValue {
                 runtime: Runtime::Rust,
                 version: "1.97.1".to_owned(),
                 label: None,
-                environment: Some("nightly".to_owned()),
             },
-            RuntimeValue {
+            CachedRuntimeValue {
                 runtime: Runtime::Python,
                 version: "3.14.6".to_owned(),
                 label: Some("cpython".to_owned()),
-                environment: Some(".venv".to_owned()),
             },
         ];
 
@@ -695,9 +663,7 @@ mod tests {
         assert_eq!(decoded[0].runtime, Runtime::Python);
         assert_eq!(decoded[0].version, "3.14.6");
         assert_eq!(decoded[0].label.as_deref(), Some("cpython"));
-        assert_eq!(decoded[0].environment.as_deref(), Some(".venv"));
         assert_eq!(decoded[1].runtime, Runtime::Rust);
-        assert_eq!(decoded[1].environment.as_deref(), Some("nightly"));
     }
 
     #[test]
@@ -722,11 +688,10 @@ mod tests {
         assert!(decode(&[1, u8::MAX]).is_err());
         assert!(decode(&[1, Runtime::Rust.id(), 0, 0, 2]).is_err());
 
-        let valid = encode(&[RuntimeValue {
+        let valid = encode(&[CachedRuntimeValue {
             runtime: Runtime::Node,
             version: "24.5.0".to_owned(),
             label: None,
-            environment: None,
         }])
         .unwrap();
         for length in 0..valid.len() {

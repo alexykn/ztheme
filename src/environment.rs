@@ -2,14 +2,11 @@ use std::ffi::{OsStr, OsString};
 
 use tokio::process::Command;
 
-use crate::utils::HashBuilder;
-
 /// The per-request prompt environment parsed from the shell's request.
 ///
 /// The client no longer mutates its process environment; this value is the
-/// single source of truth and is threaded explicitly through Git query
-/// construction, runtime detection, cache fingerprints, and runtime child
-/// commands.
+/// single source of truth for one shell request. The wire order is mirrored in
+/// `prompt::client` and `shell/ztheme.zsh`.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct PromptEnvironment {
     pub(crate) path: Option<OsString>,
@@ -22,46 +19,45 @@ pub(crate) struct PromptEnvironment {
     pub(crate) conda_default_env: Option<OsString>,
     pub(crate) perlbrew_perl: Option<OsString>,
     pub(crate) plenv_version: Option<OsString>,
+    pub(crate) pyenv_version: Option<OsString>,
+    pub(crate) pyenv_dir: Option<OsString>,
     pub(crate) rustup_toolchain: Option<OsString>,
+    pub(crate) rustup_home: Option<OsString>,
+    pub(crate) rbenv_dir: Option<OsString>,
     pub(crate) rbenv_version: Option<OsString>,
+    pub(crate) nodenv_version: Option<OsString>,
+    pub(crate) nodenv_dir: Option<OsString>,
+    pub(crate) plenv_dir: Option<OsString>,
     pub(crate) ruby_version: Option<OsString>,
+    pub(crate) java_home: Option<OsString>,
+    pub(crate) gotoolchain: Option<OsString>,
+    pub(crate) dotnet_root: Option<OsString>,
 }
 
 impl PromptEnvironment {
-    /// Hashes the runtime-relevant values into the project fingerprint so the
-    /// cache key always matches the environment the runtime command runs
-    /// under.
-    pub(crate) fn add_runtime_fingerprint(&self, hash: &mut HashBuilder) {
-        for (name, value) in [
-            ("PATH", self.path.as_deref()),
-            ("VIRTUAL_ENV", self.virtual_env.as_deref()),
-            ("CONDA_PREFIX", self.conda_prefix.as_deref()),
-            ("CONDA_DEFAULT_ENV", self.conda_default_env.as_deref()),
-            ("PERLBREW_PERL", self.perlbrew_perl.as_deref()),
-            ("PLENV_VERSION", self.plenv_version.as_deref()),
-            ("RUSTUP_TOOLCHAIN", self.rustup_toolchain.as_deref()),
-            ("RBENV_VERSION", self.rbenv_version.as_deref()),
-            ("RUBY_VERSION", self.ruby_version.as_deref()),
-        ] {
-            hash.add_bytes(b"environment-name", name.as_bytes());
-            hash.add_optional_os(b"environment-value", value);
-        }
+    /// Starts every runtime command from a small deterministic baseline.
+    pub(crate) fn prepare_command(command: &mut Command) {
+        command
+            .env_clear()
+            .env("LC_ALL", "C")
+            .env("TERM", "dumb")
+            .env("NO_COLOR", "1")
+            .env("DOTNET_NOLOGO", "1")
+            .env("DOTNET_CLI_TELEMETRY_OPTOUT", "1");
     }
 
-    /// Applies the request values to a child command: set variables that are
-    /// present, explicitly remove variables that are unset, so the child can
-    /// never observe a stale inherited value. The child keeps the client's
-    /// stable startup environment for everything else.
+    /// Applies the runtime portion of the request environment to a volatile
+    /// command. Git routing fields stay private to the Git query path.
+    ///
+    /// Volatile commands are deliberately allowed to observe the shell's
+    /// selection machinery. They are never put in the semantic cache.
     pub(crate) fn apply_to_command(&self, command: &mut Command) {
+        Self::prepare_command(command);
         apply(command, "PATH", self.path.as_deref());
         apply(command, "HOME", self.home.as_deref());
-        apply(command, "GIT_DIR", self.git_dir.as_deref());
-        apply(command, "GIT_WORK_TREE", self.git_work_tree.as_deref());
-        apply(
-            command,
-            "GIT_CEILING_DIRECTORIES",
-            self.git_ceilings.as_deref(),
-        );
+        apply(command, "GIT_DIR", None);
+        apply(command, "GIT_WORK_TREE", None);
+        apply(command, "GIT_CEILING_DIRECTORIES", None);
         apply(command, "VIRTUAL_ENV", self.virtual_env.as_deref());
         apply(command, "CONDA_PREFIX", self.conda_prefix.as_deref());
         apply(
@@ -71,13 +67,23 @@ impl PromptEnvironment {
         );
         apply(command, "PERLBREW_PERL", self.perlbrew_perl.as_deref());
         apply(command, "PLENV_VERSION", self.plenv_version.as_deref());
+        apply(command, "PYENV_VERSION", self.pyenv_version.as_deref());
+        apply(command, "PYENV_DIR", self.pyenv_dir.as_deref());
         apply(
             command,
             "RUSTUP_TOOLCHAIN",
             self.rustup_toolchain.as_deref(),
         );
+        apply(command, "RUSTUP_HOME", self.rustup_home.as_deref());
+        apply(command, "RBENV_DIR", self.rbenv_dir.as_deref());
         apply(command, "RBENV_VERSION", self.rbenv_version.as_deref());
+        apply(command, "NODENV_VERSION", self.nodenv_version.as_deref());
+        apply(command, "NODENV_DIR", self.nodenv_dir.as_deref());
+        apply(command, "PLENV_DIR", self.plenv_dir.as_deref());
         apply(command, "RUBY_VERSION", self.ruby_version.as_deref());
+        apply(command, "JAVA_HOME", self.java_home.as_deref());
+        apply(command, "GOTOOLCHAIN", self.gotoolchain.as_deref());
+        apply(command, "DOTNET_ROOT", self.dotnet_root.as_deref());
     }
 }
 
@@ -101,6 +107,9 @@ mod tests {
     #[test]
     fn apply_to_command_sets_and_removes_all_controls() {
         let environment = PromptEnvironment {
+            git_dir: Some(OsString::from("/repo/.git")),
+            git_work_tree: Some(OsString::from("/repo")),
+            git_ceilings: Some(OsString::from("/repo")),
             virtual_env: Some(OsString::from("/venv-a")),
             rustup_toolchain: Some(OsString::from("nightly")),
             ..PromptEnvironment::default()
@@ -124,17 +133,40 @@ mod tests {
             get("RUSTUP_TOOLCHAIN"),
             Some(Some(OsString::from("nightly")))
         );
-        // Explicit removals for every unset prompt-controlled variable.
-        assert_eq!(get("PATH"), Some(None));
-        assert_eq!(get("HOME"), Some(None));
-        assert_eq!(get("GIT_DIR"), Some(None));
-        assert_eq!(get("GIT_WORK_TREE"), Some(None));
-        assert_eq!(get("GIT_CEILING_DIRECTORIES"), Some(None));
-        assert_eq!(get("CONDA_PREFIX"), Some(None));
-        assert_eq!(get("CONDA_DEFAULT_ENV"), Some(None));
-        assert_eq!(get("PERLBREW_PERL"), Some(None));
-        assert_eq!(get("PLENV_VERSION"), Some(None));
-        assert_eq!(get("RBENV_VERSION"), Some(None));
-        assert_eq!(get("RUBY_VERSION"), Some(None));
+        // Clearing the command environment means unset controls do not appear
+        // as inherited values or as a synthetic environment entry.
+        for name in [
+            "PATH",
+            "HOME",
+            "GIT_DIR",
+            "GIT_WORK_TREE",
+            "GIT_CEILING_DIRECTORIES",
+            "CONDA_PREFIX",
+            "CONDA_DEFAULT_ENV",
+            "PYENV_VERSION",
+            "PYENV_DIR",
+            "RUSTUP_HOME",
+            "RBENV_DIR",
+            "NODENV_VERSION",
+            "NODENV_DIR",
+            "PLENV_DIR",
+            "PERLBREW_PERL",
+            "PLENV_VERSION",
+            "RBENV_VERSION",
+            "RUBY_VERSION",
+            "JAVA_HOME",
+            "GOTOOLCHAIN",
+            "DOTNET_ROOT",
+        ] {
+            assert!(get(name).is_none(), "{name} should be absent");
+        }
+        assert_eq!(get("LC_ALL"), Some(Some(OsString::from("C"))));
+        assert_eq!(get("TERM"), Some(Some(OsString::from("dumb"))));
+        assert_eq!(get("NO_COLOR"), Some(Some(OsString::from("1"))));
+        assert_eq!(get("DOTNET_NOLOGO"), Some(Some(OsString::from("1"))));
+        assert_eq!(
+            get("DOTNET_CLI_TELEMETRY_OPTOUT"),
+            Some(Some(OsString::from("1")))
+        );
     }
 }

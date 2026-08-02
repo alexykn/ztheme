@@ -6,13 +6,11 @@ use std::path::{Path, PathBuf};
 
 use super::Runtime;
 use crate::environment::PromptEnvironment;
-use crate::utils::HashBuilder;
 
 #[derive(Clone)]
 pub(crate) struct Project {
     pub(crate) cwd: PathBuf,
     pub(crate) runtimes: Vec<Runtime>,
-    pub(super) hash: HashBuilder,
 }
 
 pub(crate) fn worktree_root(cwd: &Path, environment: &PromptEnvironment) -> Option<PathBuf> {
@@ -36,10 +34,11 @@ pub(crate) fn worktree_root(cwd: &Path, environment: &PromptEnvironment) -> Opti
 pub(crate) fn detect(
     cwd: &Path,
     git_root: Option<&Path>,
+    configured: &[Runtime],
     environment: &PromptEnvironment,
 ) -> Project {
-    let mut hash = HashBuilder::new(b"ztheme-project-v1");
     let mut runtimes = HashSet::new();
+    let configured = configured.iter().copied().collect::<HashSet<_>>();
     let home = environment.home.as_deref().map(PathBuf::from);
     let ceilings = environment
         .git_ceilings
@@ -51,10 +50,9 @@ pub(crate) fn detect(
     let mut directory = cwd.to_path_buf();
     let mut javascript = None;
 
-    hash.add_path(b"cwd", cwd);
-    environment.add_runtime_fingerprint(&mut hash);
-
-    if environment.virtual_env.is_some() || environment.conda_prefix.is_some() {
+    if (environment.virtual_env.is_some() || environment.conda_prefix.is_some())
+        && configured.contains(&Runtime::Python)
+    {
         runtimes.insert(Runtime::Python);
     }
 
@@ -68,8 +66,6 @@ pub(crate) fn detect(
 
         let names = directory_names(&directory);
         detect_markers(&names, &mut runtimes);
-        hash.add_path(b"scanned-directory", &directory);
-        hash_version_selectors(&directory, &names, &mut hash);
 
         if javascript.is_none() {
             javascript = detect_javascript(&names);
@@ -80,7 +76,6 @@ pub(crate) fn detect(
             && directory.join("project/build.properties").is_file()
         {
             runtimes.insert(Runtime::Scala);
-            hash_metadata(&directory.join("project/build.properties"), &mut hash);
         }
 
         if depth == 0 {
@@ -105,15 +100,12 @@ pub(crate) fn detect(
         runtimes.remove(&Runtime::C);
     }
 
+    runtimes.retain(|runtime| configured.contains(runtime));
     let mut runtimes: Vec<_> = runtimes.into_iter().collect();
     runtimes.sort_unstable();
-    for runtime in &runtimes {
-        hash.add_u64(b"runtime", u64::from(runtime.id()));
-    }
     Project {
         cwd: cwd.to_path_buf(),
         runtimes,
-        hash,
     }
 }
 
@@ -323,36 +315,6 @@ fn has_any(names: &HashSet<OsString>, markers: &[&str]) -> bool {
         .any(|marker| names.contains(OsStr::new(marker)))
 }
 
-fn hash_version_selectors(directory: &Path, names: &HashSet<OsString>, hash: &mut HashBuilder) {
-    for marker in [
-        ".python-version",
-        ".perl-version",
-        ".java-version",
-        ".sdkmanrc",
-        ".scalaenv",
-        ".sbtenv",
-        "rust-toolchain",
-        "rust-toolchain.toml",
-        ".nvmrc",
-        ".node-version",
-        ".ruby-version",
-        ".php-version",
-        "global.json",
-        ".lua-version",
-    ] {
-        if names.contains(OsStr::new(marker)) {
-            hash.add_bytes(b"selector-name", marker.as_bytes());
-            hash_metadata(&directory.join(marker), hash);
-        }
-    }
-}
-
-fn hash_metadata(path: &Path, hash: &mut HashBuilder) {
-    hash.add_path(b"metadata-path", path);
-    let metadata = path.metadata().ok();
-    hash.add_metadata(b"metadata", metadata.as_ref());
-}
-
 #[cfg(test)]
 mod tests {
     use std::fs;
@@ -399,6 +361,7 @@ mod tests {
         let project = detect(
             &nested,
             Some(directory.path()),
+            &Runtime::ALL,
             &PromptEnvironment::default(),
         );
         assert!(project.runtimes.contains(&Runtime::Rust));
@@ -416,6 +379,7 @@ mod tests {
         let project = detect(
             &nested,
             Some(directory.path()),
+            &Runtime::ALL,
             &PromptEnvironment::default(),
         );
         assert!(project.runtimes.contains(&Runtime::Node));
@@ -431,6 +395,7 @@ mod tests {
         let project = detect(
             directory.path(),
             Some(directory.path()),
+            &Runtime::ALL,
             &PromptEnvironment::default(),
         );
         assert!(project.runtimes.contains(&Runtime::Cpp));
@@ -438,24 +403,25 @@ mod tests {
     }
 
     #[test]
-    fn selector_changes_invalidate_the_project_fingerprint() {
+    fn detection_is_fresh_without_a_project_fingerprint() {
         let directory = TestDirectory::new();
         let before = detect(
             directory.path(),
             Some(directory.path()),
+            &Runtime::ALL,
             &PromptEnvironment::default(),
         )
-        .hash
-        .finish();
+        .runtimes;
         fs::write(directory.path().join(".python-version"), b"3.14\n").unwrap();
         let after = detect(
             directory.path(),
             Some(directory.path()),
+            &Runtime::ALL,
             &PromptEnvironment::default(),
         )
-        .hash
-        .finish();
+        .runtimes;
 
-        assert_ne!(before, after);
+        assert!(!before.contains(&Runtime::Python));
+        assert!(after.contains(&Runtime::Python));
     }
 }

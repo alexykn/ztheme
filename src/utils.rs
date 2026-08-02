@@ -1,9 +1,7 @@
+#[cfg(test)]
 use std::ffi::OsStr;
-use std::fs::Metadata;
+#[cfg(test)]
 use std::os::unix::ffi::OsStrExt as _;
-use std::os::unix::fs::MetadataExt as _;
-use std::path::Path;
-use std::time::UNIX_EPOCH;
 
 const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
 const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
@@ -27,60 +25,19 @@ impl HashBuilder {
         self.add_raw(value);
     }
 
-    pub(crate) fn add_os(&mut self, label: &[u8], value: &OsStr) {
+    #[cfg(test)]
+    fn add_os(&mut self, label: &[u8], value: &OsStr) {
         self.add_bytes(label, value.as_bytes());
     }
 
-    pub(crate) fn add_optional_os(&mut self, label: &[u8], value: Option<&OsStr>) {
+    #[cfg(test)]
+    fn add_optional_os(&mut self, label: &[u8], value: Option<&OsStr>) {
         match value {
             Some(value) => {
                 self.add_bytes(b"present", b"1");
                 self.add_os(label, value);
             }
             None => self.add_bytes(b"present", b"0"),
-        }
-    }
-
-    pub(crate) fn add_path(&mut self, label: &[u8], value: &Path) {
-        self.add_os(label, value.as_os_str());
-    }
-
-    pub(crate) fn add_u64(&mut self, label: &[u8], value: u64) {
-        self.add_bytes(label, &value.to_be_bytes());
-    }
-
-    pub(crate) fn add_metadata(&mut self, label: &[u8], metadata: Option<&Metadata>) {
-        let Some(metadata) = metadata else {
-            self.add_bytes(label, b"missing");
-            return;
-        };
-
-        self.add_bytes(label, b"present");
-        self.add_u64(b"metadata-length", metadata.len());
-        self.add_u64(b"metadata-device", metadata.dev());
-        self.add_u64(b"metadata-inode", metadata.ino());
-        self.add_u64(b"metadata-mode", u64::from(metadata.mode()));
-        self.add_u64(
-            b"metadata-change-seconds",
-            u64::try_from(metadata.ctime()).unwrap_or(0),
-        );
-        self.add_u64(
-            b"metadata-change-nanos",
-            u64::try_from(metadata.ctime_nsec()).unwrap_or(0),
-        );
-        match metadata
-            .modified()
-            .ok()
-            .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
-        {
-            Some(modified) => {
-                self.add_u64(b"metadata-modified-seconds", modified.as_secs());
-                self.add_u64(
-                    b"metadata-modified-nanos",
-                    u64::from(modified.subsec_nanos()),
-                );
-            }
-            None => self.add_bytes(b"metadata-modified", b"unknown"),
         }
     }
 
