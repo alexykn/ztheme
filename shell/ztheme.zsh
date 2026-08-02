@@ -1,8 +1,10 @@
 # ztheme shell integration
 #
-# Immediate prompt state is rendered in Zsh. Git and runtime values are styled
-# in Rust and arrive as finished fragments from the per-shell
-# `ztheme __client-daemon` process.
+# The synchronous prompt parts (directory, command status, prompt character)
+# are formatted in Zsh and held. Git and runtime values are styled in Rust and
+# arrive as finished fragments from the per-shell `ztheme __client-daemon`
+# process. The complete prompt is assembled and drawn in one atomic redraw
+# once those fragments finish or the shared deadline expires.
 
 _ztheme_initialize() {
 autoload -Uz colors

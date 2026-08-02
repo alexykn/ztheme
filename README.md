@@ -3,8 +3,9 @@
 A Zsh prompt for Git and runtime context, customizable themes, syntax
 highlighting, and autosuggestions.
 
-Your directory and prompt appear immediately. Git state and language versions
-arrive in the background without blocking input.
+Git state and language versions are resolved asynchronously. ztheme then
+displays the complete prompt in one update, avoiding partial or visually
+jumping prompt redraws.
 
 <p align="center">
   <img src="img/image-two.png" alt="Catppuccin Mocha ztheme prompt with Git status, Rust version, and syntax highlighting">
