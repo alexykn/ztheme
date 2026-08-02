@@ -61,10 +61,10 @@ Zsh precmd/chpwd
 │       │       └── persistent gitstatus::Client
 │       │           └── gitstatusd
 │       └── start runtime task immediately after Git begins
-│           ├── detect project and active runtimes
-│           ├── daemon::runtime_cache_get
-│           ├── on miss: execute runtime snapshots
-│           └── daemon::runtime_cache_put
+│           ├── fresh project detection and PATH planning
+│           ├── partition cacheable and volatile selections
+│           ├── execute volatile selections on every request
+│           └── acquire/execute/owned-put cacheable selections
 ├── compute synchronous shell segments while the client works
 └── leave the prompt empty until the snapshot finishes
 
@@ -139,7 +139,8 @@ src/
 │   └── disk.rs
 ├── runtime/
 │   ├── mod.rs
-│   └── detect.rs
+│   ├── detect.rs
+│   └── cache.rs
 ├── gitstatus/
 ├── prompt/
 │   ├── mod.rs
@@ -185,8 +186,10 @@ help:
 
 The crate-private daemon client operations are deliberately explicit:
 
-- `runtime_cache_get`
-- `runtime_cache_put`
+- `runtime_cache_acquire`
+- `runtime_cache_put_owned`
+- `runtime_cache_release`
+- `runtime_cache_remove`
 - `git_status`
 - `reset`
 
@@ -213,9 +216,11 @@ the current user with no group or other permissions. The socket and lock file
 use mode `0600`.
 
 Production uses `daemon.sock`. A development instance hashes its validated
-`--dev NAME` into a distinct socket name. The name itself is not placed in the
-filesystem path. This allows a development build and the installed production
-binary to run simultaneously without sharing daemon state.
+`--dev NAME` into a distinct socket name. The same stable hash selects
+`runtime-v2-dev-<hash>.bin`; production continues to use `runtime-v2.bin`.
+The name itself is not placed in either filesystem path. This allows a
+development build and the installed production binary to run simultaneously
+without sharing daemon or persistent-cache state.
 
 The transport is intentionally Unix-specific. ztheme targets Zsh because that
 is what I use. Similarly it uses Unix process and filesystem semantics because 
@@ -229,12 +234,13 @@ daemon exits successfully. This handles several clients racing to lazily start
 the same instance without requiring coordination in the callers.
 
 The lock owner removes a stale socket path, binds a new listener, creates the
-runtime cache, and starts cache load and flush tasks. `gitstatusd` is started
-lazily on the first Git request rather than during startup, so a daemon that
-only serves runtime-cache operations never requires the managed binary. Each
-accepted connection is handled in its own Tokio task. Runtime-cache requests
-can proceed concurrently; Git queries are serialized by the mutex around the
-single stateful `gitstatusd` client.
+runtime cache, loads its persistent entries before accepting requests, and then
+starts the flush loop. `gitstatusd` is started lazily on the first Git request
+rather than during startup, so a daemon that only serves runtime-cache
+operations never requires the managed binary. Each accepted connection is
+handled in its own Tokio task. Runtime-cache requests can proceed concurrently;
+Git queries are serialized by the mutex around the single stateful
+`gitstatusd` client.
 
 The daemon stops when:
 
@@ -249,7 +255,8 @@ owner removes that stale path before binding.
 
 #### Client startup and replacement
 
-Callers use `runtime_cache_get`, `runtime_cache_put`, and `git_status`; none of
+Callers use the acquire/owned-put/release/remove cache operations and
+`git_status`; none of
 them manually starts the daemon. The common request path:
 
 1. connects and attempts the operation;
@@ -273,60 +280,20 @@ state.
 
 ### Cache
 
-`cache/mod.rs` owns runtime-cache policy and lifecycle:
+`cache/mod.rs` owns runtime-cache policy and lifecycle, while `cache/disk.rs`
+owns the versioned persistent representation and its safe replacement. The
+cache is hosted by the server daemon but has no socket, process-spawning,
+Git-status, or daemon dependency.
 
-- `CacheKey`;
-- in-memory entries and freshness;
-- LRU ordering and limits;
-- load coordination;
-- revisions and persistence scheduling;
-- cache identity and disk path;
-- clear and final-flush behavior.
+Runtime selection is fresh for every prompt. A selected runtime is either
+represented by a semantic SHA-256 cache identity or classified as volatile
+and executed without entering the cache. The cache keeps at most 500 entries,
+uses daemon-side singleflight for cold misses, and persists changes
+asynchronously without a wall-clock expiry.
 
-`cache/disk.rs` owns the versioned persistent representation, validation,
-private filesystem permissions, atomic replacement, directory synchronization,
-and deletion of cache files.
-
-Cache identity is independent from daemon protocol identity. A transport
-change therefore does not automatically invalidate runtime values. Disk format
-versioning changes only when the bytes stored by `cache/disk.rs` change.
-
-The cache has no socket, process-spawning, Git-status, or daemon dependency.
-
-The cache key represents the project state, detected runtimes, runtime command
-specifications, and resolved executables that can affect a runtime snapshot.
-The cached value is the runtime module's encoded snapshot. Cache deliberately
-treats that value as opaque bytes: runtime serialization can evolve without
-making cache policy aware of runtime fields.
-
-Entries remain fresh for 24 hours and are limited to 500 entries and 16 KiB per
-value. Reads update LRU order; stale entries are removed on access; insertion
-trims the least recently used entries. Last-use timestamps are not persisted
-on every hit, which avoids turning prompt reads into continuous disk writes.
-
-Persistence is asynchronous:
-
-1. startup begins loading the disk file while the daemon can already accept
-   requests;
-2. an epoch prevents a late load from restoring data after `clear`;
-3. loaded entries merge without overwriting values created while loading;
-4. mutations increment a revision and notify the flush loop;
-5. writes are debounced for two seconds and retried after failures;
-6. shutdown calls `flush_latest` to save the newest revision.
-
-The disk file lives under the XDG cache directory, falling back to
-`$HOME/.cache/ztheme`. Its filename includes an identity derived from an
-independent cache-identity version, the disk-format version, package version,
-and current executable path. This conservative identity permits a one-time
-cold cache when the installed binary changes without coupling the decision to
-daemon wire compatibility.
-
-`cache/disk.rs` validates magic, format version, entry and value limits,
-timestamps, duplicate keys, trailing data, file type, and private permissions.
-Saving writes a mode-`0600` temporary file, flushes and synchronizes it, renames
-it atomically, and synchronizes the containing mode-`0700` directory. A crash
-therefore leaves either the preceding complete cache or the replacement,
-rather than a partially written primary file.
+The complete key model, selection boundary, LRU and persistence behavior,
+failure handling, and known limitations are documented in
+[Runtime cache](cache.md).
 
 ### Runtime
 
@@ -334,11 +301,20 @@ rather than a partially written primary file.
 
 - stable runtime IDs and canonical names;
 - runtime snapshot values and serialization;
-- command selection;
+- runtime command specifications and execution;
 - version parsing;
 - compiler and environment labels;
 - snapshot execution;
-- runtime cache-key construction.
+
+`runtime/cache.rs` owns fresh selection planning, request-CWD-aware PATH
+resolution, direct executable identity, the bounded pyenv/rbenv/nodenv/plenv
+and rustup resolvers, the explicit `GOTOOLCHAIN=local` rule, and the SHA-256
+semantic key. Python virtual/Conda selection is checked before PATH. Java and
+.NET use the first executable selected from request PATH; .NET is currently
+volatile because ztheme does not simulate SDK selection. Scripts, arbitrary
+dispatchers, ambiguous selectors, and unsupported automatic Go toolchain
+selection remain volatile rather than being simulated. The exact cacheability
+boundary is documented in [Runtime cache](cache.md).
 
 Runtime identity is declared once by `define_runtimes!`. IDs are explicit
 because they are persisted and must not change when declaration order changes.
@@ -422,11 +398,16 @@ killed shell even if EOF propagation is masked.
 
 The client never mutates its process environment. Each request carries the
 prompt-controlled variables (`src/environment.rs`), and that value is threaded
-explicitly through Git query construction, runtime detection, cache
-fingerprints, and the environment of every runtime child command — set where
-present, explicitly removed where unset. The shared server daemon therefore
-always inherits the client's stable startup environment rather than one
-arbitrary prompt request's transient values.
+explicitly through Git query construction, fresh runtime detection, selection
+planning, and the environment of every runtime child command. Git routing
+fields are used only to build the Git query; they are removed from runtime
+children. Every runtime child starts from a cleared environment with fixed
+`LC_ALL=C`, `TERM=dumb`, `NO_COLOR=1`, and .NET output controls. Cacheable
+children receive only their declared runtime inputs; volatile children receive
+the current known request environment, including PATH, HOME, and runtime
+selection variables, set where present and absent otherwise. The shared server
+daemon therefore always inherits the client's stable startup environment rather
+than one arbitrary prompt request's transient values.
 
 It does not manage server sockets, process startup, cache persistence, or the
 `gitstatusd` process.
@@ -456,8 +437,8 @@ keyed by canonical runtime name.
 `setup` owns installation of managed shell integrations. Installation logic
 does not live in CLI dispatch.
 
-`utils.rs` contains only the deterministic `HashBuilder` shared by daemon
-instance naming, runtime cache keys, and persistent cache identity.
+`utils.rs` contains only the deterministic `HashBuilder` used for daemon
+instance naming. Runtime cache keys use their own SHA-256 field builder.
 
 ## Dependency direction
 
@@ -524,14 +505,16 @@ u8         operation
 ...        operation-specific payload
 ```
 
-Protocol version 1 defines these operation bytes:
+Protocol version 2 defines these operation bytes:
 
 | Byte | Operation | Request payload | Response |
 | ---: | --- | --- | --- |
-| `1` | runtime cache get | `u64` cache key | miss, or hit plus encoded value |
-| `2` | runtime cache put | `u64` key plus length-prefixed value | OK |
+| `1` | runtime cache acquire | 32-byte key | hit plus value, or owner token |
+| `2` | runtime cache put owned | 32-byte key, token, value | OK or rejected |
+| `3` | runtime cache release | 32-byte key plus token | OK or rejected |
 | `4` | reset | none | OK |
 | `5` | Git status | query kind plus length-prefixed path bytes | none, snapshot, or error |
+| `6` | runtime cache remove | 32-byte key | OK |
 
 Integers use Tokio's big-endian wire methods. Variable data is prefixed with a
 `u32` length and validated before allocation or use. Runtime values are limited
@@ -539,9 +522,10 @@ to 16 KiB; paths and Git text fields to 16 KiB; daemon error text to 1 KiB.
 Paths remain bytes across the protocol so valid non-UTF-8 Unix paths round-trip
 without lossy conversion. Human-readable Git fields must be UTF-8.
 
-The normal cache/reset exchange deadline is 25 ms. Git uses 500 ms because it
-may require repository work, while still fitting beneath the request's 550 ms
-overall deadline in the usual case.
+The normal mutation/reset exchange deadline is 25 ms. Cache acquire uses
+500 ms because it may wait for the daemon-side 400 ms singleflight lease. Git
+uses 500 ms because it may require repository work, while still fitting
+beneath the request's 550 ms overall deadline in the usual case.
 
 Compatibility is negotiated before reading an operation:
 
@@ -592,14 +576,16 @@ stdin for every asynchronous prompt. It is a single NUL-delimited record, so
 fields need no escaping and non-UTF-8 paths round-trip byte-exact:
 
 ```text
-ZTREQ<NUL>1<NUL>generation<NUL>cwd<NUL>
+ZTREQ<NUL>2<NUL>generation<NUL>cwd<NUL>
 PATH<NUL>HOME<NUL>GIT_DIR<NUL>GIT_WORK_TREE<NUL>GIT_CEILING_DIRECTORIES<NUL>
 VIRTUAL_ENV<NUL>CONDA_PREFIX<NUL>CONDA_DEFAULT_ENV<NUL>
-PERLBREW_PERL<NUL>PLENV_VERSION<NUL>RUSTUP_TOOLCHAIN<NUL>
-RBENV_VERSION<NUL>RUBY_VERSION<NUL>
+PERLBREW_PERL<NUL>PLENV_VERSION<NUL>PYENV_VERSION<NUL>PYENV_DIR<NUL>
+RUSTUP_TOOLCHAIN<NUL>RUSTUP_HOME<NUL>RBENV_DIR<NUL>RBENV_VERSION<NUL>
+NODENV_VERSION<NUL>NODENV_DIR<NUL>PLENV_DIR<NUL>RUBY_VERSION<NUL>
+JAVA_HOME<NUL>GOTOOLCHAIN<NUL>DOTNET_ROOT<NUL>
 ```
 
-`ZTREQ` and version `1` guard against garbage input. The environment subset is
+`ZTREQ` and version `2` guard against garbage input. The environment subset is
 exactly what runtime detection, command resolution, and the Git query read.
 The client does not apply it to its own process: the values are threaded
 through the request explicitly and applied only to the child commands that

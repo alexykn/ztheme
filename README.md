@@ -273,7 +273,8 @@ A per-shell client daemon renders prompts and talks to a per-user server
 daemon that hosts runtime caching and the persistent `gitstatusd` client.
 Keeping the client alive avoids spawning a process for every prompt.
 See [Architecture](docs/architecture.md) for subsystem ownership, protocols,
-and the runtime-extension workflow.
+and the runtime-extension workflow. See [Runtime cache](docs/cache.md) for
+cache identities, persistence, and limitations.
 
 ## Built with
 
