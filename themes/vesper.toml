@@ -36,6 +36,8 @@ hashed-command = { foreground = "sky" }
 history-expansion = { foreground = "violet" }
 path = { foreground = "sky", underline = true }
 path_prefix = { foreground = "sky", underline = true }
+path_pathseparator = { foreground = "sky", underline = true }
+path_prefix_pathseparator = { foreground = "sky", underline = true }
 precommand = { foreground = "violet" }
 redirection = { foreground = "violet" }
 reserved-word = { foreground = "violet" }
