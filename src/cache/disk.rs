@@ -1,31 +1,25 @@
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use super::{
-    CACHE_FILE_PREFIX, CACHE_FILE_SUFFIX, CACHE_FORMAT_VERSION, CacheKey, Entry, MAX_ENTRIES,
-    MAX_VALUE_BYTES, now_epoch_seconds, validate_value,
+    CACHE_FORMAT_VERSION, CacheKey, Entry, MAX_ENTRIES, MAX_VALUE_BYTES, now_epoch_seconds,
+    validate_value,
 };
 
 const MAGIC: [u8; 4] = *b"ZTHC";
 const MAX_FILE_BYTES: u64 = 9 * 1024 * 1024;
 const FUTURE_SKEW_SECONDS: u64 = 5 * 60;
 
-pub(super) struct Loaded {
-    pub(super) entries: HashMap<CacheKey, Entry>,
-    pub(super) needs_rewrite: bool,
-}
-
-pub(super) fn load(path: &Path) -> io::Result<Loaded> {
+pub(super) fn load(path: &Path) -> io::Result<HashMap<CacheKey, Entry>> {
     validate_private_file(path)?;
     let metadata = path.metadata()?;
     if metadata.len() > MAX_FILE_BYTES {
         return Err(invalid_data("cache file exceeds size limit"));
     }
-
     let capacity =
         usize::try_from(metadata.len()).map_err(|_| invalid_data("cache file is too large"))?;
     let mut bytes = Vec::with_capacity(capacity);
@@ -77,32 +71,21 @@ pub(super) fn clear_all(path: Option<&Path>) -> io::Result<()> {
         return Err(invalid_data("cache directory permissions are unsafe"));
     }
 
-    let entries = match fs::read_dir(directory) {
-        Ok(entries) => entries,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => return Err(error),
-    };
-
-    for entry in entries {
-        let entry = entry?;
-        let name = entry.file_name();
-        let Some(name) = name.to_str() else {
-            continue;
-        };
-        if name.starts_with(CACHE_FILE_PREFIX)
-            && (name.ends_with(CACHE_FILE_SUFFIX) || name.contains(".tmp-"))
-        {
-            match fs::remove_file(entry.path()) {
-                Ok(()) => {}
-                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-                Err(error) => return Err(error),
-            }
+    for name in [path.file_name(), temporary_path(path).file_name()]
+        .into_iter()
+        .flatten()
+    {
+        let candidate = directory.join(name);
+        match fs::remove_file(candidate) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
         }
     }
     sync_directory(directory)
 }
 
-fn decode(bytes: &[u8]) -> io::Result<Loaded> {
+fn decode(bytes: &[u8]) -> io::Result<HashMap<CacheKey, Entry>> {
     let mut decoder = Decoder::new(bytes);
     if decoder.take(MAGIC.len())? != MAGIC {
         return Err(invalid_data("cache file magic is invalid"));
@@ -110,7 +93,6 @@ fn decode(bytes: &[u8]) -> io::Result<Loaded> {
     if decoder.u16()? != CACHE_FORMAT_VERSION {
         return Err(invalid_data("cache file version is unsupported"));
     }
-
     let count = usize::try_from(decoder.u32()?)
         .map_err(|_| invalid_data("cache entry count is invalid"))?;
     if count > MAX_ENTRIES {
@@ -120,11 +102,8 @@ fn decode(bytes: &[u8]) -> io::Result<Loaded> {
     let now = now_epoch_seconds();
     let latest_allowed = now.saturating_add(FUTURE_SKEW_SECONDS);
     let mut entries = HashMap::with_capacity(count);
-    let mut needs_rewrite = false;
-
     for _ in 0..count {
-        let key = CacheKey::from_value(decoder.u64()?);
-        let refreshed_at = decoder.u64()?;
+        let key = CacheKey::from_digest(decoder.array_32()?);
         let last_used_at = decoder.u64()?;
         let lru_order = decoder.u64()?;
         let value_length = usize::try_from(decoder.u32()?)
@@ -132,7 +111,7 @@ fn decode(bytes: &[u8]) -> io::Result<Loaded> {
         if value_length > MAX_VALUE_BYTES {
             return Err(invalid_data("cache value exceeds size limit"));
         }
-        if refreshed_at > latest_allowed || last_used_at > latest_allowed {
+        if last_used_at > latest_allowed {
             return Err(invalid_data("cache timestamp is invalid"));
         }
 
@@ -140,29 +119,18 @@ fn decode(bytes: &[u8]) -> io::Result<Loaded> {
         validate_value(&value)?;
         let entry = Entry {
             value: Arc::from(value),
-            refreshed_at,
             last_used_at,
             persisted_last_used_at: last_used_at,
             lru_order,
         };
-
-        if !entry.is_fresh(now) {
-            needs_rewrite = true;
-            continue;
-        }
         if entries.insert(key, entry).is_some() {
             return Err(invalid_data("cache file contains duplicate keys"));
         }
     }
-
     if !decoder.is_empty() {
         return Err(invalid_data("cache file contains trailing data"));
     }
-
-    Ok(Loaded {
-        entries,
-        needs_rewrite,
-    })
+    Ok(entries)
 }
 
 fn encode(output: &mut impl Write, entries: &HashMap<CacheKey, Entry>) -> io::Result<()> {
@@ -173,10 +141,8 @@ fn encode(output: &mut impl Write, entries: &HashMap<CacheKey, Entry>) -> io::Re
             .unwrap_or(u32::MAX)
             .to_be_bytes(),
     )?;
-
     for (key, entry) in entries {
-        output.write_all(&key.value().to_be_bytes())?;
-        output.write_all(&entry.refreshed_at.to_be_bytes())?;
+        output.write_all(&key.bytes())?;
         output.write_all(&entry.last_used_at.to_be_bytes())?;
         output.write_all(&entry.lru_order.to_be_bytes())?;
         output.write_all(
@@ -206,7 +172,6 @@ fn validate_private_file(path: &Path) -> io::Result<()> {
     if !directory.file_type().is_dir() || directory.mode() & 0o077 != 0 {
         return Err(invalid_data("cache directory permissions are unsafe"));
     }
-
     let metadata = fs::symlink_metadata(path)?;
     if !metadata.file_type().is_file() || metadata.mode() & 0o077 != 0 {
         return Err(invalid_data("cache file permissions are unsafe"));
@@ -258,28 +223,31 @@ impl<'a> Decoder<'a> {
         Ok(value)
     }
 
-    fn u16(&mut self) -> io::Result<u16> {
-        let bytes: [u8; 2] = self
-            .take(2)?
+    fn array_32(&mut self) -> io::Result<[u8; 32]> {
+        self.take(32)?
             .try_into()
-            .map_err(|_| invalid_data("cache file is truncated"))?;
-        Ok(u16::from_be_bytes(bytes))
+            .map_err(|_| invalid_data("cache file is truncated"))
+    }
+
+    fn u16(&mut self) -> io::Result<u16> {
+        self.take(2)?
+            .try_into()
+            .map(u16::from_be_bytes)
+            .map_err(|_| invalid_data("cache file is truncated"))
     }
 
     fn u32(&mut self) -> io::Result<u32> {
-        let bytes: [u8; 4] = self
-            .take(4)?
+        self.take(4)?
             .try_into()
-            .map_err(|_| invalid_data("cache file is truncated"))?;
-        Ok(u32::from_be_bytes(bytes))
+            .map(u32::from_be_bytes)
+            .map_err(|_| invalid_data("cache file is truncated"))
     }
 
     fn u64(&mut self) -> io::Result<u64> {
-        let bytes: [u8; 8] = self
-            .take(8)?
+        self.take(8)?
             .try_into()
-            .map_err(|_| invalid_data("cache file is truncated"))?;
-        Ok(u64::from_be_bytes(bytes))
+            .map(u64::from_be_bytes)
+            .map_err(|_| invalid_data("cache file is truncated"))
     }
 
     fn is_empty(&self) -> bool {
@@ -300,8 +268,10 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU64, Ordering};
 
-    use super::{CACHE_FORMAT_VERSION, Entry, MAGIC, decode, encode, load, save};
-    use crate::cache::{CacheKey, SAFETY_EXPIRY, now_epoch_seconds};
+    use super::{
+        CACHE_FORMAT_VERSION, CacheKey, Entry, FUTURE_SKEW_SECONDS, MAGIC, decode, encode, load,
+        now_epoch_seconds, save,
+    };
 
     static SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
@@ -314,7 +284,8 @@ mod tests {
                 "ztheme-cache-disk-test-{}-{sequence}",
                 std::process::id()
             ));
-            fs::create_dir(&path).unwrap();
+            fs::create_dir_all(&path).unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
             Self(path)
         }
 
@@ -329,12 +300,11 @@ mod tests {
         }
     }
 
-    fn entry(value: &[u8], refreshed_at: u64, order: u64) -> Entry {
+    fn entry(value: &[u8], last_used_at: u64, order: u64) -> Entry {
         Entry {
             value: Arc::from(value),
-            refreshed_at,
-            last_used_at: refreshed_at,
-            persisted_last_used_at: refreshed_at,
+            last_used_at,
+            persisted_last_used_at: last_used_at,
             lru_order: order,
         }
     }
@@ -346,21 +316,28 @@ mod tests {
     }
 
     #[test]
-    fn save_and_load_round_trip_with_private_permissions() {
+    fn save_load_preserves_entries_lru_and_private_permissions() {
         let directory = TestDirectory::new();
-        let path = directory.path().join("nested/cache.bin");
-        let now = now_epoch_seconds();
+        let path = directory.path().join("nested/cache/runtime-v2.bin");
         let entries = HashMap::from([
-            (CacheKey::from_value(1), entry(b"one", now, 4)),
-            (CacheKey::from_value(2), entry(b"two", now, 9)),
+            (CacheKey::from_value(1), entry(b"first", 100, 4)),
+            (CacheKey::from_value(2), entry(b"second", 200, 9)),
         ]);
 
         save(&path, &entries).unwrap();
         let loaded = load(&path).unwrap();
 
-        assert_eq!(loaded.entries.len(), 2);
-        assert_eq!(&*loaded.entries[&CacheKey::from_value(1)].value, b"one");
-        assert_eq!(loaded.entries[&CacheKey::from_value(2)].lru_order, 9);
+        assert_eq!(loaded.len(), 2);
+        for (key, expected) in &entries {
+            let actual = &loaded[key];
+            assert_eq!(actual.value.as_ref(), expected.value.as_ref());
+            assert_eq!(actual.last_used_at, expected.last_used_at);
+            assert_eq!(
+                actual.persisted_last_used_at,
+                expected.persisted_last_used_at
+            );
+            assert_eq!(actual.lru_order, expected.lru_order);
+        }
         assert_eq!(
             fs::metadata(path.parent().unwrap())
                 .unwrap()
@@ -370,56 +347,56 @@ mod tests {
             0o700
         );
         assert_eq!(
-            fs::metadata(path).unwrap().permissions().mode() & 0o777,
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
             0o600
         );
     }
 
     #[test]
-    fn expired_entries_are_dropped_and_request_rewrite() {
-        let now = now_epoch_seconds();
-        let expired = now.saturating_sub(SAFETY_EXPIRY.as_secs().saturating_add(1));
-        let entries = HashMap::from([(CacheKey::from_value(1), entry(b"old", expired, 1))]);
-
+    fn old_entries_are_read_without_wall_clock_expiry() {
+        let entries = HashMap::from([(CacheKey::from_value(1), entry(b"old", 1, 1))]);
         let loaded = decode(&encoded(&entries)).unwrap();
-        assert!(loaded.entries.is_empty());
-        assert!(loaded.needs_rewrite);
+        assert_eq!(&*loaded[&CacheKey::from_value(1)].value, b"old");
     }
 
     #[test]
     fn malformed_cache_files_are_rejected() {
-        let now = now_epoch_seconds();
-        let entries = HashMap::from([(CacheKey::from_value(1), entry(b"value", now, 1))]);
+        let entries = HashMap::from([(CacheKey::from_value(1), entry(b"value", 1, 1))]);
         let valid = encoded(&entries);
-
         for length in 0..valid.len() {
             assert!(
                 decode(&valid[..length]).is_err(),
                 "accepted length {length}"
             );
         }
-
         let mut trailing = valid.clone();
         trailing.push(0);
         assert!(decode(&trailing).is_err());
-
         let mut bad_magic = valid.clone();
         bad_magic[0] ^= 1;
         assert!(decode(&bad_magic).is_err());
-
         let mut bad_version = valid.clone();
         bad_version[MAGIC.len()..MAGIC.len() + 2]
             .copy_from_slice(&CACHE_FORMAT_VERSION.saturating_add(1).to_be_bytes());
         assert!(decode(&bad_version).is_err());
+    }
 
+    #[test]
+    fn duplicate_cache_keys_are_rejected() {
+        let entries = HashMap::from([(CacheKey::from_value(1), entry(b"value", 1, 1))]);
+        let valid = encoded(&entries);
         let mut duplicate = valid.clone();
         duplicate[6..10].copy_from_slice(&2_u32.to_be_bytes());
         duplicate.extend_from_slice(&valid[10..]);
         assert!(decode(&duplicate).is_err());
+    }
 
-        let future = now.saturating_add(10 * 60);
-        let future_entries =
-            HashMap::from([(CacheKey::from_value(1), entry(b"future", future, 1))]);
-        assert!(decode(&encoded(&future_entries)).is_err());
+    #[test]
+    fn future_timestamps_are_rejected() {
+        let entries = HashMap::from([(CacheKey::from_value(1), entry(b"value", 1, 1))]);
+        let mut future = encoded(&entries);
+        let timestamp = now_epoch_seconds().saturating_add(FUTURE_SKEW_SECONDS + 1);
+        future[42..50].copy_from_slice(&timestamp.to_be_bytes());
+        assert!(decode(&future).is_err());
     }
 }

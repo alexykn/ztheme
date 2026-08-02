@@ -8,6 +8,7 @@ use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
 
+use tokio::io::AsyncReadExt;
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{Mutex, Notify};
 use tokio::task::JoinSet;
@@ -15,7 +16,7 @@ use tokio::time::timeout;
 
 mod protocol;
 
-use crate::cache::{CacheKey, RuntimeCache};
+use crate::cache::{Acquire, CacheKey, RuntimeCache};
 use crate::gitstatus;
 use crate::utils::HashBuilder;
 
@@ -53,15 +54,39 @@ impl Instance {
         }
     }
 
+    fn development_hash(name: &str) -> u64 {
+        let mut hash = HashBuilder::new(b"ztheme-development-instance-v1");
+        hash.add_bytes(b"name", name.as_bytes());
+        hash.finish()
+    }
+
     fn socket_path(&self) -> PathBuf {
         let directory = runtime_directory();
         match self {
             Self::Production => directory.join("daemon.sock"),
             Self::Development(name) => {
-                let mut hash = HashBuilder::new(b"ztheme-development-instance-v1");
-                hash.add_bytes(b"name", name.as_bytes());
-                directory.join(format!("dev-{:016x}.sock", hash.finish()))
+                directory.join(format!("dev-{:016x}.sock", Self::development_hash(name)))
             }
+        }
+    }
+
+    fn runtime_cache_path(&self) -> Option<PathBuf> {
+        crate::cache::path_for_file_name(&self.runtime_cache_file_name())
+    }
+
+    fn runtime_cache_file_name(&self) -> String {
+        match self {
+            Self::Production => "runtime-v2.bin".to_owned(),
+            Self::Development(name) => {
+                format!("runtime-v2-dev-{:016x}.bin", Self::development_hash(name))
+            }
+        }
+    }
+
+    fn runtime_cache(&self) -> RuntimeCache {
+        match self {
+            Self::Production => RuntimeCache::new(),
+            Self::Development(_) => RuntimeCache::new_with_path(self.runtime_cache_path()),
         }
     }
 
@@ -72,25 +97,48 @@ impl Instance {
     }
 }
 
-pub(crate) async fn runtime_cache_get(
+pub(crate) async fn runtime_cache_acquire(
     instance: &Instance,
     key: CacheKey,
-) -> io::Result<Option<Vec<u8>>> {
-    let Response::RuntimeCache(value) = request(instance, Operation::RuntimeCacheGet(key)).await?
+) -> io::Result<Acquire> {
+    let Response::CacheAcquire(value) =
+        request(instance, Operation::RuntimeCacheAcquire(key)).await?
     else {
-        unreachable!("runtime cache get returned a different response")
+        unreachable!("runtime cache acquire returned a different response")
     };
     Ok(value)
 }
 
-pub(crate) async fn runtime_cache_put(
+pub(crate) async fn runtime_cache_put_owned(
     instance: &Instance,
     key: CacheKey,
+    token: u64,
     value: &[u8],
-) -> io::Result<()> {
-    let Response::Complete = request(instance, Operation::RuntimeCachePut(key, value)).await?
+) -> io::Result<bool> {
+    let Response::CacheMutation(value) =
+        request(instance, Operation::RuntimeCachePutOwned(key, token, value)).await?
     else {
         unreachable!("runtime cache put returned a different response")
+    };
+    Ok(value)
+}
+
+pub(crate) async fn runtime_cache_release(
+    instance: &Instance,
+    key: CacheKey,
+    token: u64,
+) -> io::Result<bool> {
+    let Response::CacheMutation(value) =
+        request(instance, Operation::RuntimeCacheRelease(key, token)).await?
+    else {
+        unreachable!("runtime cache release returned a different response")
+    };
+    Ok(value)
+}
+
+pub(crate) async fn runtime_cache_remove(instance: &Instance, key: CacheKey) -> io::Result<()> {
+    let Response::Complete = request(instance, Operation::RuntimeCacheRemove(key)).await? else {
+        unreachable!("runtime cache remove returned a different response")
     };
     Ok(())
 }
@@ -129,22 +177,25 @@ pub(crate) async fn reset(instance: &Instance) -> io::Result<()> {
         }
     }
 
-    RuntimeCache::new().clear().await
+    instance.runtime_cache().clear().await
 }
 
 pub(crate) async fn serve(instance: &Instance) -> io::Result<()> {
-    serve_socket(instance.socket_path()).await
+    serve_socket(instance.socket_path(), instance.runtime_cache()).await
 }
 
 #[derive(Clone, Copy)]
 enum Operation<'a> {
-    RuntimeCacheGet(CacheKey),
-    RuntimeCachePut(CacheKey, &'a [u8]),
+    RuntimeCacheAcquire(CacheKey),
+    RuntimeCachePutOwned(CacheKey, u64, &'a [u8]),
+    RuntimeCacheRelease(CacheKey, u64),
+    RuntimeCacheRemove(CacheKey),
     GitStatus(&'a gitstatus::Query),
 }
 
 enum Response {
-    RuntimeCache(Option<Vec<u8>>),
+    CacheAcquire(Acquire),
+    CacheMutation(bool),
     GitStatus(Option<gitstatus::Snapshot>),
     Complete,
 }
@@ -210,10 +261,27 @@ async fn replace_daemon(
 
 async fn perform(socket: &Path, operation: Operation<'_>) -> protocol::Result<Response> {
     match operation {
-        Operation::RuntimeCacheGet(key) => protocol::runtime_cache_get(socket, key)
+        Operation::RuntimeCacheAcquire(key) => protocol::runtime_cache_acquire(socket, key)
             .await
-            .map(Response::RuntimeCache),
-        Operation::RuntimeCachePut(key, value) => protocol::runtime_cache_put(socket, key, value)
+            .map(|response| match response {
+                protocol::CacheAcquire::Hit(value) => {
+                    Response::CacheAcquire(Acquire::Hit(Arc::from(value)))
+                }
+                protocol::CacheAcquire::Owner(token) => {
+                    Response::CacheAcquire(Acquire::Owner(token))
+                }
+            }),
+        Operation::RuntimeCachePutOwned(key, token, value) => {
+            protocol::runtime_cache_put_owned(socket, key, token, value)
+                .await
+                .map(Response::CacheMutation)
+        }
+        Operation::RuntimeCacheRelease(key, token) => {
+            protocol::runtime_cache_release(socket, key, token)
+                .await
+                .map(Response::CacheMutation)
+        }
+        Operation::RuntimeCacheRemove(key) => protocol::runtime_cache_remove(socket, key)
             .await
             .map(|()| Response::Complete),
         Operation::GitStatus(query) => protocol::git_status(socket, query)
@@ -272,7 +340,7 @@ struct SocketGuard {
     path: PathBuf,
 }
 
-async fn serve_socket(socket: PathBuf) -> io::Result<()> {
+async fn serve_socket(socket: PathBuf, cache: RuntimeCache) -> io::Result<()> {
     prepare_directory(&socket)?;
     let Some(_lock) = acquire_lock(&socket)? else {
         return Ok(());
@@ -284,14 +352,16 @@ async fn serve_socket(socket: PathBuf) -> io::Result<()> {
         path: socket.clone(),
     };
 
-    let cache = Arc::new(RuntimeCache::new());
+    let cache = Arc::new(cache);
     let shared = Arc::new(Shared {
         cache: Arc::clone(&cache),
         shutdown: Notify::new(),
         gitstatus: Mutex::new(None),
     });
 
-    let load_task = tokio::spawn(Arc::clone(&cache).load());
+    // Load before accepting requests so a client cannot observe a cold cache
+    // while persisted entries are still being read.
+    cache.clone().load().await;
     let flush_task = tokio::spawn(Arc::clone(&cache).flush_loop());
     let mut clients = JoinSet::new();
 
@@ -314,7 +384,6 @@ async fn serve_socket(socket: PathBuf) -> io::Result<()> {
         });
     }
 
-    load_task.abort();
     flush_task.abort();
     clients.abort_all();
     while clients.join_next().await.is_some() {}
@@ -331,17 +400,35 @@ async fn handle_client(mut stream: UnixStream, shared: Arc<Shared>) -> io::Resul
         protocol::RequestHeader::ClientOutdated => {
             protocol::write_client_outdated(&mut stream).await
         }
-        protocol::RequestHeader::Operation(protocol::RUNTIME_CACHE_GET) => {
+        protocol::RequestHeader::Operation(protocol::RUNTIME_CACHE_ACQUIRE) => {
             let key = protocol::read_key(&mut stream).await?;
-            match shared.cache.get(key).await {
-                Some(value) => protocol::write_hit(&mut stream, &value).await,
-                None => protocol::write_miss(&mut stream).await,
+            match shared.cache.acquire(key).await {
+                Acquire::Hit(value) => protocol::write_cache_hit(&mut stream, &value).await,
+                Acquire::Owner(token) => protocol::write_cache_owner(&mut stream, token).await,
             }
         }
-        protocol::RequestHeader::Operation(protocol::RUNTIME_CACHE_PUT) => {
+        protocol::RequestHeader::Operation(protocol::RUNTIME_CACHE_PUT_OWNED) => {
             let key = protocol::read_key(&mut stream).await?;
+            let token = stream.read_u64().await?;
             let value = protocol::read_value(&mut stream).await?;
-            shared.cache.put(key, value).await?;
+            if shared.cache.put_owned(key, token, value).await? {
+                protocol::write_ok(&mut stream).await
+            } else {
+                protocol::write_rejected(&mut stream).await
+            }
+        }
+        protocol::RequestHeader::Operation(protocol::RUNTIME_CACHE_RELEASE) => {
+            let key = protocol::read_key(&mut stream).await?;
+            let token = stream.read_u64().await?;
+            if shared.cache.release_owned(key, token).await {
+                protocol::write_ok(&mut stream).await
+            } else {
+                protocol::write_rejected(&mut stream).await
+            }
+        }
+        protocol::RequestHeader::Operation(protocol::RUNTIME_CACHE_REMOVE) => {
+            let key = protocol::read_key(&mut stream).await?;
+            shared.cache.remove(key).await?;
             protocol::write_ok(&mut stream).await
         }
         protocol::RequestHeader::Operation(protocol::RESET) => {
@@ -575,6 +662,37 @@ mod tests {
             Instance::development("one".to_owned())
                 .unwrap()
                 .socket_path()
+        );
+
+        let production_cache = Instance::Production.runtime_cache_path().unwrap();
+        let first_cache = Instance::development("one".to_owned())
+            .unwrap()
+            .runtime_cache_path()
+            .unwrap();
+        let second_cache = Instance::development("two".to_owned())
+            .unwrap()
+            .runtime_cache_path()
+            .unwrap();
+        assert_eq!(production_cache.file_name().unwrap(), "runtime-v2.bin");
+        assert_eq!(
+            Instance::Production.runtime_cache_file_name(),
+            "runtime-v2.bin"
+        );
+        assert_ne!(production_cache, first_cache);
+        assert_ne!(first_cache, second_cache);
+        assert_eq!(
+            first_cache,
+            Instance::development("one".to_owned())
+                .unwrap()
+                .runtime_cache_path()
+                .unwrap()
+        );
+        assert!(
+            first_cache
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("runtime-v2-dev-")
         );
     }
 

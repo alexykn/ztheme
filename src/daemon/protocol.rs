@@ -11,19 +11,23 @@ use tokio::time::timeout;
 use crate::cache::{CacheKey, MAX_VALUE_BYTES, validate_value};
 use crate::gitstatus::{Query, Snapshot};
 
-pub(super) const VERSION: u16 = 1;
-pub(super) const RUNTIME_CACHE_GET: u8 = 1;
-pub(super) const RUNTIME_CACHE_PUT: u8 = 2;
+pub(super) const VERSION: u16 = 2;
+pub(super) const RUNTIME_CACHE_ACQUIRE: u8 = 1;
+pub(super) const RUNTIME_CACHE_PUT_OWNED: u8 = 2;
+pub(super) const RUNTIME_CACHE_RELEASE: u8 = 3;
 pub(super) const RESET: u8 = 4;
 pub(super) const GIT_STATUS: u8 = 5;
-pub(super) const MISS: u8 = 0;
-pub(super) const HIT: u8 = 1;
-pub(super) const OK: u8 = 2;
+pub(super) const RUNTIME_CACHE_REMOVE: u8 = 6;
+pub(super) const CACHE_HIT: u8 = 1;
+pub(super) const CACHE_OWNER: u8 = 2;
+pub(super) const OK: u8 = 3;
+pub(super) const REJECTED: u8 = 4;
 
 const MAGIC: [u8; 2] = *b"ZT";
 const DAEMON_OUTDATED: u8 = 0xfe;
 const CLIENT_OUTDATED: u8 = 0xff;
 const EXCHANGE_TIMEOUT: Duration = Duration::from_millis(25);
+const CACHE_ACQUIRE_TIMEOUT: Duration = Duration::from_millis(500);
 const GIT_TIMEOUT: Duration = Duration::from_millis(500);
 const MAX_PATH_BYTES: usize = 16 * 1024;
 const MAX_GIT_TEXT_BYTES: usize = 16 * 1024;
@@ -56,33 +60,67 @@ impl From<io::Error> for Error {
     }
 }
 
-pub(super) async fn runtime_cache_get(socket: &Path, key: CacheKey) -> Result<Option<Vec<u8>>> {
-    exchange(socket, async |stream| {
-        write_request(stream, RUNTIME_CACHE_GET, Some(key)).await?;
+pub(super) enum CacheAcquire {
+    Hit(Vec<u8>),
+    Owner(u64),
+}
+
+pub(super) async fn runtime_cache_acquire(socket: &Path, key: CacheKey) -> Result<CacheAcquire> {
+    exchange_with_timeout(socket, CACHE_ACQUIRE_TIMEOUT, async |stream| {
+        write_request(stream, RUNTIME_CACHE_ACQUIRE).await?;
+        write_key(stream, key).await?;
         match read_response(stream).await? {
-            MISS => Ok(None),
-            HIT => {
-                let length = usize::try_from(stream.read_u32().await?)
-                    .map_err(|_| invalid_data("invalid cache value length"))?;
-                if length > MAX_VALUE_BYTES {
-                    return Err(invalid_data("cache value exceeds size limit").into());
-                }
-                let mut bytes = vec![0; length];
-                stream.read_exact(&mut bytes).await?;
-                validate_value(&bytes)?;
-                Ok(Some(bytes))
-            }
-            _ => Err(invalid_data("invalid cache response").into()),
+            CACHE_HIT => Ok(CacheAcquire::Hit(read_value(stream).await?)),
+            CACHE_OWNER => Ok(CacheAcquire::Owner(stream.read_u64().await?)),
+            _ => Err(invalid_data("invalid cache acquire response").into()),
         }
     })
     .await
 }
 
-pub(super) async fn runtime_cache_put(socket: &Path, key: CacheKey, value: &[u8]) -> Result<()> {
+pub(super) async fn runtime_cache_put_owned(
+    socket: &Path,
+    key: CacheKey,
+    token: u64,
+    value: &[u8],
+) -> Result<bool> {
     exchange(socket, async |stream| {
-        write_request(stream, RUNTIME_CACHE_PUT, Some(key)).await?;
+        write_request(stream, RUNTIME_CACHE_PUT_OWNED).await?;
+        write_key(stream, key).await?;
+        stream.write_u64(token).await?;
         stream.write_u32(u32_len(value)?).await?;
         stream.write_all(value).await?;
+        match read_response(stream).await? {
+            OK => Ok(true),
+            REJECTED => Ok(false),
+            _ => Err(invalid_data("invalid cache put response").into()),
+        }
+    })
+    .await
+}
+
+pub(super) async fn runtime_cache_release(
+    socket: &Path,
+    key: CacheKey,
+    token: u64,
+) -> Result<bool> {
+    exchange(socket, async |stream| {
+        write_request(stream, RUNTIME_CACHE_RELEASE).await?;
+        write_key(stream, key).await?;
+        stream.write_u64(token).await?;
+        match read_response(stream).await? {
+            OK => Ok(true),
+            REJECTED => Ok(false),
+            _ => Err(invalid_data("invalid cache release response").into()),
+        }
+    })
+    .await
+}
+
+pub(super) async fn runtime_cache_remove(socket: &Path, key: CacheKey) -> Result<()> {
+    exchange(socket, async |stream| {
+        write_request(stream, RUNTIME_CACHE_REMOVE).await?;
+        write_key(stream, key).await?;
         expect_ok(stream).await
     })
     .await
@@ -90,7 +128,7 @@ pub(super) async fn runtime_cache_put(socket: &Path, key: CacheKey, value: &[u8]
 
 pub(super) async fn reset(socket: &Path) -> Result<()> {
     exchange(socket, async |stream| {
-        write_request(stream, RESET, None).await?;
+        write_request(stream, RESET).await?;
         expect_ok(stream).await
     })
     .await
@@ -98,7 +136,7 @@ pub(super) async fn reset(socket: &Path) -> Result<()> {
 
 pub(super) async fn git_status(socket: &Path, query: &Query) -> Result<Option<Snapshot>> {
     exchange_with_timeout(socket, GIT_TIMEOUT, async |stream| {
-        write_request(stream, GIT_STATUS, None).await?;
+        write_request(stream, GIT_STATUS).await?;
         write_query(stream, query).await?;
         match read_response(stream).await? {
             GIT_NONE => Ok(None),
@@ -138,7 +176,9 @@ pub(super) async fn read_query(stream: &mut UnixStream) -> io::Result<Query> {
 }
 
 pub(super) async fn read_key(stream: &mut UnixStream) -> io::Result<CacheKey> {
-    Ok(CacheKey::from_value(stream.read_u64().await?))
+    let mut key = [0; 32];
+    stream.read_exact(&mut key).await?;
+    Ok(CacheKey::from_digest(key))
 }
 
 pub(super) async fn read_value(stream: &mut UnixStream) -> io::Result<Vec<u8>> {
@@ -153,18 +193,23 @@ pub(super) async fn read_value(stream: &mut UnixStream) -> io::Result<Vec<u8>> {
     Ok(bytes)
 }
 
-pub(super) async fn write_miss(stream: &mut UnixStream) -> io::Result<()> {
-    stream.write_u8(MISS).await
-}
-
-pub(super) async fn write_hit(stream: &mut UnixStream, value: &[u8]) -> io::Result<()> {
-    stream.write_u8(HIT).await?;
+pub(super) async fn write_cache_hit(stream: &mut UnixStream, value: &[u8]) -> io::Result<()> {
+    stream.write_u8(CACHE_HIT).await?;
     stream.write_u32(u32_len(value)?).await?;
     stream.write_all(value).await
 }
 
+pub(super) async fn write_cache_owner(stream: &mut UnixStream, token: u64) -> io::Result<()> {
+    stream.write_u8(CACHE_OWNER).await?;
+    stream.write_u64(token).await
+}
+
 pub(super) async fn write_ok(stream: &mut UnixStream) -> io::Result<()> {
     stream.write_u8(OK).await
+}
+
+pub(super) async fn write_rejected(stream: &mut UnixStream) -> io::Result<()> {
+    stream.write_u8(REJECTED).await
 }
 
 pub(super) async fn write_daemon_outdated(stream: &mut UnixStream) -> io::Result<()> {
@@ -216,18 +261,15 @@ where
     })?
 }
 
-async fn write_request(
-    stream: &mut UnixStream,
-    operation: u8,
-    key: Option<CacheKey>,
-) -> io::Result<()> {
+async fn write_request(stream: &mut UnixStream, operation: u8) -> io::Result<()> {
     stream.write_all(&MAGIC).await?;
     stream.write_u16(VERSION).await?;
     stream.write_u8(operation).await?;
-    if let Some(key) = key {
-        stream.write_u64(key.value()).await?;
-    }
     Ok(())
+}
+
+async fn write_key(stream: &mut UnixStream, key: CacheKey) -> io::Result<()> {
+    stream.write_all(&key.bytes()).await
 }
 
 async fn expect_ok(stream: &mut UnixStream) -> Result<()> {

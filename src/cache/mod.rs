@@ -8,37 +8,40 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use tokio::sync::{Mutex, Notify};
-use tokio::time::sleep;
+use tokio::time::{Instant, sleep};
 
-use crate::utils::HashBuilder;
-
-const CACHE_FILE_PREFIX: &str = "runtime-v1-";
-const CACHE_FILE_SUFFIX: &str = ".bin";
-const CACHE_FORMAT_VERSION: u16 = 1;
-const CACHE_IDENTITY_VERSION: u64 = 2;
+const CACHE_FILE_NAME: &str = "runtime-v2.bin";
+pub(crate) const CACHE_FORMAT_VERSION: u16 = 2;
 const MAX_ENTRIES: usize = 500;
 pub(crate) const MAX_VALUE_BYTES: usize = 16 * 1024;
-const SAFETY_EXPIRY: Duration = Duration::from_hours(24);
+const LEASE_DURATION: Duration = Duration::from_millis(400);
 const SAVE_DEBOUNCE: Duration = Duration::from_secs(2);
 const SAVE_RETRY: Duration = Duration::from_secs(30);
 const LAST_USED_SAVE_INTERVAL: u64 = 5 * 60;
+
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub(crate) struct CacheKey(u64);
+pub(crate) struct CacheKey([u8; 32]);
 
 impl CacheKey {
-    pub(crate) const fn from_value(value: u64) -> Self {
+    pub(crate) fn from_digest(value: [u8; 32]) -> Self {
         Self(value)
     }
 
-    pub(crate) const fn value(self) -> u64 {
+    #[cfg(test)]
+    pub(crate) fn from_value(value: u64) -> Self {
+        let mut bytes = [0; 32];
+        bytes[24..].copy_from_slice(&value.to_be_bytes());
+        Self(bytes)
+    }
+
+    pub(crate) const fn bytes(self) -> [u8; 32] {
         self.0
     }
 }
 
 #[derive(Clone, Debug)]
-struct Entry {
+pub(crate) struct Entry {
     value: Arc<[u8]>,
-    refreshed_at: u64,
     last_used_at: u64,
     persisted_last_used_at: u64,
     lru_order: u64,
@@ -48,29 +51,36 @@ impl Entry {
     fn new(value: Vec<u8>, now: u64, lru_order: u64) -> Self {
         Self {
             value: Arc::from(value),
-            refreshed_at: now,
             last_used_at: now,
             persisted_last_used_at: 0,
             lru_order,
         }
     }
+}
 
-    fn is_fresh(&self, now: u64) -> bool {
-        now.checked_sub(self.refreshed_at)
-            .is_some_and(|age| age <= SAFETY_EXPIRY.as_secs())
-    }
+struct Lease {
+    token: u64,
+    expires_at: Instant,
+    notify: Arc<Notify>,
+}
+
+pub(crate) enum Acquire {
+    Hit(Arc<[u8]>),
+    Owner(u64),
 }
 
 pub(crate) struct RuntimeCache {
-    state: Mutex<State>,
-    disk_io: Mutex<()>,
+    pub(crate) state: Mutex<State>,
+    pub(crate) disk_io: Mutex<()>,
     changed: Notify,
     path: Option<PathBuf>,
 }
 
 #[derive(Default)]
-struct State {
+pub(crate) struct State {
     entries: HashMap<CacheKey, Entry>,
+    in_flight: HashMap<CacheKey, Lease>,
+    next_token: u64,
     revision: u64,
     saved_revision: u64,
     load_epoch: u64,
@@ -79,11 +89,15 @@ struct State {
 
 impl RuntimeCache {
     pub(crate) fn new() -> Self {
+        Self::new_with_path(cache_path())
+    }
+
+    pub(crate) fn new_with_path(path: Option<PathBuf>) -> Self {
         Self {
             state: Mutex::new(State::default()),
             disk_io: Mutex::new(()),
             changed: Notify::new(),
-            path: cache_path(),
+            path,
         }
     }
 
@@ -111,7 +125,7 @@ impl RuntimeCache {
         if state.load_epoch != load_epoch {
             return;
         }
-        let mut entries: Vec<_> = loaded.entries.into_iter().collect();
+        let mut entries: Vec<_> = loaded.into_iter().collect();
         entries.sort_unstable_by_key(|(_, entry)| (entry.lru_order, entry.last_used_at));
         let shift = u64::try_from(entries.len()).unwrap_or(u64::MAX);
         for entry in state.entries.values_mut() {
@@ -123,64 +137,164 @@ impl RuntimeCache {
             state.entries.entry(key).or_insert(entry);
         }
         trim_lru(&mut state.entries);
-        if loaded.needs_rewrite {
-            state.revision = state.revision.wrapping_add(1);
-            self.changed.notify_one();
-        }
     }
 
+    #[cfg(test)]
     pub(crate) async fn get(&self, key: CacheKey) -> Option<Arc<[u8]>> {
         let now = now_epoch_seconds();
-        let mut state = self.state.lock().await;
-        state.lru_order = state.lru_order.saturating_add(1);
-        let lru_order = state.lru_order;
-        let entry = state.entries.get_mut(&key)?;
-
-        if !entry.is_fresh(now) {
-            state.entries.remove(&key);
-            state.revision = state.revision.wrapping_add(1);
-            self.changed.notify_one();
-            return None;
-        }
-
-        entry.last_used_at = now;
-        entry.lru_order = lru_order;
-        let should_persist_use =
-            now.saturating_sub(entry.persisted_last_used_at) >= LAST_USED_SAVE_INTERVAL;
-        let value = entry.value.clone();
-        if should_persist_use {
-            state.revision = state.revision.wrapping_add(1);
+        let (value, persist_use) = {
+            let mut state = self.state.lock().await;
+            touch_entry(&mut state, key, now)
+        }?;
+        if persist_use {
             self.changed.notify_one();
         }
         Some(value)
     }
 
+    #[cfg(test)]
     pub(crate) async fn put(&self, key: CacheKey, value: Vec<u8>) -> io::Result<()> {
         validate_value(&value)?;
         let now = now_epoch_seconds();
         let mut state = self.state.lock().await;
-        state.lru_order = state.lru_order.saturating_add(1);
-        let lru_order = state.lru_order;
-        state.entries.insert(key, Entry::new(value, now, lru_order));
-        trim_lru(&mut state.entries);
+        insert_entry(&mut state, key, value, now);
         state.revision = state.revision.wrapping_add(1);
         self.changed.notify_one();
         Ok(())
     }
 
-    pub(crate) async fn clear(&self) -> io::Result<()> {
-        // The revision produced by this in-memory clear, captured under the
-        // state lock. A concurrent put after the lock is released advances the
-        // state revision again; `saved_revision` must record the clear's
-        // revision, not the state's current one, so the concurrent entry stays
-        // dirty and is later persisted by `flush_latest`.
-        let clear_revision = {
+    pub(crate) async fn acquire(&self, key: CacheKey) -> Acquire {
+        enum Decision {
+            Hit(Arc<[u8]>, bool),
+            Owner(u64),
+            Wait {
+                notify: Arc<Notify>,
+                deadline: Instant,
+            },
+        }
+
+        loop {
+            let decision = {
+                let mut state = self.state.lock().await;
+                if let Some((value, persist_use)) =
+                    touch_entry(&mut state, key, now_epoch_seconds())
+                {
+                    Decision::Hit(value, persist_use)
+                } else {
+                    let now = Instant::now();
+                    if state
+                        .in_flight
+                        .get(&key)
+                        .is_some_and(|lease| lease.expires_at <= now)
+                        && let Some(lease) = state.in_flight.remove(&key)
+                    {
+                        lease.notify.notify_waiters();
+                    }
+                    if let Some(lease) = state.in_flight.get(&key) {
+                        Decision::Wait {
+                            notify: Arc::clone(&lease.notify),
+                            deadline: lease.expires_at,
+                        }
+                    } else {
+                        state.next_token = state.next_token.wrapping_add(1);
+                        let token = state.next_token;
+                        state.in_flight.insert(
+                            key,
+                            Lease {
+                                token,
+                                expires_at: now + LEASE_DURATION,
+                                notify: Arc::new(Notify::new()),
+                            },
+                        );
+                        Decision::Owner(token)
+                    }
+                }
+            };
+
+            match decision {
+                Decision::Hit(value, persist_use) => {
+                    if persist_use {
+                        self.changed.notify_one();
+                    }
+                    return Acquire::Hit(value);
+                }
+                Decision::Owner(token) => return Acquire::Owner(token),
+                Decision::Wait { notify, deadline } => {
+                    let notified = notify.notified();
+                    let _ = tokio::time::timeout_at(deadline, notified).await;
+                }
+            }
+        }
+    }
+
+    pub(crate) async fn put_owned(
+        &self,
+        key: CacheKey,
+        token: u64,
+        value: Vec<u8>,
+    ) -> io::Result<bool> {
+        validate_value(&value)?;
+        let notify = {
             let mut state = self.state.lock().await;
+            let Some(lease) = state.in_flight.get(&key) else {
+                return Ok(false);
+            };
+            if lease.token != token {
+                return Ok(false);
+            }
+            let notify = Arc::clone(&lease.notify);
+            state.in_flight.remove(&key);
+            insert_entry(&mut state, key, value, now_epoch_seconds());
+            state.revision = state.revision.wrapping_add(1);
+            notify
+        };
+        notify.notify_waiters();
+        self.changed.notify_one();
+        Ok(true)
+    }
+
+    pub(crate) async fn release_owned(&self, key: CacheKey, token: u64) -> bool {
+        let notify = {
+            let mut state = self.state.lock().await;
+            let Some(lease) = state.in_flight.get(&key) else {
+                return false;
+            };
+            if lease.token != token {
+                return false;
+            }
+            let notify = Arc::clone(&lease.notify);
+            state.in_flight.remove(&key);
+            notify
+        };
+        notify.notify_waiters();
+        true
+    }
+
+    pub(crate) async fn remove(&self, key: CacheKey) -> io::Result<()> {
+        let mut state = self.state.lock().await;
+        if state.entries.remove(&key).is_some() {
+            state.revision = state.revision.wrapping_add(1);
+            self.changed.notify_one();
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn clear(&self) -> io::Result<()> {
+        let (clear_revision, leases) = {
+            let mut state = self.state.lock().await;
+            let leases = state
+                .in_flight
+                .drain()
+                .map(|(_, lease)| lease.notify)
+                .collect::<Vec<_>>();
             state.entries.clear();
             state.load_epoch = state.load_epoch.wrapping_add(1);
             state.revision = state.revision.wrapping_add(1);
-            state.revision
+            (state.revision, leases)
         };
+        for lease in leases {
+            lease.notify_waiters();
+        }
 
         let path = self.path.clone();
         let _disk = self.disk_io.lock().await;
@@ -243,6 +357,26 @@ impl RuntimeCache {
     }
 }
 
+fn touch_entry(state: &mut State, key: CacheKey, now: u64) -> Option<(Arc<[u8]>, bool)> {
+    state.lru_order = state.lru_order.saturating_add(1);
+    let lru_order = state.lru_order;
+    let entry = state.entries.get_mut(&key)?;
+    entry.last_used_at = now;
+    entry.lru_order = lru_order;
+    let persist_use = now.saturating_sub(entry.persisted_last_used_at) >= LAST_USED_SAVE_INTERVAL;
+    if persist_use {
+        state.revision = state.revision.wrapping_add(1);
+    }
+    Some((entry.value.clone(), persist_use))
+}
+
+fn insert_entry(state: &mut State, key: CacheKey, value: Vec<u8>, now: u64) {
+    state.lru_order = state.lru_order.saturating_add(1);
+    let lru_order = state.lru_order;
+    state.entries.insert(key, Entry::new(value, now, lru_order));
+    trim_lru(&mut state.entries);
+}
+
 fn trim_lru(entries: &mut HashMap<CacheKey, Entry>) {
     while entries.len() > MAX_ENTRIES {
         let Some(oldest) = entries
@@ -257,12 +391,11 @@ fn trim_lru(entries: &mut HashMap<CacheKey, Entry>) {
 }
 
 fn cache_path() -> Option<PathBuf> {
-    cache_root().map(|root| {
-        root.join("ztheme").join(format!(
-            "{CACHE_FILE_PREFIX}{}{CACHE_FILE_SUFFIX}",
-            cache_identity()
-        ))
-    })
+    path_for_file_name(CACHE_FILE_NAME)
+}
+
+pub(crate) fn path_for_file_name(file_name: &str) -> Option<PathBuf> {
+    cache_root().map(|root| root.join("ztheme").join(file_name))
 }
 
 fn cache_root() -> Option<PathBuf> {
@@ -279,17 +412,6 @@ fn cache_root() -> Option<PathBuf> {
         .map(|home| home.join(".cache"))
 }
 
-fn cache_identity() -> String {
-    let mut hash = HashBuilder::new(b"ztheme-runtime-cache-identity-v2");
-    hash.add_u64(b"cache-identity-version", CACHE_IDENTITY_VERSION);
-    hash.add_u64(b"cache-format-version", u64::from(CACHE_FORMAT_VERSION));
-    hash.add_bytes(b"package-version", env!("CARGO_PKG_VERSION").as_bytes());
-    if let Ok(executable) = env::current_exe() {
-        hash.add_path(b"executable", &executable);
-    }
-    format!("{:016x}", hash.finish())
-}
-
 pub(crate) fn validate_value(value: &[u8]) -> io::Result<()> {
     if value.len() > MAX_VALUE_BYTES {
         return Err(io::Error::new(
@@ -301,11 +423,9 @@ pub(crate) fn validate_value(value: &[u8]) -> io::Result<()> {
 }
 
 fn now_epoch_seconds() -> u64 {
-    epoch_duration(SystemTime::now()).map_or(0, |duration| duration.as_secs())
-}
-
-fn epoch_duration(time: SystemTime) -> Option<Duration> {
-    time.duration_since(UNIX_EPOCH).ok()
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_secs())
 }
 
 #[cfg(test)]
@@ -316,13 +436,11 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::Duration;
 
-    use tokio::sync::{Mutex, Notify};
+    use tokio::sync::Notify;
 
-    use super::{
-        CACHE_FILE_PREFIX, CACHE_FILE_SUFFIX, CacheKey, Entry, MAX_VALUE_BYTES, RuntimeCache,
-        SAFETY_EXPIRY, State, disk, trim_lru,
-    };
+    use super::{Acquire, CacheKey, Entry, MAX_VALUE_BYTES, RuntimeCache, State, disk, trim_lru};
 
     static SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
@@ -332,10 +450,10 @@ mod tests {
         fn new() -> Self {
             let sequence = SEQUENCE.fetch_add(1, Ordering::Relaxed);
             let path = std::env::temp_dir().join(format!(
-                "ztheme-cache-race-test-{}-{sequence}",
+                "ztheme-cache-test-{}-{sequence}",
                 std::process::id()
             ));
-            fs::create_dir(&path).unwrap();
+            fs::create_dir_all(&path).unwrap();
             fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
             Self(path)
         }
@@ -353,8 +471,8 @@ mod tests {
 
     fn disk_backed_cache(path: PathBuf) -> Arc<RuntimeCache> {
         Arc::new(RuntimeCache {
-            state: Mutex::new(State::default()),
-            disk_io: Mutex::new(()),
+            state: tokio::sync::Mutex::new(State::default()),
+            disk_io: tokio::sync::Mutex::new(()),
             changed: Notify::new(),
             path: Some(path),
         })
@@ -363,21 +481,14 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn clear_keeps_concurrent_puts_dirty_until_flushed() {
         let directory = TestDirectory::new();
-        let path = directory.path().join(format!(
-            "{CACHE_FILE_PREFIX}{:016x}{CACHE_FILE_SUFFIX}",
-            1_u64
-        ));
+        let path = directory.path().join("runtime-v2.bin");
         let cache = disk_backed_cache(path.clone());
-
-        // Seed a persisted entry so the disk file exists before the clear.
         cache
             .put(CacheKey::from_value(1), b"first".to_vec())
             .await
             .unwrap();
         cache.flush_latest().await.unwrap();
 
-        // Hold the disk lock so clear's in-memory phase is separated from its
-        // disk deletion; the spawned clear must block before touching disk.
         let disk_guard = cache.disk_io.lock().await;
         let clear_task = {
             let cache = Arc::clone(&cache);
@@ -389,63 +500,53 @@ mod tests {
             }
             tokio::task::yield_now().await;
         }
-
-        // A put while deletion is pending is a concurrent mutation: it must
-        // stay dirty even after clear reports success.
         cache
             .put(CacheKey::from_value(2), b"second".to_vec())
             .await
             .unwrap();
         drop(disk_guard);
         clear_task.await.unwrap().unwrap();
-
-        // The state revision advanced past the clear's captured revision, so
-        // the concurrent entry is still dirty and must be persisted by a later
-        // flush rather than being silently marked as saved.
         {
             let state = cache.state.lock().await;
             assert_ne!(state.revision, state.saved_revision);
         }
         cache.flush_latest().await.unwrap();
         let loaded = disk::load(&path).unwrap();
-        assert_eq!(loaded.entries.len(), 1);
-        assert_eq!(&*loaded.entries[&CacheKey::from_value(2)].value, b"second");
-        assert!(!loaded.entries.contains_key(&CacheKey::from_value(1)));
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(&*loaded[&CacheKey::from_value(2)].value, b"second");
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn clear_without_concurrent_mutation_is_fully_persisted() {
+    async fn clear_is_scoped_to_one_persistent_path() {
         let directory = TestDirectory::new();
-        let path = directory.path().join(format!(
-            "{CACHE_FILE_PREFIX}{:016x}{CACHE_FILE_SUFFIX}",
-            2_u64
-        ));
-        let cache = disk_backed_cache(path.clone());
-
-        cache
-            .put(CacheKey::from_value(1), b"value".to_vec())
+        let first_path = directory.path().join("runtime-v2-dev-one.bin");
+        let second_path = directory.path().join("runtime-v2-dev-two.bin");
+        let first = disk_backed_cache(first_path.clone());
+        let second = disk_backed_cache(second_path.clone());
+        first
+            .put(CacheKey::from_value(1), b"first".to_vec())
             .await
             .unwrap();
-        cache.flush_latest().await.unwrap();
+        second
+            .put(CacheKey::from_value(2), b"second".to_vec())
+            .await
+            .unwrap();
+        first.flush_latest().await.unwrap();
+        second.flush_latest().await.unwrap();
 
-        cache.clear().await.unwrap();
-        assert!(!path.exists());
-        assert!(!cache.flush_latest().await.unwrap());
-    }
+        first.clear().await.unwrap();
 
-    #[test]
-    fn entry_freshness_has_an_exact_safety_boundary() {
-        let entry = Entry::new(Vec::new(), 100, 1);
-        assert!(entry.is_fresh(100 + SAFETY_EXPIRY.as_secs()));
-        assert!(!entry.is_fresh(101 + SAFETY_EXPIRY.as_secs()));
-        assert!(!entry.is_fresh(99));
+        assert!(!first_path.exists());
+        assert_eq!(
+            &*disk::load(&second_path).unwrap()[&CacheKey::from_value(2)].value,
+            b"second"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
     async fn runtime_cache_inserts_retrieves_and_rejects_oversized_values() {
         let cache = RuntimeCache::new();
         let key = CacheKey::from_value(7);
-
         cache.put(key, b"value".to_vec()).await.unwrap();
         assert_eq!(cache.get(key).await.as_deref(), Some(b"value".as_slice()));
         assert!(cache.put(key, vec![0; MAX_VALUE_BYTES + 1]).await.is_err());
@@ -460,10 +561,131 @@ mod tests {
                 Entry::new(Vec::new(), 1, order),
             );
         }
-
         trim_lru(&mut entries);
         assert_eq!(entries.len(), 500);
         assert!(!entries.contains_key(&CacheKey::from_value(0)));
         assert!(entries.contains_key(&CacheKey::from_value(500)));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn lru_recency_preserves_a_revisited_old_entry() {
+        let cache = RuntimeCache::new();
+        for value in 0..500 {
+            cache
+                .put(CacheKey::from_value(value), vec![value.to_le_bytes()[0]])
+                .await
+                .unwrap();
+        }
+        assert!(cache.get(CacheKey::from_value(0)).await.is_some());
+        cache
+            .put(CacheKey::from_value(500), vec![500_u16.to_le_bytes()[0]])
+            .await
+            .unwrap();
+
+        assert_eq!(
+            cache.get(CacheKey::from_value(0)).await.as_deref(),
+            Some([0_u8].as_slice())
+        );
+        assert!(cache.get(CacheKey::from_value(1)).await.is_none());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn lru_recency_survives_persistence_and_restart() {
+        let directory = TestDirectory::new();
+        let path = directory.path().join("runtime-v2.bin");
+        let cache = disk_backed_cache(path.clone());
+        for value in 0..500 {
+            cache
+                .put(CacheKey::from_value(value), vec![value.to_le_bytes()[0]])
+                .await
+                .unwrap();
+        }
+        cache.flush_latest().await.unwrap();
+        assert!(cache.get(CacheKey::from_value(0)).await.is_some());
+        cache.flush_latest().await.unwrap();
+        cache
+            .put(CacheKey::from_value(500), vec![500_u16.to_le_bytes()[0]])
+            .await
+            .unwrap();
+        cache.flush_latest().await.unwrap();
+
+        let restored = disk_backed_cache(path);
+        restored.clone().load().await;
+        assert!(restored.get(CacheKey::from_value(0)).await.is_some());
+        assert!(restored.get(CacheKey::from_value(1)).await.is_none());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn concurrent_acquires_have_one_owner() {
+        let cache = Arc::new(RuntimeCache::new());
+        let key = CacheKey::from_value(9);
+        let owner = cache.acquire(key).await;
+        let token = match owner {
+            Acquire::Owner(token) => token,
+            Acquire::Hit(_) => panic!("unexpected cache hit"),
+        };
+        let mut waiters = Vec::new();
+        for _ in 0..8 {
+            let cache = Arc::clone(&cache);
+            waiters.push(tokio::spawn(async move { cache.acquire(key).await }));
+        }
+        tokio::task::yield_now().await;
+        assert!(
+            cache
+                .put_owned(key, token, b"value".to_vec())
+                .await
+                .unwrap()
+        );
+        for waiter in waiters {
+            assert!(matches!(waiter.await.unwrap(), Acquire::Hit(_)));
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn expired_owner_cannot_overwrite_a_replacement() {
+        let cache = Arc::new(RuntimeCache::new());
+        let key = CacheKey::from_value(10);
+        let first = match cache.acquire(key).await {
+            Acquire::Owner(token) => token,
+            Acquire::Hit(_) => panic!("unexpected cache hit"),
+        };
+        tokio::time::sleep(Duration::from_millis(425)).await;
+        let second = match cache.acquire(key).await {
+            Acquire::Owner(token) => token,
+            Acquire::Hit(_) => panic!("unexpected cache hit"),
+        };
+        assert_ne!(first, second);
+        assert!(
+            !cache
+                .put_owned(key, first, b"stale".to_vec())
+                .await
+                .unwrap()
+        );
+        assert!(
+            cache
+                .put_owned(key, second, b"fresh".to_vec())
+                .await
+                .unwrap()
+        );
+        assert_eq!(cache.get(key).await.as_deref(), Some(b"fresh".as_slice()));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn expired_owner_can_put_when_lease_was_not_reclaimed() {
+        let cache = RuntimeCache::new();
+        let key = CacheKey::from_value(11);
+        let token = match cache.acquire(key).await {
+            Acquire::Owner(token) => token,
+            Acquire::Hit(_) => panic!("unexpected cache hit"),
+        };
+        tokio::time::sleep(Duration::from_millis(425)).await;
+
+        assert!(
+            cache
+                .put_owned(key, token, b"value".to_vec())
+                .await
+                .unwrap()
+        );
+        assert_eq!(cache.get(key).await.as_deref(), Some(b"value".as_slice()));
     }
 }
