@@ -764,7 +764,7 @@ checksum = "e13c156562582aa81c60cb29407084cdb54c4164760106ab78e6c5b0858cf64e"
 
 [[package]]
 name = "ztheme"
-version = "1.5.0"
+version = "1.5.1"
 dependencies = [
  "clap",
  "serde",
