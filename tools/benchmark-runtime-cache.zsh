@@ -8,7 +8,7 @@ zmodload zsh/datetime
 readonly script_dir=$0:A:h
 readonly repo_root=$script_dir:h
 readonly temp_root=$(mktemp -d "/tmp/zt-runtime-cache-bench.XXXXXX")
-trap '/bin/rm -rf -- "$temp_root"' EXIT INT TERM
+trap 'shutdown_all_daemons; /bin/rm -rf -- "$temp_root"' EXIT INT TERM
 
 readonly compiler=$(command -v cc)
 readonly measured_prompts=${BENCHMARK_MEASURED_PROMPTS:-1000}
@@ -388,6 +388,27 @@ shutdown_server_process() {
     done
     print -u2 -- "$label: daemon did not stop during restart"
     return 1
+}
+
+shutdown_all_daemons() {
+    local runtime_dir helper socket lock server_pid
+    for runtime_dir in "$temp_root"/*/runtime(N); do
+        helper="${runtime_dir:h}/shutdown-daemon"
+        [[ -x "$helper" ]] || continue
+        for socket in "$runtime_dir"/*.sock(N); do
+            lock="${socket%.sock}.lock"
+            if [[ -r "$lock" ]]; then
+                read -r server_pid < "$lock"
+                if kill -0 "$server_pid" 2>/dev/null; then
+                    "$helper" "$socket" || true
+                else
+                    /bin/rm -f -- "$socket" "$lock"
+                fi
+            else
+                /bin/rm -f -- "$socket"
+            fi
+        done
+    done
 }
 
 measure_persisted_restart() {

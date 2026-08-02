@@ -81,8 +81,11 @@ plus the client-daemon round trip:
 | `git-dirty` | 64 files + 256 untracked + 1 modified | 1624 | 2162 |
 | `git-large` | 20,000 files across 200 directories, clean | 18,406 | 20,229 |
 
-The first git prompt after a daemon start pays an additional one-time
-`gitstatusd` spawn cost: 189 ms in this run.
+The first git prompt after a daemon start is markedly slower (189 ms in this
+run), but the harness does not isolate that cost: the first-request timing
+combines client startup, the daemon's lazy `gitstatusd` spawn, and the initial
+worktree scan. The warm rows above are the steady state after that one-time
+startup.
 
 Git status is the dominant prompt cost at scale: a small clean repository
 (~0.4 ms) costs about the same as a runtime-only warm prompt, a dirty tree
