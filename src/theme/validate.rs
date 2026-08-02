@@ -4,9 +4,10 @@ use std::io;
 use crate::runtime::Runtime;
 
 use super::{
-    MAX_LAYOUT_LINES, MAX_LAYOUT_SEGMENTS, MAX_SEGMENT_SPACING, SegmentId, Spacing, Theme,
-    ValidatedLayout, contains_control, git_symbol_values, highlight_style, invalid, palette_color,
-    style_open, valid_color, valid_identifier, valid_syntax_style_name,
+    LayoutSegment, MAX_LAYOUT_LINES, MAX_LAYOUT_SEGMENTS, MAX_SEGMENT_SPACING, SegmentId, Spacing,
+    Theme, ValidatedLayout, contains_control, git_symbol_values, highlight_style, invalid,
+    palette_color, segments::valid_custom_identifier, style_open, valid_color, valid_identifier,
+    valid_syntax_style_name,
 };
 
 pub(super) fn validate(theme: &Theme) -> io::Result<ValidatedLayout> {
@@ -20,6 +21,7 @@ pub(super) fn validate(theme: &Theme) -> io::Result<ValidatedLayout> {
             return Err(invalid(format!("missing segments.{}", runtime.name())));
         }
     }
+    validate_custom_segments(theme)?;
     for (name, color) in &theme.palette {
         if !valid_identifier(name) {
             return Err(invalid(format!("invalid palette name `{name}`")));
@@ -60,11 +62,11 @@ pub(super) fn validate(theme: &Theme) -> io::Result<ValidatedLayout> {
         let mut parsed = Vec::with_capacity(line.len());
         for name in line {
             let segment = parse_layout_segment(name, theme)?;
-            if !seen.insert(segment) {
+            if !seen.insert(segment.clone()) {
                 return Err(invalid(format!("segment `{name}` appears more than once")));
             }
-            if segment.is_async() {
-                asynchronous.push(segment);
+            if let Some(async_segment) = segment.asynchronous() {
+                asynchronous.push(async_segment);
             }
             parsed.push(segment);
             total += 1;
@@ -80,7 +82,7 @@ pub(super) fn validate(theme: &Theme) -> io::Result<ValidatedLayout> {
                 "segment `{name}` is not allowed in the right prompt"
             )));
         }
-        if !seen.insert(segment) {
+        if !seen.insert(segment.clone()) {
             return Err(invalid(format!("segment `{name}` appears more than once")));
         }
         right.push(segment);
@@ -90,7 +92,7 @@ pub(super) fn validate(theme: &Theme) -> io::Result<ValidatedLayout> {
         return Err(invalid("layout contains more than 64 segments"));
     }
 
-    if let Some((line_index, item_index)) = find_segment(&lines, SegmentId::Character)
+    if let Some((line_index, item_index)) = find_segment(&lines, LayoutSegment::is_character)
         && (line_index + 1 != lines.len() || item_index + 1 != lines[line_index].len())
     {
         return Err(invalid(
@@ -105,23 +107,56 @@ pub(super) fn validate(theme: &Theme) -> io::Result<ValidatedLayout> {
     })
 }
 
-fn parse_layout_segment(name: &str, theme: &Theme) -> io::Result<SegmentId> {
-    let segment =
-        SegmentId::parse(name).ok_or_else(|| invalid(format!("unknown segment `{name}`")))?;
-    if let SegmentId::Runtime(runtime) = segment
-        && !theme.segments.runtimes.contains_key(runtime.name())
-    {
-        return Err(invalid(format!(
-            "missing configuration for runtime segment `{name}`"
-        )));
+fn parse_layout_segment(name: &str, theme: &Theme) -> io::Result<LayoutSegment> {
+    if let Some(segment) = SegmentId::parse(name) {
+        if let SegmentId::Runtime(runtime) = segment
+            && !theme.segments.runtimes.contains_key(runtime.name())
+        {
+            return Err(invalid(format!(
+                "missing configuration for runtime segment `{name}`"
+            )));
+        }
+        return Ok(LayoutSegment::BuiltIn(segment));
     }
-    Ok(segment)
+    if valid_custom_identifier(name) {
+        if !theme.segments.custom.contains_key(name) {
+            return Err(invalid(format!(
+                "missing configuration for custom segment `{name}`"
+            )));
+        }
+        return Ok(LayoutSegment::Custom(name.to_owned()));
+    }
+    Err(invalid(format!("unknown segment `{name}`")))
 }
 
-fn find_segment(lines: &[Vec<SegmentId>], needle: SegmentId) -> Option<(usize, usize)> {
+fn validate_custom_segments(theme: &Theme) -> io::Result<()> {
+    for (name, custom) in &theme.segments.custom {
+        if !valid_custom_identifier(name) {
+            return Err(invalid(format!("invalid custom segment id `{name}`")));
+        }
+        for (field, value) in [
+            ("prefix", custom.prefix.as_str()),
+            ("suffix", custom.suffix.as_str()),
+        ] {
+            if contains_control(value) {
+                return Err(invalid(format!(
+                    "segments.custom.{name}.{field} contains a control character"
+                )));
+            }
+        }
+        style_open(&custom.style, theme)?;
+        validate_segment_spacing(name, custom.spacing)?;
+    }
+    Ok(())
+}
+
+fn find_segment(
+    lines: &[Vec<LayoutSegment>],
+    needle: impl Fn(&LayoutSegment) -> bool,
+) -> Option<(usize, usize)> {
     lines.iter().enumerate().find_map(|(line_index, line)| {
         line.iter()
-            .position(|segment| *segment == needle)
+            .position(&needle)
             .map(|item_index| (line_index, item_index))
     })
 }

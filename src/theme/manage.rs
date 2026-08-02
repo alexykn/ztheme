@@ -9,9 +9,9 @@ use std::process::{self, Command};
 use crate::runtime::Runtime;
 
 use super::{
-    BUNDLED_THEMES, CompiledTheme, Config, DEFAULT_THEME_SELECTOR, SegmentId, Style, Theme,
-    bundled_theme, config_root, configured_theme, invalid, resolve_color, theme_path,
-    valid_identifier,
+    BUNDLED_THEMES, CompiledTheme, DEFAULT_THEME_SELECTOR, LayoutSegment, SegmentId, Style, Theme,
+    bundled_theme, config_root, configured_theme, default_config, invalid, load_config,
+    resolve_color, theme_path, valid_identifier,
 };
 
 const PALETTE_ROLES: [&str; 7] = [
@@ -155,11 +155,11 @@ pub(crate) fn persist(selector: &str) -> io::Result<PathBuf> {
         Err(error) if error.kind() == io::ErrorKind::NotFound => path.clone(),
         Err(error) => return Err(error),
     };
-    let content = toml::to_string(&Config {
-        version: super::THEME_VERSION,
-        theme: selector.to_owned(),
-    })
-    .map_err(io::Error::other)?;
+    // Update only the theme selector so unrelated configuration such as
+    // [custom_segments] is preserved across `theme apply`.
+    let mut config = load_config()?.unwrap_or_else(default_config);
+    selector.clone_into(&mut config.theme);
+    let content = toml::to_string(&config).map_err(io::Error::other)?;
     atomic_write(&target, content.as_bytes())?;
     Ok(path)
 }
@@ -337,13 +337,21 @@ fn render_layout(output: &mut String, layout: &super::ValidatedLayout) {
     }
 }
 
-fn summarize_segments(segments: &[SegmentId]) -> String {
+fn summarize_segments(segments: &[LayoutSegment]) -> String {
     let mut parts = Vec::new();
     let mut index = 0;
     while index < segments.len() {
-        if matches!(segments[index], SegmentId::Runtime(_)) {
+        if matches!(
+            segments[index],
+            LayoutSegment::BuiltIn(SegmentId::Runtime(_))
+        ) {
             let start = index;
-            while index < segments.len() && matches!(segments[index], SegmentId::Runtime(_)) {
+            while index < segments.len()
+                && matches!(
+                    segments[index],
+                    LayoutSegment::BuiltIn(SegmentId::Runtime(_))
+                )
+            {
                 index += 1;
             }
             parts.push(format!("runtimes({})", index - start));
@@ -397,19 +405,23 @@ fn render_example(output: &mut String, compiled: &CompiledTheme, color: bool) ->
 }
 
 fn render_example_segments(
-    segments: &[SegmentId],
+    segments: &[LayoutSegment],
     theme: &Theme,
     color: bool,
 ) -> io::Result<String> {
     let mut fragments = Vec::new();
     for segment in segments {
         let fragment = match segment {
-            SegmentId::Directory => sample_directory(theme, color)?,
-            SegmentId::Git => sample_git(theme, color)?,
-            SegmentId::Runtime(Runtime::Python) => sample_python(theme, color)?,
-            SegmentId::Runtime(_) => String::new(),
-            SegmentId::Character => sample_character(theme, color)?,
-            SegmentId::Status => sample_status(theme, color)?,
+            LayoutSegment::BuiltIn(SegmentId::Directory) => sample_directory(theme, color)?,
+            LayoutSegment::BuiltIn(SegmentId::Git) => sample_git(theme, color)?,
+            LayoutSegment::BuiltIn(SegmentId::Runtime(Runtime::Python)) => {
+                sample_python(theme, color)?
+            }
+            LayoutSegment::BuiltIn(SegmentId::Runtime(_)) | LayoutSegment::Custom(_) => {
+                String::new()
+            }
+            LayoutSegment::BuiltIn(SegmentId::Character) => sample_character(theme, color)?,
+            LayoutSegment::BuiltIn(SegmentId::Status) => sample_status(theme, color)?,
         };
         if !fragment.is_empty() {
             fragments.push(fragment);

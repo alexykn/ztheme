@@ -50,6 +50,15 @@ into a one-time cost per shell. The client also isolates per-shell state
 command execution out of the shared daemon, where it would couple shells
 through one event loop.
 
+## Segments
+
+Synchronous prompt segments (directory, status, character, and user-defined
+segments) are Zsh functions invoked once per prompt by a generic dispatcher.
+Custom segments are opt-in per file, validated at init/reload time, and
+embedded or sourced before the shell starts. Git and runtime segments remain
+client-computed and asynchronous. See [Segments](docs/segments.md) for the
+complete contract, allowlist, header format, and examples.
+
 ## End-to-end prompt flow
 
 ```text
@@ -148,11 +157,20 @@ src/
 │   └── protocol.rs
 ├── setup/
 └── theme/
+    ├── mod.rs
+    ├── schema.rs
+    ├── validate.rs
+    ├── zsh.rs
+    ├── async_theme.rs
+    ├── manage.rs
+    └── segments.rs
 ```
 
 The larger `mod.rs` files intentionally keep each subsystem's primary
 execution path local. New files are reserved for independent algorithms or
-compatibility boundaries such as wire and disk formats.
+compatibility boundaries such as wire and disk formats. `theme/segments.rs`
+holds the custom-segment id grammar, allowlist validation, and file/header
+resolution used only at init and reload time.
 
 ## Subsystem ownership
 

@@ -3,7 +3,7 @@ use std::fmt::Write as _;
 use std::io;
 
 use super::{
-    CompiledTheme, DirectoryTheme, InputTheme, Layout, STYLE_RESET, SegmentId, Segments, Theme,
+    CompiledTheme, InputTheme, Layout, LayoutSegment, STYLE_RESET, SegmentId, Segments, Theme,
     ValidatedLayout, async_theme, highlight_style, line_editor_style, prompt_literal, shell_quote,
     style_open,
 };
@@ -30,7 +30,9 @@ impl CompiledTheme {
             "__ZTHEME_HAS_ASYNC",
             u64::from(!self.layout.asynchronous.is_empty()),
         );
-        emit_immediate_theme(&mut output, theme, &theme.segments)?;
+        emit_input_theme(&mut output, theme, &theme.input)?;
+        emit_segment_themes(&mut output, theme, &theme.segments, &self.layout)?;
+        emit_sync_segments(&mut output, &self.layout);
 
         emit_segment_state(&mut output, &self.layout);
         emit_clear_async(&mut output, &self.layout.asynchronous);
@@ -38,75 +40,6 @@ impl CompiledTheme {
         emit_layout_renderer(&mut output, &self.layout, &theme.layout);
         Ok(output)
     }
-}
-
-fn emit_immediate_theme(output: &mut String, theme: &Theme, segments: &Segments) -> io::Result<()> {
-    emit_input_theme(output, theme, &theme.input)?;
-    emit_directory_theme(output, theme, &segments.directory)?;
-
-    let character = &segments.character;
-    let character_before = " ".repeat(usize::from(character.spacing.before));
-    let character_after = " ".repeat(usize::from(character.spacing.after));
-    scalar(
-        output,
-        "__ZTHEME_CHARACTER_SUCCESS",
-        &format!(
-            "{character_before}{}{}{}{}{STYLE_RESET}{character_after}",
-            style_open(&character.success_style, theme)?,
-            prompt_literal(&character.prefix),
-            prompt_literal(&character.success),
-            prompt_literal(&character.suffix)
-        ),
-    );
-    scalar(
-        output,
-        "__ZTHEME_CHARACTER_ERROR",
-        &format!(
-            "{character_before}{}{}{}{}{STYLE_RESET}{character_after}",
-            style_open(&character.error_style, theme)?,
-            prompt_literal(&character.prefix),
-            prompt_literal(&character.error),
-            prompt_literal(&character.suffix)
-        ),
-    );
-
-    let status = &segments.status;
-    let status_before = " ".repeat(usize::from(status.spacing.before));
-    let status_after = " ".repeat(usize::from(status.spacing.after));
-    integer(
-        output,
-        "__ZTHEME_STATUS_SHOW_SUCCESS",
-        u64::from(status.show_success),
-    );
-    scalar(
-        output,
-        "__ZTHEME_STATUS_SUCCESS",
-        &format!(
-            "{status_before}{}{}{}{}{STYLE_RESET}{status_after}",
-            style_open(&status.success_style, theme)?,
-            prompt_literal(&status.prefix),
-            prompt_literal(&status.success_symbol),
-            prompt_literal(&status.suffix)
-        ),
-    );
-    scalar(
-        output,
-        "__ZTHEME_STATUS_OPEN",
-        &format!(
-            "{status_before}{}{}",
-            style_open(&status.style, theme)?,
-            prompt_literal(&status.prefix)
-        ),
-    );
-    scalar(
-        output,
-        "__ZTHEME_STATUS_CLOSE",
-        &format!(
-            "{}{STYLE_RESET}{status_after}",
-            prompt_literal(&status.suffix)
-        ),
-    );
-    Ok(())
 }
 
 fn emit_input_theme(output: &mut String, theme: &Theme, input: &InputTheme) -> io::Result<()> {
@@ -137,13 +70,19 @@ fn emit_input_theme(output: &mut String, theme: &Theme, input: &InputTheme) -> i
     Ok(())
 }
 
-fn emit_directory_theme(
+/// Emits the styling shared by every synchronous segment: the per-variant
+/// OPEN/CLOSE maps `_ztheme_segment_render` wraps values with, the raw
+/// character/status symbols, and the directory truncation parameters.
+fn emit_segment_themes(
     output: &mut String,
     theme: &Theme,
-    directory: &DirectoryTheme,
+    segments: &Segments,
+    layout: &ValidatedLayout,
 ) -> io::Result<()> {
-    let before = " ".repeat(usize::from(directory.spacing.before));
-    let after = " ".repeat(usize::from(directory.spacing.after));
+    output.push_str("typeset -gA __ZTHEME_SEGMENT_OPEN\n");
+    output.push_str("typeset -gA __ZTHEME_SEGMENT_CLOSE\n");
+
+    let directory = &segments.directory;
     scalar(
         output,
         "__ZTHEME_DIRECTORY_HOME",
@@ -153,20 +92,6 @@ fn emit_directory_theme(
         output,
         "__ZTHEME_DIRECTORY_TRUNCATION",
         &prompt_literal(&directory.truncation_symbol),
-    );
-    scalar(
-        output,
-        "__ZTHEME_DIRECTORY_OPEN",
-        &format!(
-            "{before}{}{}",
-            style_open(&directory.style, theme)?,
-            prompt_literal(&directory.prefix)
-        ),
-    );
-    scalar(
-        output,
-        "__ZTHEME_DIRECTORY_CLOSE",
-        &format!("{}{STYLE_RESET}{after}", prompt_literal(&directory.suffix)),
     );
     integer(
         output,
@@ -183,19 +108,153 @@ fn emit_directory_theme(
         "__ZTHEME_DIRECTORY_MAXIMUM",
         u64::from(directory.width.maximum),
     );
+    emit_style_entry(
+        output,
+        theme,
+        &directory.style,
+        &directory.prefix,
+        &directory.suffix,
+        directory.spacing,
+        "directory:default",
+    )?;
+
+    let character = &segments.character;
+    scalar(
+        output,
+        "__ZTHEME_CHARACTER_SUCCESS_SYMBOL",
+        &prompt_literal(&character.success),
+    );
+    scalar(
+        output,
+        "__ZTHEME_CHARACTER_ERROR_SYMBOL",
+        &prompt_literal(&character.error),
+    );
+    emit_style_entry(
+        output,
+        theme,
+        &character.success_style,
+        &character.prefix,
+        &character.suffix,
+        character.spacing,
+        "character:success",
+    )?;
+    emit_style_entry(
+        output,
+        theme,
+        &character.error_style,
+        &character.prefix,
+        &character.suffix,
+        character.spacing,
+        "character:error",
+    )?;
+
+    let status = &segments.status;
+    integer(
+        output,
+        "__ZTHEME_STATUS_SHOW_SUCCESS",
+        u64::from(status.show_success),
+    );
+    scalar(
+        output,
+        "__ZTHEME_STATUS_SUCCESS_SYMBOL",
+        &prompt_literal(&status.success_symbol),
+    );
+    emit_style_entry(
+        output,
+        theme,
+        &status.success_style,
+        &status.prefix,
+        &status.suffix,
+        status.spacing,
+        "status:success",
+    )?;
+    emit_style_entry(
+        output,
+        theme,
+        &status.style,
+        &status.prefix,
+        &status.suffix,
+        status.spacing,
+        "status:error",
+    )?;
+
+    emit_custom_style_entries(output, theme, segments, layout)
+}
+
+fn emit_custom_style_entries(
+    output: &mut String,
+    theme: &Theme,
+    segments: &Segments,
+    layout: &ValidatedLayout,
+) -> io::Result<()> {
+    for segment in layout.lines.iter().flatten().chain(layout.right.iter()) {
+        let LayoutSegment::Custom(id) = segment else {
+            continue;
+        };
+        let Some(custom) = segments.custom.get(id) else {
+            continue;
+        };
+        emit_style_entry(
+            output,
+            theme,
+            &custom.style,
+            &custom.prefix,
+            &custom.suffix,
+            custom.spacing,
+            &format!("{id}:default"),
+        )?;
+    }
     Ok(())
+}
+
+fn emit_style_entry(
+    output: &mut String,
+    theme: &Theme,
+    style: &super::Style,
+    prefix: &str,
+    suffix: &str,
+    spacing: super::Spacing,
+    key: &str,
+) -> io::Result<()> {
+    let before = " ".repeat(usize::from(spacing.before));
+    let after = " ".repeat(usize::from(spacing.after));
+    let open = format!(
+        "{before}{}{}",
+        style_open(style, theme)?,
+        prompt_literal(prefix)
+    );
+    let close = format!("{}{STYLE_RESET}{after}", prompt_literal(suffix));
+    writeln!(
+        output,
+        "__ZTHEME_SEGMENT_OPEN[{key}]={}",
+        shell_quote(&open)
+    )
+    .expect("writing to a String cannot fail");
+    writeln!(
+        output,
+        "__ZTHEME_SEGMENT_CLOSE[{key}]={}",
+        shell_quote(&close)
+    )
+    .expect("writing to a String cannot fail");
+    Ok(())
+}
+
+/// Emits the ordered list of synchronous (shell-provided) segment ids present
+/// in the active layout. The ids are validated identifiers, safe to emit
+/// unquoted.
+fn emit_sync_segments(output: &mut String, layout: &ValidatedLayout) {
+    output.push_str("typeset -ga __ZTHEME_SYNC_SEGMENTS=(");
+    for id in layout.sync_ids() {
+        output.push_str(id);
+        output.push(' ');
+    }
+    output.push_str(")\n");
 }
 
 fn emit_segment_state(output: &mut String, layout: &ValidatedLayout) {
     let mut seen = HashSet::new();
-    for segment in layout
-        .lines
-        .iter()
-        .flatten()
-        .chain(layout.right.iter())
-        .copied()
-    {
-        if seen.insert(segment) {
+    for segment in layout.lines.iter().flatten().chain(layout.right.iter()) {
+        if seen.insert(segment.name()) {
             writeln!(output, "typeset -g {}=''", segment_variable(segment))
                 .expect("writing to a String cannot fail");
         }
@@ -205,8 +264,12 @@ fn emit_segment_state(output: &mut String, layout: &ValidatedLayout) {
 fn emit_clear_async(output: &mut String, segments: &[SegmentId]) {
     output.push_str("_ztheme_clear_async_segments() {\n    emulate -L zsh\n");
     for segment in segments {
-        writeln!(output, "    {}=''", segment_variable(*segment))
-            .expect("writing to a String cannot fail");
+        writeln!(
+            output,
+            "    {}=''",
+            segment_variable(&LayoutSegment::BuiltIn(*segment))
+        )
+        .expect("writing to a String cannot fail");
     }
     output.push_str("}\n");
 }
@@ -214,7 +277,7 @@ fn emit_clear_async(output: &mut String, segments: &[SegmentId]) {
 fn emit_assign_async(output: &mut String, segments: &[SegmentId]) {
     output.push_str("_ztheme_assign_async_segment() {\n    emulate -L zsh\n    case \"$1\" in\n");
     for segment in segments {
-        let variable = segment_variable(*segment);
+        let variable = segment_variable(&LayoutSegment::BuiltIn(*segment));
         writeln!(
             output,
             "        {})\n            [[ \"${{{variable}}}\" == \"$2\" ]] && return 1\n            {variable}=\"$2\"\n            ;;\n",
@@ -235,7 +298,7 @@ fn emit_layout_renderer(output: &mut String, layout: &ValidatedLayout, source: &
     for (index, line) in layout.lines.iter().enumerate() {
         output.push_str("    line=''\n    separator=''\n");
         for segment in line {
-            emit_layout_segment(output, *segment, "line");
+            emit_layout_segment(output, segment, "line");
         }
         output.push_str("    prompt+=\"$line\"\n");
         if index + 1 != layout.lines.len() {
@@ -245,14 +308,14 @@ fn emit_layout_renderer(output: &mut String, layout: &ValidatedLayout, source: &
 
     output.push_str("    line=''\n    separator=''\n");
     for segment in &layout.right {
-        emit_layout_segment(output, *segment, "line");
+        emit_layout_segment(output, segment, "line");
     }
     output.push_str(
         "    right=\"$line\"\n    ZTHEME_PROMPT=\"$prompt\"\n    ZTHEME_RPROMPT=\"$right\"\n}\n",
     );
 }
 
-fn emit_layout_segment(output: &mut String, segment: SegmentId, target: &str) {
+fn emit_layout_segment(output: &mut String, segment: &LayoutSegment, target: &str) {
     let variable = segment_variable(segment);
     writeln!(
         output,
@@ -261,7 +324,7 @@ fn emit_layout_segment(output: &mut String, segment: SegmentId, target: &str) {
     .expect("writing to a String cannot fail");
 }
 
-fn segment_variable(segment: SegmentId) -> String {
+fn segment_variable(segment: &LayoutSegment) -> String {
     format!("ZTHEME_SEGMENT_{}", segment.name().to_ascii_uppercase())
 }
 

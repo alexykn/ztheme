@@ -529,8 +529,7 @@ fn zsh_renders_immediate_segments_and_shell_defaults() {
 eval "$("$ZTHEME_TEST_BIN" init zsh --theme minimal)" || exit 10
 cd "$HOME"
 COLUMNS=20
-_ztheme_format_directory
-_ztheme_format_status 7
+_ztheme_compute_sync_segments 7
 _ztheme_render_layout
 print -r -- "directory=$ZTHEME_SEGMENT_DIRECTORY"
 print -r -- "character=$ZTHEME_SEGMENT_CHARACTER"
@@ -572,6 +571,292 @@ eval "$("$ZTHEME_TEST_BIN" init zsh --theme minimal)" || exit 22
 "#,
     );
     assert_success(&preserved);
+}
+
+/// Theme overlay enabling a `clock` custom segment in the layout. `prefix` is
+/// embedded as a TOML literal and must not contain quotes or backslashes.
+fn clock_theme(prefix: &str) -> String {
+    format!(
+        "version = 1\n\
+         \n\
+         [layout]\n\
+         lines = [[\"directory\"], [\"clock\"], [\"character\"]]\n\
+         right = [\"status\"]\n\
+         separator = \" | \"\n\
+         blank_line_before = false\n\
+         [segments.custom.clock]\n\
+         prefix = \"{prefix}\"\n\
+         style = {{ foreground = \"accent\" }}\n"
+    )
+}
+
+/// Writes config.toml with `enabled` and a matching clock segment file that
+/// renders `value`.
+fn install_clock_segment(sandbox: &Sandbox, enabled: &[&str], value: &str) {
+    let config_dir = sandbox.config.join("ztheme");
+    fs::create_dir_all(config_dir.join("segments")).unwrap();
+    fs::write(
+        config_dir.join("config.toml"),
+        format!(
+            "version = 1\ntheme = \"clocktheme\"\n[custom_segments]\nenabled = [{enabled}]\n",
+            enabled = enabled
+                .iter()
+                .map(|id| format!("\"{id}\""))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    )
+    .unwrap();
+    fs::write(
+        config_dir.join("segments/clock.zsh"),
+        format!(
+            "# ztheme-segment-v1: clock\n\
+             ztheme_segment_clock() {{\n\
+               emulate -L zsh\n\
+               _ztheme_segment_render clock {value}\n\
+             }}\n"
+        ),
+    )
+    .unwrap();
+}
+
+#[test]
+fn custom_segments_load_and_render_through_the_theme() {
+    let sandbox = Sandbox::new();
+    sandbox.install_fake_gitstatus();
+    sandbox.write_theme("clocktheme", &clock_theme("☀ "));
+    install_clock_segment(&sandbox, &["clock"], "'clock-value'");
+
+    let script = r#"
+eval "$("$ZTHEME_TEST_BIN" init zsh --theme clocktheme)" || exit 10
+_ztheme_compute_sync_segments 0
+_ztheme_render_layout
+print -r -- "prompt=$ZTHEME_PROMPT"
+[[ "$ZTHEME_PROMPT" == *clock-value* ]] || exit 11
+[[ "$ZTHEME_SEGMENT_CLOCK" == *"☀ "*clock-value* ]] || exit 12
+"#;
+    let output = sandbox.zsh(script);
+    assert_success(&output);
+
+    // The generated integration sources exactly the active segment file.
+    let generated = sandbox
+        .command()
+        .args(["init", "zsh", "--theme", "clocktheme"])
+        .output()
+        .unwrap();
+    assert_success(&generated);
+    let source = String::from_utf8(generated.stdout).unwrap();
+    assert!(source.contains("builtin source --"));
+    assert!(source.contains("ztheme_segment_clock"));
+    assert!(!source.contains("segments/cpu.zsh"));
+}
+
+#[test]
+fn previous_status_reaches_custom_segments_through_the_dispatcher() {
+    let sandbox = Sandbox::new();
+    sandbox.install_fake_gitstatus();
+    sandbox.write_theme("clocktheme", &clock_theme(""));
+    install_clock_segment(&sandbox, &["clock"], "\"$1\"");
+
+    let script = r#"
+eval "$("$ZTHEME_TEST_BIN" init zsh --theme clocktheme)" || exit 10
+false
+_ztheme_compute_sync_segments "$?"
+[[ "$ZTHEME_SEGMENT_STATUS" == *1* ]] || exit 11
+[[ "$ZTHEME_SEGMENT_CLOCK" == *1* ]] || exit 12
+[[ "$ZTHEME_SEGMENT_CLOCK" != *0* ]] || exit 13
+true
+_ztheme_compute_sync_segments "$?"
+[[ "$ZTHEME_SEGMENT_STATUS" != *1* ]] || exit 14
+"#;
+    let output = sandbox.zsh(script);
+    assert_success(&output);
+}
+
+#[test]
+fn reload_stops_dispatching_a_removed_custom_segment() {
+    let sandbox = Sandbox::new();
+    sandbox.install_fake_gitstatus();
+    sandbox.write_theme("clocktheme", &clock_theme(""));
+    install_clock_segment(&sandbox, &["clock"], "'clock-value'");
+
+    let minimal = r#"version = 1
+[layout]
+lines = [["directory"], ["character"]]
+right = ["status"]
+separator = " | "
+blank_line_before = false
+"#;
+
+    // One shell: initialize with the clock segment, rewrite the theme without
+    // it, reload, and confirm the regenerated integration stops dispatching it.
+    let script = format!(
+        r#"
+eval "$("$ZTHEME_TEST_BIN" init zsh --theme clocktheme)" || exit 10
+_ztheme_compute_sync_segments 0
+_ztheme_render_layout
+[[ "$ZTHEME_PROMPT" == *clock-value* ]] || exit 11
+cat > {} <<'ZTEOF'
+{minimal}
+ZTEOF
+ztheme theme reload >/dev/null || exit 12
+_ztheme_compute_sync_segments 0
+_ztheme_render_layout
+[[ "$ZTHEME_PROMPT" != *clock-value* ]] || exit 13
+"#,
+        shell_word(&sandbox.theme_path("clocktheme")),
+    );
+    let output = sandbox.zsh(&script);
+    assert_success(&output);
+}
+
+#[test]
+fn theme_apply_preserves_the_custom_segment_allowlist() {
+    let sandbox = Sandbox::new();
+    sandbox.install_fake_gitstatus();
+    sandbox.write_theme("clocktheme", &clock_theme(""));
+    sandbox.write_theme("minimal", &minimal_theme(""));
+    install_clock_segment(&sandbox, &["clock"], "'x'");
+
+    let script = r#"
+eval "$("$ZTHEME_TEST_BIN" init zsh --theme clocktheme)" || exit 10
+ztheme theme apply minimal >/dev/null || exit 11
+"#;
+    let output = sandbox.zsh(script);
+    assert_success(&output);
+
+    let config = fs::read_to_string(sandbox.config.join("ztheme/config.toml")).unwrap();
+    assert!(config.contains("theme = \"minimal\""), "{config}");
+    assert!(config.contains("enabled = [\"clock\"]"), "{config}");
+}
+
+#[test]
+fn custom_segment_paths_with_spaces_and_quotes_are_sourced_safely() {
+    let sandbox = Sandbox::new();
+    sandbox.install_fake_gitstatus();
+    let quoted = sandbox.config.join("quoted 'config");
+    let config_dir = quoted.join("ztheme");
+    fs::create_dir_all(config_dir.join("segments")).unwrap();
+    fs::write(
+        config_dir.join("config.toml"),
+        "version = 1\ntheme = \"clocktheme\"\n[custom_segments]\nenabled = [\"clock\"]\n",
+    )
+    .unwrap();
+    fs::write(
+        config_dir.join("segments/clock.zsh"),
+        "# ztheme-segment-v1: clock\n\
+         ztheme_segment_clock() {\n\
+           emulate -L zsh\n\
+           _ztheme_segment_render clock 'quoted-path-value'\n\
+         }\n",
+    )
+    .unwrap();
+    fs::create_dir_all(quoted.join("ztheme/themes")).unwrap();
+    fs::write(
+        quoted.join("ztheme/themes/clocktheme.toml"),
+        clock_theme(""),
+    )
+    .unwrap();
+
+    let mut command = sandbox.zsh_command();
+    command.env("XDG_CONFIG_HOME", &quoted);
+    let script = r#"
+eval "$("$ZTHEME_TEST_BIN" init zsh --theme clocktheme)" || exit 10
+_ztheme_compute_sync_segments 0
+[[ "$ZTHEME_SEGMENT_CLOCK" == *quoted-path-value* ]] || exit 11
+"#;
+    let output = command.args(["-dfc", script]).output().unwrap();
+    assert_success(&output);
+}
+
+#[test]
+fn missing_segment_function_is_reported_during_initialization() {
+    let sandbox = Sandbox::new();
+    sandbox.install_fake_gitstatus();
+    sandbox.write_theme("clocktheme", &clock_theme(""));
+    let config_dir = sandbox.config.join("ztheme");
+    fs::create_dir_all(config_dir.join("segments")).unwrap();
+    fs::write(
+        config_dir.join("config.toml"),
+        "version = 1\ntheme = \"clocktheme\"\n[custom_segments]\nenabled = [\"clock\"]\n",
+    )
+    .unwrap();
+    fs::write(
+        config_dir.join("segments/clock.zsh"),
+        "# ztheme-segment-v1: clock\nztheme_segment_watch() { :; }\n",
+    )
+    .unwrap();
+
+    let script = r#"
+ztheme_test_init() {
+    eval "$("$ZTHEME_TEST_BIN" init zsh --theme clocktheme)"
+}
+ztheme_test_init
+init_status=$?
+print -r -- "init_status=$init_status"
+[[ -n "${ZTHEME_SHELL_INITIALIZED:-}" ]] && exit 20
+[[ "$init_status" == 1 ]] || exit 21
+"#;
+    let output = sandbox.zsh(script);
+    assert_success(&output);
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("init_status=1"), "stdout: {stdout}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("did not define"), "stderr: {stderr}");
+}
+
+#[test]
+fn sync_segment_output_matches_the_pre_refactor_bytes() {
+    let sandbox = Sandbox::new();
+    sandbox.install_fake_gitstatus();
+    let overlay = r##"
+version = 1
+[layout]
+lines = [["directory"], ["character"]]
+right = ["status"]
+separator = " | "
+blank_line_before = false
+[segments.directory]
+prefix = ""
+suffix = ""
+home_symbol = "~"
+truncation_symbol = "…"
+style = { foreground = "#112233", underline = true, bold = false }
+spacing = { before = 0, after = 0 }
+width = { percent = 50, minimum = 5, maximum = 60 }
+[segments.character]
+prefix = "p"
+suffix = "s"
+success = "❯"
+error = "✗"
+success_style = { foreground = "#445566" }
+error_style = { foreground = "#778899" }
+spacing = { before = 1, after = 1 }
+[segments.status]
+prefix = "S"
+suffix = "e"
+show_success = false
+success_symbol = "✓"
+style = { foreground = "#990011" }
+success_style = { foreground = "#00aa22" }
+spacing = { before = 0, after = 0 }
+"##;
+    sandbox.write_theme("fixed", overlay);
+
+    let script = r#"
+eval "$("$ZTHEME_TEST_BIN" init zsh --theme fixed)" || exit 10
+cd "$HOME"
+COLUMNS=100
+_ztheme_compute_sync_segments 0
+[[ "$ZTHEME_SEGMENT_DIRECTORY" == '%F{#112233}%U%50<…<~%<<%f%k%b%u%s' ]] || exit 11
+[[ "$ZTHEME_SEGMENT_CHARACTER" == ' %F{#445566}p❯s%f%k%b%u%s ' ]] || exit 12
+[[ -z "$ZTHEME_SEGMENT_STATUS" ]] || exit 13
+_ztheme_compute_sync_segments 5
+[[ "$ZTHEME_SEGMENT_CHARACTER" == ' %F{#778899}p✗s%f%k%b%u%s ' ]] || exit 14
+[[ "$ZTHEME_SEGMENT_STATUS" == '%F{#990011}S5e%f%k%b%u%s' ]] || exit 15
+"#;
+    let output = sandbox.zsh(script);
+    assert_success(&output);
 }
 
 #[test]

@@ -7,6 +7,24 @@ use serde::{Deserialize, Serialize};
 pub(super) struct Config {
     pub(super) version: u64,
     pub(super) theme: String,
+
+    #[serde(default)]
+    #[serde(skip_serializing_if = "CustomSegmentsConfig::is_empty")]
+    pub(super) custom_segments: CustomSegmentsConfig,
+}
+
+#[derive(Clone, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct CustomSegmentsConfig {
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub(super) enabled: Vec<String>,
+}
+
+impl CustomSegmentsConfig {
+    fn is_empty(&self) -> bool {
+        self.enabled.is_empty()
+    }
 }
 
 #[derive(Clone, Deserialize)]
@@ -49,8 +67,24 @@ pub(super) struct Segments {
     pub(super) git: GitTheme,
     pub(super) character: CharacterTheme,
     pub(super) status: StatusTheme,
+
+    #[serde(default)]
+    pub(super) custom: BTreeMap<String, CustomSegmentTheme>,
+
     #[serde(flatten)]
     pub(super) runtimes: BTreeMap<String, RuntimeTheme>,
+}
+
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct CustomSegmentTheme {
+    #[serde(default)]
+    pub(super) prefix: String,
+    #[serde(default)]
+    pub(super) suffix: String,
+    pub(super) style: Style,
+    #[serde(default)]
+    pub(super) spacing: Spacing,
 }
 
 #[derive(Clone, Deserialize)]

@@ -4,6 +4,7 @@ mod protocol;
 pub(crate) use client::serve_client;
 
 use std::env;
+use std::fmt::Write as _;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -23,6 +24,9 @@ pub(crate) use protocol::prompt_text;
 const REQUEST_TIMEOUT: Duration = Duration::from_millis(550);
 const ZSH_DEFAULTS: &str = include_str!("../../shell/defaults.zsh");
 const ZSH_INTEGRATION: &str = include_str!("../../shell/ztheme.zsh");
+const ZSH_DIRECTORY_SEGMENT: &str = include_str!("../../shell/segments/directory.zsh");
+const ZSH_STATUS_SEGMENT: &str = include_str!("../../shell/segments/status.zsh");
+const ZSH_CHARACTER_SEGMENT: &str = include_str!("../../shell/segments/character.zsh");
 
 pub async fn snapshot(
     generation: u64,
@@ -160,6 +164,11 @@ pub fn init_zsh(instance: &daemon::Instance, selector: Option<&str>) -> io::Resu
     let instance_arguments = instance
         .development_name()
         .map_or_else(String::new, |name| format!("--dev {}", shell_quote(name)));
+    // Discover and validate enabled custom segments against config.toml and
+    // the segments directory; this is the only point that touches the
+    // filesystem or the config outside the prompt hot path.
+    let custom_segments = theme.custom_sources()?;
+    let bundled = format!("{ZSH_DIRECTORY_SEGMENT}{ZSH_STATUS_SEGMENT}{ZSH_CHARACTER_SEGMENT}");
     Ok(ZSH_INTEGRATION
         .replace("@ZTHEME_BIN@", &binary)
         .replace("@ZTHEME_INSTANCE_ARGS@", &instance_arguments)
@@ -172,7 +181,45 @@ pub fn init_zsh(instance: &daemon::Instance, selector: Option<&str>) -> io::Resu
             &shell_quote(&setup::syntax_highlighting_script().to_string_lossy()),
         )
         .replace("@ZTHEME_SHELL_DEFAULTS@", ZSH_DEFAULTS)
-        .replace("@ZTHEME_COMPILED_THEME@", &theme_zsh))
+        .replace("@ZTHEME_COMPILED_THEME@", &theme_zsh)
+        .replace("@ZTHEME_BUNDLED_SEGMENTS@", &bundled)
+        .replace(
+            "@ZTHEME_CUSTOM_SEGMENTS@",
+            &custom_segment_block(&custom_segments),
+        ))
+}
+
+/// Emits one `source` line and a declared-function check per resolved custom
+/// segment. Paths are single-quoted with the shared shell quoting; ids are
+/// validated identifiers, safe to interpolate into generated function names.
+fn custom_segment_block(sources: &[theme::ResolvedCustomSegment]) -> String {
+    let mut output = String::new();
+    for source in sources {
+        writeln!(
+            output,
+            "builtin source -- {} || return 1",
+            shell_quote(&source.path.to_string_lossy())
+        )
+        .expect("writing to a String cannot fail");
+        writeln!(
+            output,
+            "if (( ! $+functions[ztheme_segment_{}] )); then",
+            source.id
+        )
+        .expect("writing to a String cannot fail");
+        writeln!(
+            output,
+            "    builtin print -u2 -r -- {}",
+            shell_quote(&format!(
+                "ztheme: custom segment `{}` did not define ztheme_segment_{}",
+                source.id, source.id
+            ))
+        )
+        .expect("writing to a String cannot fail");
+        writeln!(output, "    return 1").expect("writing to a String cannot fail");
+        writeln!(output, "fi").expect("writing to a String cannot fail");
+    }
+    output
 }
 
 pub fn theme_zsh(instance: &daemon::Instance, selector: &str, persist: bool) -> io::Result<String> {

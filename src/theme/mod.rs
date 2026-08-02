@@ -1,9 +1,11 @@
 mod async_theme;
 mod manage;
 mod schema;
+mod segments;
 mod validate;
 mod zsh;
 
+use std::collections::HashSet;
 use std::env;
 use std::fmt::Write as _;
 use std::fs;
@@ -15,9 +17,11 @@ use crate::runtime::Runtime;
 pub use async_theme::AsyncTheme;
 pub(crate) use manage::{apply, edit, list, persist};
 use schema::{
-    Config, DirectoryTheme, GitSymbols, InputTheme, Layout, RuntimeTheme, Segments, Spacing, Style,
-    SyntaxStyle, Theme,
+    Config, CustomSegmentsConfig, GitSymbols, InputTheme, Layout, RuntimeTheme, Segments, Spacing,
+    Style, SyntaxStyle, Theme,
 };
+pub(crate) use segments::ResolvedCustomSegment;
+use segments::{resolve_custom_segments, validate_enabled_segments};
 use validate::validate;
 
 const DEFAULT_THEME_SELECTOR: &str = "catppuccin-mocha";
@@ -53,6 +57,15 @@ pub enum SegmentId {
     Status,
 }
 
+/// One entry in the validated prompt layout. Built-in segments are copied
+/// `SegmentId` values (convenient for async handling); custom user segments
+/// carry their validated identifier.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+enum LayoutSegment {
+    BuiltIn(SegmentId),
+    Custom(String),
+}
+
 #[derive(Clone)]
 pub struct CompiledTheme {
     theme: Theme,
@@ -62,9 +75,78 @@ pub struct CompiledTheme {
 
 #[derive(Clone)]
 struct ValidatedLayout {
-    lines: Vec<Vec<SegmentId>>,
-    right: Vec<SegmentId>,
+    lines: Vec<Vec<LayoutSegment>>,
+    right: Vec<LayoutSegment>,
     asynchronous: Vec<SegmentId>,
+}
+
+impl LayoutSegment {
+    fn name(&self) -> &str {
+        match self {
+            Self::BuiltIn(segment) => segment.name(),
+            Self::Custom(name) => name,
+        }
+    }
+
+    const fn asynchronous(&self) -> Option<SegmentId> {
+        match self {
+            Self::BuiltIn(segment) if segment.is_async() => Some(*segment),
+            _ => None,
+        }
+    }
+
+    fn is_right_safe(&self) -> bool {
+        match self {
+            Self::Custom(_) => true,
+            Self::BuiltIn(segment) => segment.is_right_safe(),
+        }
+    }
+
+    const fn is_character(&self) -> bool {
+        matches!(self, Self::BuiltIn(SegmentId::Character))
+    }
+}
+
+impl ValidatedLayout {
+    /// Custom segment ids present in the active layout, in deterministic
+    /// layout order, without duplicates.
+    fn custom_ids(&self) -> Vec<String> {
+        let mut seen = HashSet::new();
+        let mut ids = Vec::new();
+        for segment in self.lines.iter().flatten().chain(self.right.iter()) {
+            if let LayoutSegment::Custom(id) = segment
+                && seen.insert(id)
+            {
+                ids.push(id.clone());
+            }
+        }
+        ids
+    }
+
+    /// Shell-provided (synchronous) segment ids in layout order, without
+    /// duplicates: directory, status, character, and custom segments.
+    fn sync_ids(&self) -> Vec<&str> {
+        let mut seen = HashSet::new();
+        let mut ids = Vec::new();
+        for segment in self.lines.iter().flatten().chain(self.right.iter()) {
+            let id = match segment {
+                LayoutSegment::BuiltIn(segment)
+                    if matches!(
+                        segment,
+                        SegmentId::Directory | SegmentId::Character | SegmentId::Status
+                    ) =>
+                {
+                    segment.name()
+                }
+                LayoutSegment::Custom(id) => id.as_str(),
+                LayoutSegment::BuiltIn(_) => continue,
+            };
+            if seen.insert(id) {
+                ids.push(id);
+            }
+        }
+        ids
+    }
 }
 
 impl SegmentId {
@@ -145,6 +227,17 @@ impl CompiledTheme {
     pub(crate) fn git_enabled(&self) -> bool {
         self.layout.asynchronous.contains(&SegmentId::Git)
     }
+
+    /// Resolves and validates every custom segment used by the active layout
+    /// against `config.toml` and the segments directory. Fails init/reload
+    /// with a contextual error when an active custom segment is not enabled,
+    /// missing, non-regular, or header-invalid.
+    pub(crate) fn custom_sources(&self) -> io::Result<Vec<ResolvedCustomSegment>> {
+        let root = config_root().ok_or_else(|| invalid("cannot determine config directory"))?;
+        let config = load_config()?.unwrap_or_else(default_config);
+        validate_enabled_segments(&config.custom_segments.enabled)?;
+        resolve_custom_segments(&config, &self.layout.custom_ids(), &root)
+    }
 }
 
 fn bundled_theme(selector: &str) -> Option<&'static BundledTheme> {
@@ -154,6 +247,13 @@ fn bundled_theme(selector: &str) -> Option<&'static BundledTheme> {
 }
 
 fn configured_theme() -> io::Result<Option<String>> {
+    Ok(load_config()?.map(|config| config.theme))
+}
+
+/// Reads and validates the shared `config.toml`. All config consumers
+/// (theme selection, custom segment resolution, persistence) use this one
+/// parser and version check.
+fn load_config() -> io::Result<Option<Config>> {
     let Some(root) = config_root() else {
         return Ok(None);
     };
@@ -177,7 +277,15 @@ fn configured_theme() -> io::Result<Option<String>> {
             path.display()
         )));
     }
-    Ok(Some(config.theme))
+    Ok(Some(config))
+}
+
+fn default_config() -> Config {
+    Config {
+        version: THEME_VERSION,
+        theme: DEFAULT_THEME_SELECTOR.to_owned(),
+        custom_segments: CustomSegmentsConfig::default(),
+    }
 }
 
 fn config_root() -> Option<PathBuf> {
@@ -425,6 +533,35 @@ fn invalid(message: impl Into<String>) -> io::Error {
 }
 
 #[cfg(test)]
+pub(super) mod tests_support {
+    use std::fs;
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// Creates a temporary config root containing `ztheme/segments` and runs
+    /// `setup` against it. The returned guard removes the tree on drop.
+    pub(super) fn write_theme_files<F: FnOnce(&Path)>(setup: F) -> (PathBuf, TempConfigDir) {
+        static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+        let root = std::env::temp_dir().join(format!(
+            "ztheme-segment-test-{}-{}",
+            std::process::id(),
+            SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(root.join("ztheme/segments")).unwrap();
+        setup(&root);
+        (root.clone(), TempConfigDir(root))
+    }
+
+    pub(super) struct TempConfigDir(PathBuf);
+
+    impl Drop for TempConfigDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::{
         CATPPUCCIN_MOCHA_THEME, CompiledTheme, DEFAULT_THEME_SELECTOR, Theme, merge,
@@ -559,5 +696,109 @@ lines = [["directory"], ["character"]]
         assert!(parse_versioned("theme = \"x\"", "missing").is_err());
         assert!(parse_versioned("version = 2", "future").is_err());
         assert!(parse_versioned("version = \"1\"", "wrong type").is_err());
+    }
+
+    #[test]
+    fn configured_custom_segments_work_on_left_and_right() {
+        let overlay = r#"
+version = 1
+[layout]
+lines = [["directory", "clock"]]
+right = ["cpu", "status"]
+[segments.custom.clock]
+prefix = "☀ "
+style = { foreground = "accent" }
+[segments.custom.cpu]
+style = { foreground = "muted" }
+"#;
+        let layout = validate(&merged_theme(overlay).unwrap()).unwrap();
+        assert_eq!(layout.lines[0][1].name(), "clock");
+        assert_eq!(layout.right[0].name(), "cpu");
+        assert!(layout.asynchronous.is_empty());
+    }
+
+    #[test]
+    fn layout_custom_segment_without_configuration_fails() {
+        let overlay = r#"
+version = 1
+[layout]
+lines = [["directory", "clock"]]
+"#;
+        let error = validate_overlay(overlay).unwrap_err();
+        assert!(error.to_string().contains("missing configuration"));
+    }
+
+    #[test]
+    fn reserved_custom_segment_ids_are_rejected() {
+        for reserved in ["git", "python", "directory", "status", "character"] {
+            let overlay = format!(
+                "version = 1\n[layout]\nlines = [[\"directory\"]]\n\
+                 [segments.custom.{reserved}]\nstyle = {{ foreground = \"accent\" }}\n"
+            );
+            assert!(
+                validate_overlay(&overlay).is_err(),
+                "accepted reserved id `{reserved}`"
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_custom_segment_ids_and_layout_duplicates_are_rejected() {
+        let overlay = r#"
+version = 1
+[layout]
+lines = [["directory", "clock-time"]]
+[segments.custom.clock-time]
+style = { foreground = "accent" }
+"#;
+        assert!(validate_overlay(overlay).is_err());
+
+        let overlay = r#"
+version = 1
+[layout]
+lines = [["directory", "clock"], ["clock"]]
+[segments.custom.clock]
+style = { foreground = "accent" }
+"#;
+        let error = validate_overlay(overlay).unwrap_err();
+        assert!(error.to_string().contains("more than once"));
+    }
+
+    #[test]
+    fn unused_custom_style_entries_are_allowed() {
+        let overlay = r#"
+version = 1
+[layout]
+lines = [["directory"]]
+[segments.custom.clock]
+style = { foreground = "accent" }
+"#;
+        assert!(validate_overlay(overlay).is_ok());
+    }
+
+    #[test]
+    fn custom_segment_theme_contracts_are_validated() {
+        for overlay in [
+            // Control character in prefix.
+            "version = 1\n[layout]\nlines = [[\"clock\"]]\n[segments.custom.clock]\nprefix = \"bad\\n\"\nstyle = { foreground = \"accent\" }\n",
+            // Unknown palette color in style.
+            "version = 1\n[layout]\nlines = [[\"clock\"]]\n[segments.custom.clock]\nstyle = { foreground = \"nope\" }\n",
+            // Excessive spacing.
+            "version = 1\n[layout]\nlines = [[\"clock\"]]\n[segments.custom.clock]\nstyle = { foreground = \"accent\" }\nspacing = { after = 17 }\n",
+        ] {
+            assert!(validate_overlay(overlay).is_err(), "accepted {overlay}");
+        }
+    }
+
+    #[test]
+    fn character_position_restriction_still_holds_with_custom_segments() {
+        let overlay = r#"
+version = 1
+[layout]
+lines = [["character", "clock"]]
+[segments.custom.clock]
+style = { foreground = "accent" }
+"#;
+        assert!(validate_overlay(overlay).is_err());
     }
 }
