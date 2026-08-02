@@ -16,22 +16,32 @@ readonly warmup_prompts=${BENCHMARK_WARMUP_PROMPTS:-100}
 readonly realistic_prompts=${BENCHMARK_REALISTIC_PROMPTS:-5000}
 readonly skip_realistic=${BENCHMARK_SKIP_REALISTIC:-0}
 readonly skip_latency=${BENCHMARK_SKIP_LATENCY:-0}
-readonly baseline_source="$temp_root/baseline-source"
-readonly baseline_target="$temp_root/baseline-target"
+readonly skip_baseline=${BENCHMARK_SKIP_BASELINE:-0}
+readonly skip_git=${BENCHMARK_SKIP_GIT:-0}
+readonly git_large_files=${BENCHMARK_GIT_LARGE_FILES:-20000}
+readonly user_gitstatusd="${XDG_DATA_HOME:-$HOME/.local/share}/ztheme/gitstatus/v1.5/gitstatusd"
+typeset -a git_scenarios_measured=()
 readonly candidate_target="$temp_root/candidate-target"
-readonly baseline_archive="$temp_root/baseline.tar"
 
-print "building isolated baseline from HEAD"
-git -C "$repo_root" archive HEAD -o "$baseline_archive"
-mkdir -p "$baseline_source"
-tar -xf "$baseline_archive" -C "$baseline_source"
-cargo build --release --manifest-path "$baseline_source/Cargo.toml" \
-    --target-dir "$baseline_target" >/dev/null
+print "building current release binary"
 cargo build --release --manifest-path "$repo_root/Cargo.toml" \
     --target-dir "$candidate_target" >/dev/null
-
-readonly baseline_binary="$baseline_target/release/ztheme"
 readonly candidate_binary="$candidate_target/release/ztheme"
+if (( skip_baseline )); then
+    print "baseline comparison skipped; measuring the current binary only"
+    readonly baseline_binary="$candidate_binary"
+else
+    readonly baseline_source="$temp_root/baseline-source"
+    readonly baseline_target="$temp_root/baseline-target"
+    readonly baseline_archive="$temp_root/baseline.tar"
+    print "building isolated baseline from HEAD"
+    git -C "$repo_root" archive HEAD -o "$baseline_archive"
+    mkdir -p "$baseline_source"
+    tar -xf "$baseline_archive" -C "$baseline_source"
+    cargo build --release --manifest-path "$baseline_source/Cargo.toml" \
+        --target-dir "$baseline_target" >/dev/null
+    readonly baseline_binary="$baseline_target/release/ztheme"
+fi
 typeset -A realistic_execution_counts realistic_stale_counts realistic_hit_rates
 typeset -A warm_p50_us warm_p95_us concurrent_execution_counts
 
@@ -498,6 +508,30 @@ run_realistic_workload() {
     stop_client
 }
 
+create_git_repo() {
+    local repo_dir=$1
+    local directory_count=$2
+    local files_per_directory=$3
+    local dirty=$4
+    local i j
+    mkdir -p "$repo_dir"
+    git -C "$repo_dir" init -q -b main
+    for (( i = 1; i <= directory_count; i++ )); do
+        mkdir -p "$repo_dir/dir-$i"
+        for (( j = 1; j <= files_per_directory; j++ )); do
+            print -r -- "content $i/$j" > "$repo_dir/dir-$i/file-$j.txt"
+        done
+    done
+    git -C "$repo_dir" add -A
+    git -C "$repo_dir" -c user.name=bench -c user.email=bench@localhost commit -q -m bench
+    if (( dirty )); then
+        print -r -- "modified" >> "$repo_dir/dir-1/file-1.txt"
+        for (( i = 1; i <= 256; i++ )); do
+            print -r -- "untracked" > "$repo_dir/untracked-$i.txt"
+        done
+    fi
+}
+
 measure_build() {
     emulate -L zsh
     setopt errexit nounset pipefail
@@ -516,6 +550,18 @@ measure_build() {
     mkdir -p "$home" "$config/ztheme/themes" "$cache" "$runtime" \
         "$project" "$fixture/bin" "$fixture/scenarios"
     chmod 700 "$runtime"
+
+    git_available=0
+    if (( ! skip_git )) && [[ -x "$user_gitstatusd" ]]; then
+        mkdir -p "$fixture/data/ztheme/gitstatus/v1.5"
+        cp "$user_gitstatusd" "$fixture/data/ztheme/gitstatus/v1.5/gitstatusd"
+        chmod 700 "$fixture/data/ztheme/gitstatus/v1.5/gitstatusd"
+        git_available=1
+    elif (( skip_git )); then
+        print -r -- "$label: git scenarios skipped (BENCHMARK_SKIP_GIT=1)"
+    else
+        print -r -- "$label: git scenarios skipped: gitstatusd not found at $user_gitstatusd"
+    fi
 
     counter_file="$fixture/counter"
     print -r -- 0 > "$counter_file"
@@ -670,6 +716,72 @@ EOF
 
         measure_warm_scenario four-direct four "$four_project" "$fixture/bin:/usr/bin:/bin"
 
+        if (( git_available )); then
+            cat > "$config/ztheme/themes/gittheme.toml" <<'GEOF'
+version = 1
+[layout]
+lines = [["git"]]
+right = []
+separator = " | "
+blank_line_before = false
+[segments.git]
+prefix = "on "
+symbol = "git"
+action_prefix = " "
+changes_prefix = " "
+style = { foreground = "#f9e2af" }
+action_style = { foreground = "#f38ba8" }
+[segments.git.symbols]
+conflicted = "="
+staged = "+"
+modified = "!"
+deleted = "✘"
+untracked = "?"
+ahead = "⇡"
+behind = "⇣"
+diverged = "⇕"
+stash = "$"
+[segments.git.styles]
+conflicted = { foreground = "#f38ba8", bold = true }
+staged = { foreground = "#a6e3a1", bold = true }
+modified = { foreground = "#fab387", bold = true }
+deleted = { foreground = "#f38ba8", bold = true }
+untracked = { foreground = "#cba6f7", bold = true }
+ahead = { foreground = "#a6e3a1" }
+behind = { foreground = "#cba6f7" }
+diverged = { foreground = "#cba6f7" }
+stash = { foreground = "#89b4fa" }
+GEOF
+
+            local git_small="$fixture/scenarios/git-small"
+            local git_dirty="$fixture/scenarios/git-dirty"
+            local git_large="$fixture/scenarios/git-large"
+            local git_large_dirs=200
+            local git_large_files_per_dir=$(( git_large_files / git_large_dirs ))
+            print -r -- "$label: creating git repositories (large = $git_large_dirs dirs x $git_large_files_per_dir files)"
+            create_git_repo "$git_small" 4 16 0
+            create_git_repo "$git_dirty" 4 16 1
+            create_git_repo "$git_large" "$git_large_dirs" "$git_large_files_per_dir" 0
+
+            git_scenarios_measured=(git-small git-large git-dirty)
+            local git_path="$fixture/bin:/usr/bin:/bin"
+            measure_warm_scenario git-small gittheme "$git_small" "$git_path"
+            if [[ "$last_response_summary" != *main* ]]; then
+                print -u2 -- "$label git-small: expected clean main branch, got $last_response_summary"
+                exit 1
+            fi
+            measure_warm_scenario git-large gittheme "$git_large" "$git_path"
+            if [[ "$last_response_summary" != *main* ]]; then
+                print -u2 -- "$label git-large: expected clean main branch, got $last_response_summary"
+                exit 1
+            fi
+            measure_warm_scenario git-dirty gittheme "$git_dirty" "$git_path"
+            if [[ "$last_response_summary" != *'?'* ]]; then
+                print -u2 -- "$label git-dirty: expected untracked marker, got $last_response_summary"
+                exit 1
+            fi
+        fi
+
         local cold_one="$fixture/scenarios/cold-one"
         mkdir -p "$cold_one"
         cp "$fixture/bin/python" "$cold_one/python"
@@ -778,7 +890,7 @@ check_latency_regressions() {
 
     local scenario
     local -F 6 baseline_p50 candidate_p50 baseline_p95 candidate_p95 allowed
-    for scenario in rustup-warm shallow ordinary distant deep four-direct; do
+    for scenario in rustup-warm shallow ordinary distant deep four-direct "${git_scenarios_measured[@]}"; do
         baseline_p50=${warm_p50_us["baseline/$scenario"]}
         candidate_p50=${warm_p50_us["candidate/$scenario"]}
         allowed=$(( baseline_p50 * 0.05 ))
@@ -799,11 +911,15 @@ check_latency_regressions() {
     done
 }
 
-measure_build baseline 1 "$baseline_binary"
-measure_build candidate 2 "$candidate_binary"
-check_latency_regressions
+if (( skip_baseline )); then
+    measure_build candidate 2 "$candidate_binary"
+else
+    measure_build baseline 1 "$baseline_binary"
+    measure_build candidate 2 "$candidate_binary"
+    check_latency_regressions
 
-if (( realistic_execution_counts[candidate] >= realistic_execution_counts[baseline] )); then
-    print -u2 -- "candidate realistic workload did not execute fewer runtime commands than baseline"
-    exit 1
+    if (( realistic_execution_counts[candidate] >= realistic_execution_counts[baseline] )); then
+        print -u2 -- "candidate realistic workload did not execute fewer runtime commands than baseline"
+        exit 1
+    fi
 fi
