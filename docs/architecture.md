@@ -56,7 +56,7 @@ Synchronous prompt segments (directory, status, character, and user-defined
 segments) are Zsh functions invoked once per prompt by a generic dispatcher.
 Custom segments are opt-in per file, validated at init/reload time, and
 embedded or sourced before the shell starts. Git and runtime segments remain
-client-computed and asynchronous. See [Segments](docs/segments.md) for the
+client-computed and asynchronous. See [Segments](segments.md) for the
 complete contract, allowlist, header format, and examples.
 
 ## End-to-end prompt flow

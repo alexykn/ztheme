@@ -233,10 +233,18 @@ impl CompiledTheme {
     /// with a contextual error when an active custom segment is not enabled,
     /// missing, non-regular, or header-invalid.
     pub(crate) fn custom_sources(&self) -> io::Result<Vec<ResolvedCustomSegment>> {
-        let root = config_root().ok_or_else(|| invalid("cannot determine config directory"))?;
+        let active_ids = self.layout.custom_ids();
         let config = load_config()?.unwrap_or_else(default_config);
+
         validate_enabled_segments(&config.custom_segments.enabled)?;
-        resolve_custom_segments(&config, &self.layout.custom_ids(), &root)
+
+        if active_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let root = config_root().ok_or_else(|| invalid("cannot determine config directory"))?;
+
+        resolve_custom_segments(&config, &active_ids, &root)
     }
 }
 

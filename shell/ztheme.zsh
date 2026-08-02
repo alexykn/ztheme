@@ -46,10 +46,12 @@ fi
 # segments were validated and allowlisted by the ztheme binary and are sourced
 # here, once, during initialization; nothing in this section runs per prompt.
 #
+# Custom definitions are emitted first and bundled definitions afterward so
+# bundled segment functions win under ordinary redefinition.
 # ---------------------------------------------------------------------------
 
-@ZTHEME_BUNDLED_SEGMENTS@
 @ZTHEME_CUSTOM_SEGMENTS@
+@ZTHEME_BUNDLED_SEGMENTS@
 
 # ---------------------------------------------------------------------------
 # State
@@ -387,7 +389,10 @@ _ztheme_compute_sync_segments() {
             continue
         fi
 
-        "$function_name" "$last_status"
+        if ! "$function_name" "$last_status"; then
+            REPLY=""
+        fi
+
         typeset -g "$variable_name=$REPLY"
     done
 }
