@@ -5,7 +5,7 @@ pub(crate) use client::serve_client;
 
 use std::env;
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -13,8 +13,9 @@ use tokio::sync::oneshot;
 use tokio::task::JoinSet;
 use tokio::time::{Instant, timeout_at};
 
+use crate::cache::Acquire;
 use crate::environment::PromptEnvironment;
-use crate::runtime::{self, Runtime, RuntimeValue};
+use crate::runtime::{self, Runtime, RuntimeOutcome, RuntimeValue};
 use crate::{daemon, gitstatus, setup, theme};
 
 pub(crate) use protocol::prompt_text;
@@ -193,46 +194,241 @@ async fn runtime_values(
     active: Vec<Runtime>,
     environment: Arc<PromptEnvironment>,
 ) -> io::Result<Vec<RuntimeValue>> {
-    // Runtime discovery walks the filesystem synchronously (up to 32
-    // directories) and would otherwise block the client's single-threaded
-    // event loop, preventing the shared 550 ms deadline from firing and
-    // writing `done`. Running it on Tokio's blocking pool restores that
-    // deadline; aborting this task does not stop the underlying closure, so a
-    // superseded or expired request may briefly keep scanning before the
-    // result is dropped. That bounded worst case is accepted here because it
-    // only costs a discarded filesystem walk, while the pre-fix behavior
-    // could stall every prompt on one slow directory read.
-    let project = {
-        let cwd = cwd.clone();
-        let environment = Arc::clone(&environment);
-        tokio::task::spawn_blocking(move || {
-            let git_root = runtime::detect::worktree_root(&cwd, &environment);
-            runtime::detect::detect(&cwd, git_root.as_deref(), &environment)
-        })
-        .await
-        .map_err(|error| io::Error::other(format!("runtime discovery task failed: {error}")))?
+    let plans = build_plans(&cwd, &active, Arc::clone(&environment)).await?;
+    let (cacheable, volatile) = partition_plans(plans);
+    let cached = cached_runtime_values(
+        instance,
+        cwd.clone(),
+        active.clone(),
+        Arc::clone(&environment),
+        cacheable,
+        true,
+    );
+    let volatile_count = volatile.len();
+    let volatile = runtime::execute_plans(volatile, cwd, Arc::clone(&environment));
+    let (cached, volatile) = tokio::join!(cached, volatile);
+    let mut values = cached?;
+    values.extend(materialize_executions(
+        volatile,
+        volatile_count,
+        &environment,
+    ));
+    Ok(merge_runtime_values(values))
+}
+
+async fn build_plans(
+    cwd: &Path,
+    active: &[Runtime],
+    environment: Arc<PromptEnvironment>,
+) -> io::Result<Vec<runtime::cache::RuntimePlan>> {
+    let detection_cwd = cwd.to_path_buf();
+    let detection_active = active.to_vec();
+    let detection_environment = Arc::clone(&environment);
+    let detection = tokio::task::spawn_blocking(move || {
+        let git_root = runtime::detect::worktree_root(&detection_cwd, &detection_environment);
+        runtime::detect::detect(
+            &detection_cwd,
+            git_root.as_deref(),
+            &detection_active,
+            &detection_environment,
+        )
+    });
+
+    let base_active = active.to_vec();
+    let base_cwd = cwd.to_path_buf();
+    let base_environment = Arc::clone(&environment);
+    let base_plans = tokio::task::spawn_blocking(move || {
+        runtime::cache::resolve_base_plans(&base_active, &base_cwd, &base_environment)
+    });
+
+    let (project, base_plans) = tokio::try_join!(detection, base_plans)
+        .map_err(|error| io::Error::other(format!("runtime planning task failed: {error}")))?;
+    Ok(runtime::cache::finalize_plans(
+        cwd,
+        &project,
+        base_plans,
+        &environment,
+    ))
+}
+
+fn partition_plans(
+    plans: Vec<runtime::cache::RuntimePlan>,
+) -> (
+    Vec<runtime::cache::RuntimePlan>,
+    Vec<runtime::cache::RuntimePlan>,
+) {
+    plans.into_iter().partition(|plan| match &plan.cache {
+        runtime::cache::Cacheability::Cacheable(_) => true,
+        runtime::cache::Cacheability::Volatile(reason) => {
+            let _ = reason;
+            false
+        }
+    })
+}
+
+async fn cached_runtime_values(
+    instance: &daemon::Instance,
+    cwd: PathBuf,
+    active: Vec<Runtime>,
+    environment: Arc<PromptEnvironment>,
+    plans: Vec<runtime::cache::RuntimePlan>,
+    retry_selection: bool,
+) -> io::Result<Vec<RuntimeValue>> {
+    if plans.is_empty() {
+        return Ok(Vec::new());
+    }
+    let key = runtime::cache::cache_key(&plans, &environment);
+    let acquire = daemon::runtime_cache_acquire(instance, key).await;
+    let mut acquire = match acquire {
+        Ok(value) => value,
+        Err(error) => {
+            eprintln!("ztheme: runtime cache unavailable: {error}");
+            let expected = plans.len();
+            let executions = runtime::execute_plans(plans, cwd, Arc::clone(&environment)).await;
+            return Ok(materialize_executions(executions, expected, &environment));
+        }
     };
-    let detected = active
-        .into_iter()
-        .filter(|runtime| project.runtimes.contains(runtime))
-        .collect::<Vec<_>>();
-    let key = runtime::cache_key(&project, &detected, &environment);
 
-    match daemon::runtime_cache_get(instance, key).await {
-        Ok(Some(value)) => match runtime::decode(&value) {
-            Ok(values) => return Ok(values),
-            Err(error) => eprintln!("ztheme: invalid runtime cache entry: {error}"),
-        },
-        Ok(None) => {}
-        Err(error) => eprintln!("ztheme: runtime cache unavailable: {error}"),
-    }
+    let mut corrupt_retried = false;
+    loop {
+        match acquire {
+            Acquire::Hit(value) => match runtime::decode(&value) {
+                Ok(values) if same_runtime_set(&plans, &values) => {
+                    return Ok(values
+                        .into_iter()
+                        .map(|value| runtime::materialize(value, &environment))
+                        .collect());
+                }
+                Ok(_) | Err(_) if !corrupt_retried => {
+                    corrupt_retried = true;
+                    let _ = daemon::runtime_cache_remove(instance, key).await;
+                    acquire =
+                        daemon::runtime_cache_acquire(instance, key)
+                            .await
+                            .map_err(|error| {
+                                io::Error::other(format!(
+                                    "runtime cache reacquire failed: {error:?}"
+                                ))
+                            })?;
+                }
+                Ok(_) | Err(_) => {
+                    let expected = plans.len();
+                    let executions =
+                        runtime::execute_plans(plans, cwd, Arc::clone(&environment)).await;
+                    return Ok(materialize_executions(executions, expected, &environment));
+                }
+            },
+            Acquire::Owner(token) => {
+                let before = key;
+                let executions =
+                    runtime::execute_plans(plans.clone(), cwd.clone(), Arc::clone(&environment))
+                        .await;
+                let (values, complete) = execution_values(executions, plans.len(), &environment);
+                if !complete {
+                    let _ = daemon::runtime_cache_release(instance, key, token).await;
+                    return Ok(values);
+                }
 
-    let values = runtime::snapshot(project, detected, Arc::clone(&environment)).await;
-    let encoded = runtime::encode(&values)?;
-    if let Err(error) = daemon::runtime_cache_put(instance, key, &encoded).await {
-        eprintln!("ztheme: runtime cache write failed: {error}");
+                let refreshed = build_plans(&cwd, &active, Arc::clone(&environment)).await?;
+                let (refreshed_cacheable, _) = partition_plans(refreshed);
+                let after = runtime::cache::cache_key(&refreshed_cacheable, &environment);
+                if before != after {
+                    let _ = daemon::runtime_cache_release(instance, key, token).await;
+                    if retry_selection {
+                        return Box::pin(refreshed_runtime_values(
+                            instance,
+                            cwd,
+                            active,
+                            environment,
+                        ))
+                        .await;
+                    }
+                    return Ok(values);
+                }
+
+                let cached_values = values
+                    .iter()
+                    .map(|value| runtime::CachedRuntimeValue {
+                        runtime: value.runtime,
+                        version: value.version.clone(),
+                        label: value.label.clone(),
+                    })
+                    .collect::<Vec<_>>();
+                let encoded = runtime::encode(&cached_values)?;
+                let _ = daemon::runtime_cache_put_owned(instance, key, token, &encoded).await;
+                return Ok(values);
+            }
+        }
     }
-    Ok(values)
+}
+
+async fn refreshed_runtime_values(
+    instance: &daemon::Instance,
+    cwd: PathBuf,
+    active: Vec<Runtime>,
+    environment: Arc<PromptEnvironment>,
+) -> io::Result<Vec<RuntimeValue>> {
+    let plans = build_plans(&cwd, &active, Arc::clone(&environment)).await?;
+    let (cacheable, volatile) = partition_plans(plans);
+    let cached = cached_runtime_values(
+        instance,
+        cwd.clone(),
+        active,
+        Arc::clone(&environment),
+        cacheable,
+        false,
+    );
+    let volatile_count = volatile.len();
+    let volatile = runtime::execute_plans(volatile, cwd, Arc::clone(&environment));
+    let (cached, volatile) = tokio::join!(cached, volatile);
+    let mut values = cached?;
+    values.extend(materialize_executions(
+        volatile,
+        volatile_count,
+        &environment,
+    ));
+    Ok(merge_runtime_values(values))
+}
+
+fn same_runtime_set(
+    plans: &[runtime::cache::RuntimePlan],
+    values: &[runtime::CachedRuntimeValue],
+) -> bool {
+    let expected = plans.iter().map(|plan| plan.runtime).collect::<Vec<_>>();
+    let actual = values.iter().map(|value| value.runtime).collect::<Vec<_>>();
+    expected == actual
+}
+
+fn execution_values(
+    executions: Vec<runtime::RuntimeExecution>,
+    expected: usize,
+    environment: &PromptEnvironment,
+) -> (Vec<RuntimeValue>, bool) {
+    let mut complete = executions.len() == expected;
+    let mut values = Vec::new();
+    for execution in executions {
+        match execution.outcome {
+            RuntimeOutcome::Value(value) => values.push(runtime::materialize(value, environment)),
+            RuntimeOutcome::MissingExecutable | RuntimeOutcome::TransientFailure => {
+                complete = false;
+            }
+        }
+    }
+    (values, complete)
+}
+
+fn materialize_executions(
+    executions: Vec<runtime::RuntimeExecution>,
+    expected: usize,
+    environment: &PromptEnvironment,
+) -> Vec<RuntimeValue> {
+    execution_values(executions, expected, environment).0
+}
+
+fn merge_runtime_values(mut values: Vec<RuntimeValue>) -> Vec<RuntimeValue> {
+    values.sort_unstable_by_key(|value| value.runtime);
+    values.dedup_by_key(|value| value.runtime);
+    values
 }
 
 fn record_error(error: &io::Error) -> String {

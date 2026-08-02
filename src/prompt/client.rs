@@ -16,7 +16,7 @@ use crate::prompt::snapshot;
 use crate::theme::AsyncTheme;
 
 const REQUEST_MAGIC: &[u8] = b"ZTREQ";
-const REQUEST_VERSION: &[u8] = b"1";
+const REQUEST_VERSION: &[u8] = b"2";
 
 /// How often the client verifies that the shell that spawned it is still its
 /// parent. EOF on the request pipe is the primary lifetime signal; this
@@ -207,9 +207,19 @@ where
         conda_default_env: env_field(read_field(reader)?)?,
         perlbrew_perl: env_field(read_field(reader)?)?,
         plenv_version: env_field(read_field(reader)?)?,
+        pyenv_version: env_field(read_field(reader)?)?,
+        pyenv_dir: env_field(read_field(reader)?)?,
         rustup_toolchain: env_field(read_field(reader)?)?,
+        rustup_home: env_field(read_field(reader)?)?,
+        rbenv_dir: env_field(read_field(reader)?)?,
         rbenv_version: env_field(read_field(reader)?)?,
+        nodenv_version: env_field(read_field(reader)?)?,
+        nodenv_dir: env_field(read_field(reader)?)?,
+        plenv_dir: env_field(read_field(reader)?)?,
         ruby_version: env_field(read_field(reader)?)?,
+        java_home: env_field(read_field(reader)?)?,
+        gotoolchain: env_field(read_field(reader)?)?,
+        dotnet_root: env_field(read_field(reader)?)?,
     };
 
     Ok(Some(Request {
@@ -261,7 +271,7 @@ mod tests {
 
     use super::{REQUEST_MAGIC, REQUEST_VERSION, read_request};
 
-    const ENV_FIELD_COUNT: usize = 13;
+    const ENV_FIELD_COUNT: usize = 23;
 
     fn request(cwd: &[u8], fields: &[&[u8]]) -> Vec<u8> {
         assert_eq!(fields.len(), ENV_FIELD_COUNT);
@@ -287,6 +297,16 @@ mod tests {
             b"/home/user",
             b"",
             b"/work/tree",
+            b"",
+            b"",
+            b"",
+            b"",
+            b"",
+            b"",
+            b"",
+            b"",
+            b"",
+            b"",
             b"",
             b"",
             b"",
@@ -323,9 +343,8 @@ mod tests {
     fn non_utf8_cwd_and_environment_round_trip() {
         let mut git_dir = b"/repo-".to_vec();
         git_dir.push(0xff);
-        let fields: [&[u8]; ENV_FIELD_COUNT] = [
-            b"", b"", &git_dir, b"", b"", b"", b"", b"", b"", b"", b"", b"", b"",
-        ];
+        let mut fields: [&[u8]; ENV_FIELD_COUNT] = [b""; ENV_FIELD_COUNT];
+        fields[2] = &git_dir;
         let mut cwd = b"/cwd-".to_vec();
         cwd.push(0xfe);
         let bytes = request(&cwd, &fields);
@@ -344,13 +363,13 @@ mod tests {
         let empty: [&[u8]; ENV_FIELD_COUNT] = [b""; ENV_FIELD_COUNT];
         let valid = request(b"/work", &empty);
 
-        // bytes: ZTREQ\0 1\0 42\0 /work\0 then 13 empty fields
+        // bytes: ZTREQ\0 2\0 42\0 /work\0 then 23 empty fields
         let mut bad_magic = valid.clone();
         bad_magic[0] = b'X';
         assert!(read_request(&mut BufReader::new(&bad_magic[..])).is_err());
 
         let mut bad_version = valid.clone();
-        bad_version[6] = b'2';
+        bad_version[6] = b'1';
         assert!(read_request(&mut BufReader::new(&bad_version[..])).is_err());
 
         let mut bad_generation = valid.clone();
