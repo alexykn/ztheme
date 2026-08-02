@@ -236,6 +236,19 @@ fn compile_c(sandbox: &Sandbox, name: &str, source: &str) -> PathBuf {
     out
 }
 
+fn warm_executable(path: &Path) {
+    assert!(
+        Command::new(path)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .unwrap()
+            .success(),
+        "failed to warm {}",
+        path.display()
+    );
+}
+
 fn process_alive(pid: u32) -> bool {
     Command::new("kill")
         .args(["-0", &pid.to_string()])
@@ -350,7 +363,7 @@ fn wait_for_socket(child: &mut Child, directory: &Path) -> PathBuf {
 fn shutdown_outdated_daemon(socket: &Path) {
     let mut stream = UnixStream::connect(socket).unwrap();
     stream.write_all(b"ZT").unwrap();
-    stream.write_all(&2_u16.to_be_bytes()).unwrap();
+    stream.write_all(&3_u16.to_be_bytes()).unwrap();
     let mut response = [0];
     stream.read_exact(&mut response).unwrap();
     assert_eq!(response[0], 0xfe);
@@ -686,7 +699,7 @@ fn shell_word(path: &Path) -> String {
     format!("'{}'", path.to_string_lossy().replace('\'', "'\\''"))
 }
 
-const REQUEST_ENV_NAMES: [&str; 13] = [
+const REQUEST_ENV_NAMES: [&str; 23] = [
     "PATH",
     "HOME",
     "GIT_DIR",
@@ -697,9 +710,19 @@ const REQUEST_ENV_NAMES: [&str; 13] = [
     "CONDA_DEFAULT_ENV",
     "PERLBREW_PERL",
     "PLENV_VERSION",
+    "PYENV_VERSION",
+    "PYENV_DIR",
     "RUSTUP_TOOLCHAIN",
+    "RUSTUP_HOME",
+    "RBENV_DIR",
     "RBENV_VERSION",
+    "NODENV_VERSION",
+    "NODENV_DIR",
+    "PLENV_DIR",
     "RUBY_VERSION",
+    "JAVA_HOME",
+    "GOTOOLCHAIN",
+    "DOTNET_ROOT",
 ];
 
 fn client_request(generation: u64, cwd: &[u8]) -> Vec<u8> {
@@ -707,7 +730,7 @@ fn client_request(generation: u64, cwd: &[u8]) -> Vec<u8> {
 }
 
 fn client_request_with_env(generation: u64, cwd: &[u8], env: &[(&str, &str)]) -> Vec<u8> {
-    let mut fields: [&[u8]; 13] = [b""; 13];
+    let mut fields: [&[u8]; 23] = [b""; 23];
     for (name, value) in env {
         let index = REQUEST_ENV_NAMES
             .iter()
@@ -716,7 +739,7 @@ fn client_request_with_env(generation: u64, cwd: &[u8], env: &[(&str, &str)]) ->
         fields[index] = value.as_bytes();
     }
     let mut bytes = b"ZTREQ\0".to_vec();
-    bytes.extend_from_slice(b"1\0");
+    bytes.extend_from_slice(b"2\0");
     bytes.extend_from_slice(generation.to_string().as_bytes());
     bytes.push(0);
     bytes.extend_from_slice(cwd);
@@ -775,11 +798,38 @@ fn send_python_request(
     env: &[(&str, &str)],
 ) -> String {
     let records = send_and_read_until_done(stdin, stdout, generation, cwd, env);
+    python_fragment(&records)
+}
+
+fn send_rust_request(
+    stdin: &mut std::process::ChildStdin,
+    stdout: &mut BufReader<std::process::ChildStdout>,
+    generation: u64,
+    cwd: &[u8],
+    env: &[(&str, &str)],
+) -> String {
+    let records = send_and_read_until_done(stdin, stdout, generation, cwd, env);
+    rust_fragment(&records)
+}
+
+fn python_fragment(records: &[String]) -> String {
     records
         .iter()
         .find_map(|record| {
-            let fields: Vec<&str> = record.trim_end().split('\t').collect();
-            (fields[2] == "segment" && fields[3] == "python").then(|| fields[4].to_owned())
+            let fields: Vec<&str> = record.trim_end_matches('\n').split('\t').collect();
+            (fields.get(2) == Some(&"segment") && fields.get(3) == Some(&"python"))
+                .then(|| fields.get(4).copied().unwrap_or_default().to_owned())
+        })
+        .unwrap_or_default()
+}
+
+fn rust_fragment(records: &[String]) -> String {
+    records
+        .iter()
+        .find_map(|record| {
+            let fields: Vec<&str> = record.trim_end_matches('\n').split('\t').collect();
+            (fields.get(2) == Some(&"segment") && fields.get(3) == Some(&"rust"))
+                .then(|| fields.get(4).copied().unwrap_or_default().to_owned())
         })
         .unwrap_or_default()
 }
@@ -789,6 +839,13 @@ fn write_python_env_theme(sandbox: &Sandbox, name: &str) {
     sandbox.write_theme(
         name,
         "version = 1\n[layout]\nlines = [[\"python\"]]\nright = []\nseparator = \" | \"\nblank_line_before = false\n[segments.python]\nsymbol = \"py\"\nstyle = { foreground = \"accent\" }\nenvironment = { prefix = \"env:\" }\n",
+    );
+}
+
+fn write_rust_theme(sandbox: &Sandbox, name: &str) {
+    sandbox.write_theme(
+        name,
+        "version = 1\n[layout]\nlines = [[\"rust\"]]\nright = []\nseparator = \" | \"\nblank_line_before = false\n[segments.rust]\nsymbol = \"rust\"\n",
     );
 }
 
@@ -803,7 +860,102 @@ fn write_git_theme(sandbox: &Sandbox, name: &str) {
 const PLAIN_PYTHON: &str =
     "#include <stdio.h>\nint main(void) { printf(\"Python 3.12.0\\n\"); return 0; }\n";
 
-const ENV_ECHO_PYTHON: &str = "#include <stdio.h>\n#include <stdlib.h>\nint main(void) { const char* v = getenv(\"VIRTUAL_ENV\"); const char* r = getenv(\"RUSTUP_TOOLCHAIN\"); printf(\"Python %s-%s-3.12.0\\n\", v ? v : \"unset\", r ? r : \"unset\"); return 0; }\n";
+const ENV_ECHO_PYTHON: &str = "#include <stdio.h>\n#include <stdlib.h>\nint main(void) { const char* v = getenv(\"VIRTUAL_ENV\"); printf(\"Python %s-3.12.0\\n\", v ? v : \"unset\"); return 0; }\n";
+
+fn install_counting_python(sandbox: &Sandbox, version: &str, counter: &Path) -> String {
+    install_counting_python_with_options(sandbox, version, counter, 0, false)
+}
+
+fn install_counting_python_with_options(
+    sandbox: &Sandbox,
+    version: &str,
+    counter: &Path,
+    delay_ms: u32,
+    fail_first: bool,
+) -> String {
+    let bin = sandbox.home.join("counting-bin");
+    fs::create_dir_all(&bin).unwrap();
+    let source_path = sandbox.home.join("counting-python.c");
+    let binary = bin.join("python");
+    let source = format!(
+        r#"#include <fcntl.h>
+#include <stdio.h>
+#include <sys/file.h>
+#include <unistd.h>
+int main(void) {{
+    int fd = open("{}", O_CREAT | O_RDWR, 0600);
+    if (fd < 0 || flock(fd, LOCK_EX) != 0) return 2;
+    char value[32] = {{0}};
+    int count = 0;
+    if (read(fd, value, sizeof(value) - 1) > 0) sscanf(value, "%d", &count);
+    ++count;
+    lseek(fd, 0, SEEK_SET);
+    ftruncate(fd, 0);
+    dprintf(fd, "%d\n", count);
+    flock(fd, LOCK_UN);
+    close(fd);
+    if ({} && count == 1) return 1;
+    usleep({} * 1000);
+    printf("Python {}\n");
+    return 0;
+}}
+"#,
+        counter.display(),
+        u8::from(fail_first),
+        delay_ms,
+        version
+    );
+    fs::write(&source_path, source).unwrap();
+    let compiled = Command::new("cc")
+        .arg(&source_path)
+        .arg("-o")
+        .arg(&binary)
+        .status()
+        .unwrap();
+    assert!(compiled.success(), "failed to compile counting python");
+    fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();
+    bin.to_str().unwrap().to_owned()
+}
+
+fn install_counting_rustc(sandbox: &Sandbox, version: &str, counter: &Path) -> PathBuf {
+    let source_path = sandbox.home.join(format!("rustc-{version}.c"));
+    let binary = sandbox.home.join(format!("rustc-{version}"));
+    let source = format!(
+        r#"#include <fcntl.h>
+#include <stdio.h>
+#include <sys/file.h>
+#include <unistd.h>
+int main(void) {{
+    int fd = open("{}", O_CREAT | O_RDWR, 0600);
+    if (fd < 0 || flock(fd, LOCK_EX) != 0) return 2;
+    char value[32] = {{0}};
+    int count = 0;
+    if (read(fd, value, sizeof(value) - 1) > 0) sscanf(value, "%d", &count);
+    ++count;
+    lseek(fd, 0, SEEK_SET);
+    ftruncate(fd, 0);
+    dprintf(fd, "%d\n", count);
+    flock(fd, LOCK_UN);
+    close(fd);
+    printf("rustc {}\n");
+    return 0;
+}}
+"#,
+        counter.display(),
+        version
+    );
+    fs::write(&source_path, source).unwrap();
+    let compiled = Command::new("cc")
+        .arg(&source_path)
+        .arg("-o")
+        .arg(&binary)
+        .status()
+        .unwrap();
+    assert!(compiled.success(), "failed to compile counting rustc");
+    fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();
+    warm_executable(&binary);
+    binary
+}
 
 /// Compiles the fake python into the sandbox, warms the dyld cache, and adds
 /// the pyproject marker so the python runtime is detected. Returns the
@@ -825,6 +977,69 @@ fn install_fake_python(sandbox: &Sandbox, source: &str) -> String {
     assert!(Command::new(&fake_python).status().unwrap().success());
     fs::write(sandbox.home.join("pyproject.toml"), "[]\n").unwrap();
     bin.to_str().unwrap().to_owned()
+}
+
+fn install_selector_script(sandbox: &Sandbox, selector: &Path) -> String {
+    let bin = sandbox.home.join("asdf/shims");
+    fs::create_dir_all(&bin).unwrap();
+    let path = bin.join("python");
+    fs::write(
+        &path,
+        format!(
+            "#!/bin/sh\nprintf 'Python %s\\n' \"$(cat '{}')\"\n",
+            selector.display()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+    bin.to_str().unwrap().to_owned()
+}
+
+fn install_volatile_environment_script(sandbox: &Sandbox, counter: &Path) -> String {
+    let bin = sandbox.home.join("volatile-bin");
+    fs::create_dir_all(&bin).unwrap();
+    let path = bin.join("python");
+    fs::write(
+        &path,
+        format!(
+            "#!/bin/sh\n             count=$(cat '{}')\n             count=$((count + 1))\n             printf '%s\\n' \"$count\" > '{}'\n             printf 'Python %s|%s|%s|%s|%s\\n' \"${{HOME:-unset}}\" \"${{ZTHEME_PRIVATE_ONLY:-unset}}\" \"${{LC_ALL:-unset}}\" \"${{TERM:-unset}}\" \"${{NO_COLOR:-unset}}\"\n",
+            counter.display(),
+            counter.display()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+    bin.to_str().unwrap().to_owned()
+}
+
+fn install_pyenv_fixture(sandbox: &Sandbox, counter: &Path) -> (PathBuf, PathBuf) {
+    let root = sandbox.home.join("pyenv");
+    let shim = root.join("shims/python");
+    fs::create_dir_all(shim.parent().unwrap()).unwrap();
+    fs::create_dir_all(root.join("bin")).unwrap();
+    fs::create_dir_all(root.join("versions/3.11/bin")).unwrap();
+    fs::create_dir_all(root.join("versions/3.12/bin")).unwrap();
+    fs::write(root.join("bin/pyenv"), "#!/bin/sh\nexit 0\n").unwrap();
+    fs::set_permissions(root.join("bin/pyenv"), fs::Permissions::from_mode(0o700)).unwrap();
+    fs::write(&shim, "#!/bin/sh\nexit 1\n").unwrap();
+    fs::set_permissions(&shim, fs::Permissions::from_mode(0o700)).unwrap();
+
+    let first = install_counting_python(sandbox, "3.11.0", counter);
+    fs::copy(
+        Path::new(&first).join("python"),
+        root.join("versions/3.11/bin/python"),
+    )
+    .unwrap();
+    let second = install_counting_python(sandbox, "3.12.0", counter);
+    fs::copy(
+        Path::new(&second).join("python"),
+        root.join("versions/3.12/bin/python"),
+    )
+    .unwrap();
+    warm_executable(&root.join("versions/3.11/bin/python"));
+    warm_executable(&root.join("versions/3.12/bin/python"));
+    fs::write(counter, b"0\n").unwrap();
+    (root, sandbox.home.join("pyenv-project"))
 }
 
 /// Replaces gitstatusd with one that answers after 150 ms.
@@ -1077,15 +1292,19 @@ add-zsh-hook -D preexec _ztheme_preexec 2>/dev/null
 # requires zle -F registration, which is only meaningful in an interactive
 # shell, and the test drives the wire protocol itself.
 typeset -i request_generation=5
-local request_line="ZTREQ"$'\0'"1"$'\0'"$request_generation"$'\0'"$PWD"$'\0'
+local request_line="ZTREQ"$'\0'"2"$'\0'"$request_generation"$'\0'"$PWD"$'\0'
 request_line+="${{PATH:-}}"$'\0'"${{HOME:-}}"$'\0'
 request_line+="${{GIT_DIR:-}}"$'\0'"${{GIT_WORK_TREE:-}}"$'\0'
 request_line+="${{GIT_CEILING_DIRECTORIES:-}}"$'\0'
 request_line+="${{VIRTUAL_ENV:-}}"$'\0'"${{CONDA_PREFIX:-}}"$'\0'
 request_line+="${{CONDA_DEFAULT_ENV:-}}"$'\0'
 request_line+="${{PERLBREW_PERL:-}}"$'\0'"${{PLENV_VERSION:-}}"$'\0'
-request_line+="${{RUSTUP_TOOLCHAIN:-}}"$'\0'"${{RBENV_VERSION:-}}"$'\0'
-request_line+="${{RUBY_VERSION:-}}"$'\0'
+request_line+="${{PYENV_VERSION:-}}"$'\0'"${{PYENV_DIR:-}}"$'\0'
+request_line+="${{RUSTUP_TOOLCHAIN:-}}"$'\0'"${{RUSTUP_HOME:-}}"$'\0'
+request_line+="${{RBENV_DIR:-}}"$'\0'"${{RBENV_VERSION:-}}"$'\0'
+request_line+="${{NODENV_VERSION:-}}"$'\0'"${{NODENV_DIR:-}}"$'\0'
+request_line+="${{PLENV_DIR:-}}"$'\0'"${{RUBY_VERSION:-}}"$'\0'
+request_line+="${{JAVA_HOME:-}}"$'\0'"${{GOTOOLCHAIN:-}}"$'\0'"${{DOTNET_ROOT:-}}"$'\0'
 if ! print -rn -- "$request_line" >&"$ZTHEME_REQ_FD"; then
     exit 83
 fi
@@ -1218,6 +1437,539 @@ fn client_daemon_applies_per_request_environment() {
         "stale environment leaked into a later request: {third}"
     );
 
+    drop(stdin);
+    assert!(
+        wait_for_exit(&mut child, PROCESS_TIMEOUT)
+            .unwrap()
+            .success()
+    );
+    shutdown_server(server, &socket);
+}
+
+#[test]
+fn runtime_cache_reuses_direct_values_and_invalidates_replacements() {
+    let sandbox = Sandbox::new();
+    let instance = format!(
+        "runtime-cache-direct-{}",
+        SEQUENCE.fetch_add(1, Ordering::Relaxed)
+    );
+    write_python_env_theme(&sandbox, "counting-python");
+    let counter = sandbox.home.join("python-count");
+    fs::write(&counter, b"0\n").unwrap();
+    let first_path = install_counting_python(&sandbox, "3.12.0", &counter);
+    assert!(
+        Command::new(sandbox.home.join("counting-bin/python"))
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .unwrap()
+            .success()
+    );
+    fs::write(&counter, b"0\n").unwrap();
+    fs::write(sandbox.home.join("pyproject.toml"), "[]\n").unwrap();
+    let (server, socket) = spawn_server(&sandbox, &instance);
+    let hex = theme_hex(&sandbox, &instance, "counting-python");
+    let (mut child, mut stdin, mut stdout) = spawn_client_daemon(&sandbox, &instance, &hex, &[]);
+    let cwd = sandbox.home.to_str().unwrap().as_bytes().to_vec();
+
+    for generation in 1..=100 {
+        let value = send_python_request(
+            &mut stdin,
+            &mut stdout,
+            generation,
+            &cwd,
+            &[("PATH", &first_path)],
+        );
+        assert!(
+            value.contains("3.12.0"),
+            "unexpected runtime value: {value}"
+        );
+    }
+    assert_eq!(fs::read_to_string(&counter).unwrap().trim(), "1");
+
+    let replacement_path = install_counting_python(&sandbox, "3.13.0", &counter);
+    assert!(
+        Command::new(sandbox.home.join("counting-bin/python"))
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .unwrap()
+            .success()
+    );
+    fs::write(&counter, b"1\n").unwrap();
+    let replaced = send_python_request(
+        &mut stdin,
+        &mut stdout,
+        101,
+        &cwd,
+        &[("PATH", &replacement_path)],
+    );
+    assert!(
+        replaced.contains("3.13.0"),
+        "replacement was cached: {replaced}"
+    );
+    assert_eq!(fs::read_to_string(&counter).unwrap().trim(), "2");
+
+    let warm_replacement = send_python_request(
+        &mut stdin,
+        &mut stdout,
+        102,
+        &cwd,
+        &[("PATH", &replacement_path)],
+    );
+    assert!(warm_replacement.contains("3.13.0"));
+    assert_eq!(fs::read_to_string(&counter).unwrap().trim(), "2");
+
+    drop(stdin);
+    assert!(
+        wait_for_exit(&mut child, PROCESS_TIMEOUT)
+            .unwrap()
+            .success()
+    );
+    shutdown_server(server, &socket);
+}
+
+#[test]
+fn runtime_cache_ignores_irrelevant_environment_and_path_changes() {
+    let sandbox = Sandbox::new();
+    let instance = format!(
+        "runtime-cache-irrelevant-{}",
+        SEQUENCE.fetch_add(1, Ordering::Relaxed)
+    );
+    write_python_env_theme(&sandbox, "irrelevant-python");
+    let counter = sandbox.home.join("python-count");
+    fs::write(&counter, b"0\n").unwrap();
+    let fake_path = install_counting_python(&sandbox, "3.12.0", &counter);
+    warm_executable(&sandbox.home.join("counting-bin/python"));
+    fs::write(&counter, b"0\n").unwrap();
+    fs::write(sandbox.home.join("pyproject.toml"), "[]\n").unwrap();
+    let (server, socket) = spawn_server(&sandbox, &instance);
+    let hex = theme_hex(&sandbox, &instance, "irrelevant-python");
+    let (mut child, mut stdin, mut stdout) = spawn_client_daemon(&sandbox, &instance, &hex, &[]);
+    let cwd = sandbox.home.to_str().unwrap().as_bytes().to_vec();
+
+    let first = send_python_request(&mut stdin, &mut stdout, 1, &cwd, &[("PATH", &fake_path)]);
+    assert!(first.contains("3.12.0"), "unexpected first value: {first}");
+    let path_with_suffix = format!("{fake_path}:/unused/path");
+    let second = send_python_request(
+        &mut stdin,
+        &mut stdout,
+        2,
+        &cwd,
+        &[
+            ("PATH", path_with_suffix.as_str()),
+            ("CONDA_DEFAULT_ENV", "work"),
+            ("PYENV_VERSION", "ignored"),
+        ],
+    );
+    assert!(second.contains("3.12.0"));
+    assert!(
+        second.contains("env:work"),
+        "label was not rematerialized: {second}"
+    );
+    assert_eq!(fs::read_to_string(&counter).unwrap().trim(), "1");
+
+    drop(stdin);
+    assert!(
+        wait_for_exit(&mut child, PROCESS_TIMEOUT)
+            .unwrap()
+            .success()
+    );
+    shutdown_server(server, &socket);
+}
+
+#[test]
+fn new_project_markers_are_detected_on_the_next_prompt() {
+    let sandbox = Sandbox::new();
+    let instance = format!(
+        "runtime-cache-marker-{}",
+        SEQUENCE.fetch_add(1, Ordering::Relaxed)
+    );
+    write_python_env_theme(&sandbox, "marker-python");
+    let counter = sandbox.home.join("python-count");
+    fs::write(&counter, b"0\n").unwrap();
+    let fake_path = install_counting_python(&sandbox, "3.12.0", &counter);
+    warm_executable(&sandbox.home.join("counting-bin/python"));
+    fs::write(&counter, b"0\n").unwrap();
+    let project = sandbox.home.join("new-project");
+    fs::create_dir_all(&project).unwrap();
+    let (server, socket) = spawn_server(&sandbox, &instance);
+    let hex = theme_hex(&sandbox, &instance, "marker-python");
+    let (mut child, mut stdin, mut stdout) = spawn_client_daemon(&sandbox, &instance, &hex, &[]);
+    let cwd = project.to_str().unwrap().as_bytes().to_vec();
+
+    let before = send_python_request(&mut stdin, &mut stdout, 1, &cwd, &[("PATH", &fake_path)]);
+    assert!(
+        before.is_empty(),
+        "runtime appeared before its marker: {before}"
+    );
+    assert_eq!(fs::read_to_string(&counter).unwrap().trim(), "0");
+
+    fs::write(project.join("pyproject.toml"), "[]\n").unwrap();
+    let after = send_python_request(&mut stdin, &mut stdout, 2, &cwd, &[("PATH", &fake_path)]);
+    assert!(
+        after.contains("3.12.0"),
+        "new marker was not detected: {after}"
+    );
+    assert_eq!(fs::read_to_string(&counter).unwrap().trim(), "1");
+
+    drop(stdin);
+    assert!(
+        wait_for_exit(&mut child, PROCESS_TIMEOUT)
+            .unwrap()
+            .success()
+    );
+    shutdown_server(server, &socket);
+}
+
+#[test]
+fn pyenv_selector_switch_is_visible_on_the_first_refresh() {
+    let sandbox = Sandbox::new();
+    let instance = format!(
+        "runtime-cache-pyenv-{}",
+        SEQUENCE.fetch_add(1, Ordering::Relaxed)
+    );
+    write_python_env_theme(&sandbox, "pyenv-python");
+    let counter = sandbox.home.join("python-count");
+    fs::write(&counter, b"0\n").unwrap();
+    let (root, project) = install_pyenv_fixture(&sandbox, &counter);
+    fs::create_dir_all(&project).unwrap();
+    fs::write(project.join("pyproject.toml"), "[]\n").unwrap();
+    fs::write(project.join(".python-version"), "3.11\n").unwrap();
+    let path = root.join("shims").to_str().unwrap().to_owned();
+    let (server, socket) = spawn_server(&sandbox, &instance);
+    let hex = theme_hex(&sandbox, &instance, "pyenv-python");
+    let (mut child, mut stdin, mut stdout) = spawn_client_daemon(&sandbox, &instance, &hex, &[]);
+    let cwd = project.to_str().unwrap().as_bytes().to_vec();
+
+    let first = send_python_request(&mut stdin, &mut stdout, 1, &cwd, &[("PATH", &path)]);
+    assert!(
+        first.contains("3.11.0"),
+        "pyenv file selection failed: {first}"
+    );
+    fs::write(project.join(".python-version"), "3.12\n").unwrap();
+    let second = send_python_request(&mut stdin, &mut stdout, 2, &cwd, &[("PATH", &path)]);
+    assert!(
+        second.contains("3.12.0"),
+        "pyenv selector change was stale: {second}"
+    );
+    assert_eq!(fs::read_to_string(&counter).unwrap().trim(), "2");
+
+    drop(stdin);
+    assert!(
+        wait_for_exit(&mut child, PROCESS_TIMEOUT)
+            .unwrap()
+            .success()
+    );
+    shutdown_server(server, &socket);
+}
+
+#[test]
+fn rustup_selector_switch_is_visible_on_the_first_refresh() {
+    let sandbox = Sandbox::new();
+    let instance = format!(
+        "runtime-cache-rustup-{}",
+        SEQUENCE.fetch_add(1, Ordering::Relaxed)
+    );
+    write_rust_theme(&sandbox, "rustup-rust");
+    let counter = sandbox.home.join("rustc-count");
+    fs::write(&counter, b"0\n").unwrap();
+
+    let cargo_bin = sandbox.home.join(".cargo/bin");
+    let rustup_home = sandbox.home.join(".rustup");
+    fs::create_dir_all(&cargo_bin).unwrap();
+    fs::create_dir_all(&rustup_home).unwrap();
+    fs::write(
+        rustup_home.join("settings.toml"),
+        "default_toolchain = \"stable\"\n",
+    )
+    .unwrap();
+    let rustup_proxy = compile_c(&sandbox, "rustup", "int main(void) { return 0; }\n");
+    fs::copy(&rustup_proxy, cargo_bin.join("rustup")).unwrap();
+    fs::hard_link(cargo_bin.join("rustup"), cargo_bin.join("rustc")).unwrap();
+
+    let stable = install_counting_rustc(&sandbox, "stable", &counter);
+    let nightly = install_counting_rustc(&sandbox, "nightly", &counter);
+    fs::create_dir_all(rustup_home.join("toolchains/stable/bin")).unwrap();
+    fs::create_dir_all(rustup_home.join("toolchains/nightly/bin")).unwrap();
+    fs::copy(&stable, rustup_home.join("toolchains/stable/bin/rustc")).unwrap();
+    fs::copy(&nightly, rustup_home.join("toolchains/nightly/bin/rustc")).unwrap();
+    warm_executable(&rustup_home.join("toolchains/stable/bin/rustc"));
+    warm_executable(&rustup_home.join("toolchains/nightly/bin/rustc"));
+    fs::write(&counter, b"0\n").unwrap();
+
+    fs::write(sandbox.home.join("Cargo.toml"), "[package]\n").unwrap();
+    let (server, socket) = spawn_server(&sandbox, &instance);
+    let hex = theme_hex(&sandbox, &instance, "rustup-rust");
+    let (mut child, mut stdin, mut stdout) = spawn_client_daemon(&sandbox, &instance, &hex, &[]);
+    let cwd = sandbox.home.to_str().unwrap().as_bytes().to_vec();
+    let path = cargo_bin.to_str().unwrap().to_owned();
+    let home = sandbox.home.to_str().unwrap().to_owned();
+
+    let first = send_rust_request(
+        &mut stdin,
+        &mut stdout,
+        1,
+        &cwd,
+        &[("PATH", &path), ("HOME", &home)],
+    );
+    assert!(
+        first.contains("stable"),
+        "stable rustup selection failed: {first}"
+    );
+
+    fs::write(sandbox.home.join("rust-toolchain"), "nightly\n").unwrap();
+    let second = send_rust_request(
+        &mut stdin,
+        &mut stdout,
+        2,
+        &cwd,
+        &[("PATH", &path), ("HOME", &home)],
+    );
+    assert!(
+        second.contains("nightly"),
+        "rustup selector change was stale: {second}"
+    );
+    assert_eq!(fs::read_to_string(&counter).unwrap().trim(), "2");
+
+    drop(stdin);
+    assert!(
+        wait_for_exit(&mut child, PROCESS_TIMEOUT)
+            .unwrap()
+            .success()
+    );
+    shutdown_server(server, &socket);
+}
+
+#[test]
+fn unsupported_shims_are_volatile_and_never_stale() {
+    let sandbox = Sandbox::new();
+    let instance = format!(
+        "runtime-cache-unknown-shim-{}",
+        SEQUENCE.fetch_add(1, Ordering::Relaxed)
+    );
+    write_python_env_theme(&sandbox, "unknown-shim-python");
+    fs::write(sandbox.home.join("pyproject.toml"), "[]\n").unwrap();
+    let selector = sandbox.home.join("shim-selector");
+    fs::write(&selector, "3.11.0\n").unwrap();
+    let shim_path = install_selector_script(&sandbox, &selector);
+    let request_path = format!("{shim_path}:/usr/bin:/bin");
+    warm_executable(&Path::new(&shim_path).join("python"));
+    let (server, socket) = spawn_server(&sandbox, &instance);
+    let hex = theme_hex(&sandbox, &instance, "unknown-shim-python");
+    let (mut child, mut stdin, mut stdout) = spawn_client_daemon(&sandbox, &instance, &hex, &[]);
+    let cwd = sandbox.home.to_str().unwrap().as_bytes().to_vec();
+
+    let first = send_python_request(
+        &mut stdin,
+        &mut stdout,
+        1,
+        &cwd,
+        &[("PATH", request_path.as_str())],
+    );
+    assert!(
+        first.contains("3.11.0"),
+        "unknown shim did not execute: {first}"
+    );
+    fs::write(&selector, "3.12.0\n").unwrap();
+    let second = send_python_request(
+        &mut stdin,
+        &mut stdout,
+        2,
+        &cwd,
+        &[("PATH", request_path.as_str())],
+    );
+    assert!(
+        second.contains("3.12.0"),
+        "unknown shim served stale output: {second}"
+    );
+
+    drop(stdin);
+    assert!(
+        wait_for_exit(&mut child, PROCESS_TIMEOUT)
+            .unwrap()
+            .success()
+    );
+    shutdown_server(server, &socket);
+}
+
+#[test]
+fn volatile_runtime_commands_use_a_cleared_request_environment() {
+    let sandbox = Sandbox::new();
+    let instance = format!(
+        "runtime-cache-volatile-env-{}",
+        SEQUENCE.fetch_add(1, Ordering::Relaxed)
+    );
+    write_python_env_theme(&sandbox, "volatile-env-python");
+    fs::write(sandbox.home.join("pyproject.toml"), "[]\n").unwrap();
+    let counter = sandbox.home.join("volatile-count");
+    fs::write(&counter, b"0\n").unwrap();
+    let request_path = format!(
+        "{}:/usr/bin:/bin",
+        install_volatile_environment_script(&sandbox, &counter)
+    );
+    let script_path = Path::new(request_path.split(':').next().unwrap()).join("python");
+    warm_executable(&script_path);
+    fs::write(&counter, b"0\n").unwrap();
+    let (server, socket) = spawn_server(&sandbox, &instance);
+    let hex = theme_hex(&sandbox, &instance, "volatile-env-python");
+    let (mut child, mut stdin, mut stdout) = spawn_client_daemon(
+        &sandbox,
+        &instance,
+        &hex,
+        &[("ZTHEME_PRIVATE_ONLY", "startup-only")],
+    );
+    let cwd = sandbox.home.to_str().unwrap().as_bytes().to_vec();
+
+    let first = send_python_request(
+        &mut stdin,
+        &mut stdout,
+        1,
+        &cwd,
+        &[("PATH", &request_path), ("HOME", "/one")],
+    );
+    assert!(
+        first.contains("/one|unset|C|dumb|1"),
+        "volatile command did not receive the deterministic request environment: {first}"
+    );
+
+    let second = send_python_request(
+        &mut stdin,
+        &mut stdout,
+        2,
+        &cwd,
+        &[("PATH", &request_path), ("HOME", "/two")],
+    );
+    assert!(
+        second.contains("/two|unset|C|dumb|1"),
+        "volatile command retained the previous request environment: {second}"
+    );
+    assert_eq!(fs::read_to_string(&counter).unwrap().trim(), "2");
+
+    drop(stdin);
+    assert!(
+        wait_for_exit(&mut child, PROCESS_TIMEOUT)
+            .unwrap()
+            .success()
+    );
+    shutdown_server(server, &socket);
+}
+
+#[test]
+fn concurrent_cold_prompts_execute_one_runtime_command() {
+    let sandbox = Sandbox::new();
+    let instance = format!(
+        "runtime-cache-singleflight-{}",
+        SEQUENCE.fetch_add(1, Ordering::Relaxed)
+    );
+    write_python_env_theme(&sandbox, "singleflight-python");
+    let counter = sandbox.home.join("python-count");
+    fs::write(&counter, b"0\n").unwrap();
+    let fake_path = install_counting_python_with_options(&sandbox, "3.12.0", &counter, 50, false);
+    warm_executable(&sandbox.home.join("counting-bin/python"));
+    fs::write(&counter, b"0\n").unwrap();
+    fs::write(sandbox.home.join("pyproject.toml"), "[]\n").unwrap();
+    let (server, socket) = spawn_server(&sandbox, &instance);
+    let hex = theme_hex(&sandbox, &instance, "singleflight-python");
+    let mut clients = (0..8)
+        .map(|_| spawn_client_daemon(&sandbox, &instance, &hex, &[]))
+        .collect::<Vec<_>>();
+    let cwd = sandbox.home.to_str().unwrap().as_bytes().to_vec();
+    for (_, stdin, _) in &mut clients {
+        stdin
+            .write_all(&client_request_with_env(1, &cwd, &[("PATH", &fake_path)]))
+            .unwrap();
+    }
+    for (_, _, stdout) in &mut clients {
+        let records = read_until_done(stdout, 1);
+        assert!(python_fragment(&records).contains("3.12.0"));
+    }
+    for (mut child, stdin, _) in clients {
+        drop(stdin);
+        assert!(
+            wait_for_exit(&mut child, PROCESS_TIMEOUT)
+                .unwrap()
+                .success()
+        );
+    }
+    assert_eq!(fs::read_to_string(&counter).unwrap().trim(), "1");
+    shutdown_server(server, &socket);
+}
+
+#[test]
+fn transient_runtime_failures_are_not_persisted() {
+    let sandbox = Sandbox::new();
+    let instance = format!(
+        "runtime-cache-transient-{}",
+        SEQUENCE.fetch_add(1, Ordering::Relaxed)
+    );
+    write_python_env_theme(&sandbox, "transient-python");
+    let counter = sandbox.home.join("python-count");
+    fs::write(&counter, b"0\n").unwrap();
+    let fake_path = install_counting_python_with_options(&sandbox, "3.12.0", &counter, 0, true);
+    // Warm the native loader without consuming the intentional first failure.
+    fs::write(&counter, b"1\n").unwrap();
+    warm_executable(&sandbox.home.join("counting-bin/python"));
+    fs::write(&counter, b"0\n").unwrap();
+    fs::write(sandbox.home.join("pyproject.toml"), "[]\n").unwrap();
+    let (server, socket) = spawn_server(&sandbox, &instance);
+    let hex = theme_hex(&sandbox, &instance, "transient-python");
+    let (mut child, mut stdin, mut stdout) = spawn_client_daemon(&sandbox, &instance, &hex, &[]);
+    let cwd = sandbox.home.to_str().unwrap().as_bytes().to_vec();
+
+    let failed = send_python_request(&mut stdin, &mut stdout, 1, &cwd, &[("PATH", &fake_path)]);
+    assert!(
+        failed.is_empty(),
+        "failed runtime produced a value: {failed}"
+    );
+    let recovered = send_python_request(&mut stdin, &mut stdout, 2, &cwd, &[("PATH", &fake_path)]);
+    assert!(recovered.contains("3.12.0"));
+    let warm = send_python_request(&mut stdin, &mut stdout, 3, &cwd, &[("PATH", &fake_path)]);
+    assert!(warm.contains("3.12.0"));
+    assert_eq!(fs::read_to_string(&counter).unwrap().trim(), "2");
+
+    drop(stdin);
+    assert!(
+        wait_for_exit(&mut child, PROCESS_TIMEOUT)
+            .unwrap()
+            .success()
+    );
+    shutdown_server(server, &socket);
+}
+
+#[test]
+fn persisted_runtime_entries_survive_a_daemon_restart() {
+    let sandbox = Sandbox::new();
+    let instance = format!(
+        "runtime-cache-restart-{}",
+        SEQUENCE.fetch_add(1, Ordering::Relaxed)
+    );
+    write_python_env_theme(&sandbox, "restart-python");
+    let counter = sandbox.home.join("python-count");
+    fs::write(&counter, b"0\n").unwrap();
+    let fake_path = install_counting_python(&sandbox, "3.12.0", &counter);
+    warm_executable(&sandbox.home.join("counting-bin/python"));
+    fs::write(&counter, b"0\n").unwrap();
+    fs::write(sandbox.home.join("pyproject.toml"), "[]\n").unwrap();
+    let (server, socket) = spawn_server(&sandbox, &instance);
+    let hex = theme_hex(&sandbox, &instance, "restart-python");
+    let (mut child, mut stdin, mut stdout) = spawn_client_daemon(&sandbox, &instance, &hex, &[]);
+    let cwd = sandbox.home.to_str().unwrap().as_bytes().to_vec();
+    let first = send_python_request(&mut stdin, &mut stdout, 1, &cwd, &[("PATH", &fake_path)]);
+    assert!(first.contains("3.12.0"));
+    drop(stdin);
+    assert!(
+        wait_for_exit(&mut child, PROCESS_TIMEOUT)
+            .unwrap()
+            .success()
+    );
+    shutdown_server(server, &socket);
+
+    let (server, socket) = spawn_server(&sandbox, &instance);
+    let (mut child, mut stdin, mut stdout) = spawn_client_daemon(&sandbox, &instance, &hex, &[]);
+    let second = send_python_request(&mut stdin, &mut stdout, 1, &cwd, &[("PATH", &fake_path)]);
+    assert!(second.contains("3.12.0"));
+    assert_eq!(fs::read_to_string(&counter).unwrap().trim(), "1");
     drop(stdin);
     assert!(
         wait_for_exit(&mut child, PROCESS_TIMEOUT)
@@ -1654,12 +2406,8 @@ fn client_exits_after_shell_killed_during_active_request() {
     let socket = wait_for_socket(server.child(), &sandbox.runtime);
 
     // A request whose git query is still in flight when the shell dies.
-    let preamble = "print -rn -- \"ZTREQ\"$'\\0'\"1\"$'\\0'\"1\"$'\\0'\"$PWD\"$'\\0' \\\n\
-         \"${PATH:-}\"$'\\0'\"${HOME:-}\"$'\\0'\"${GIT_DIR:-}\"$'\\0'\"${GIT_WORK_TREE:-}\"$'\\0' \\\n\
-         \"${GIT_CEILING_DIRECTORIES:-}\"$'\\0'\"${VIRTUAL_ENV:-}\"$'\\0'\"${CONDA_PREFIX:-}\"$'\\0' \\\n\
-         \"${CONDA_DEFAULT_ENV:-}\"$'\\0'\"${PERLBREW_PERL:-}\"$'\\0'\"${PLENV_VERSION:-}\"$'\\0' \\\n\
-         \"${RUSTUP_TOOLCHAIN:-}\"$'\\0'\"${RBENV_VERSION:-}\"$'\\0'\"${RUBY_VERSION:-}\"$'\\0' \\\n\
-         >&\"$ZTHEME_REQ_FD\"\n";
+    let preamble = r#"print -rn -- "ZTREQ"$'\0'"2"$'\0'"1"$'\0'"$PWD"$'\0'"${PATH:-}"$'\0'"${HOME:-}"$'\0'"${GIT_DIR:-}"$'\0'"${GIT_WORK_TREE:-}"$'\0'"${GIT_CEILING_DIRECTORIES:-}"$'\0'"${VIRTUAL_ENV:-}"$'\0'"${CONDA_PREFIX:-}"$'\0'"${CONDA_DEFAULT_ENV:-}"$'\0'"${PERLBREW_PERL:-}"$'\0'"${PLENV_VERSION:-}"$'\0'"${PYENV_VERSION:-}"$'\0'"${PYENV_DIR:-}"$'\0'"${RUSTUP_TOOLCHAIN:-}"$'\0'"${RUSTUP_HOME:-}"$'\0'"${RBENV_DIR:-}"$'\0'"${RBENV_VERSION:-}"$'\0'"${NODENV_VERSION:-}"$'\0'"${NODENV_DIR:-}"$'\0'"${PLENV_DIR:-}"$'\0'"${RUBY_VERSION:-}"$'\0'"${JAVA_HOME:-}"$'\0'"${GOTOOLCHAIN:-}"$'\0'"${DOTNET_ROOT:-}"$'\0' >&"$ZTHEME_REQ_FD"
+"#;
     let (mut shell, client_pid) = spawn_live_shell(&sandbox, &instance, preamble);
     thread::sleep(Duration::from_millis(100));
     shell.kill().unwrap();
@@ -1745,10 +2493,7 @@ fn runtime_child_receives_the_request_environment() {
         &sandbox,
         &instance,
         &hex,
-        &[
-            ("VIRTUAL_ENV", "/startup-venv"),
-            ("RUSTUP_TOOLCHAIN", "startup-toolchain"),
-        ],
+        &[("VIRTUAL_ENV", "/startup-venv")],
     );
     let cwd = sandbox.home.to_str().unwrap().as_bytes().to_vec();
 
@@ -1758,21 +2503,17 @@ fn runtime_child_receives_the_request_environment() {
         &mut stdout,
         1,
         &cwd,
-        &[
-            ("PATH", &fake_path),
-            ("VIRTUAL_ENV", "/venv-a"),
-            ("RUSTUP_TOOLCHAIN", "nightly"),
-        ],
+        &[("PATH", &fake_path), ("VIRTUAL_ENV", "/venv-a")],
     );
     assert!(
-        first.contains("/venv-a-nightly-3.12.0"),
+        first.contains("/venv-a-3.12.0"),
         "child did not receive the request environment: {first}"
     );
 
     // Request 2: empty fields must remove the inherited startup values.
     let second = send_python_request(&mut stdin, &mut stdout, 2, &cwd, &[("PATH", &fake_path)]);
     assert!(
-        second.contains("unset-unset-3.12.0"),
+        second.contains("unset-3.12.0"),
         "child inherited stale startup environment: {second}"
     );
 
@@ -1892,6 +2633,10 @@ fn runtime_only_init_does_not_require_gitstatusd_but_git_themes_still_do() {
         .args(["init", "zsh", "--theme", "gitonly"])
         .env("PATH", "/usr/bin:/bin")
         .env_remove("HOMEBREW_PREFIX")
+        // Null stdin so the installer never sees a terminal: the refusal
+        // must be deterministic in CI and under interactive cargo test
+        // alike, never a blocking confirmation prompt.
+        .stdin(Stdio::null())
         .output()
         .unwrap();
     assert!(!refused.status.success());
@@ -1918,25 +2663,30 @@ fn daemon_without_gitstatusd_starts_and_serves_the_runtime_cache() {
         "runtime-only daemon created a gitstatusd binary"
     );
 
-    let key = 7_u64;
+    let mut key = [0_u8; 32];
+    key[31] = 7;
     let value = b"runtime-value";
+    let acquire = protocol_exchange(&socket, &[b"ZT", &2_u16.to_be_bytes(), &[1], &key]);
+    assert_eq!(acquire.len(), 9);
+    assert_eq!(acquire[0], 2);
+    let token = u64::from_be_bytes(acquire[1..9].try_into().unwrap());
+    let token_bytes = token.to_be_bytes();
+    let value_length = u32::try_from(value.len()).unwrap().to_be_bytes();
     let put = protocol_exchange(
         &socket,
         &[
             b"ZT",
-            &1_u16.to_be_bytes(),
+            &2_u16.to_be_bytes(),
             &[2],
-            &key.to_be_bytes(),
-            &(u32::try_from(value.len()).unwrap()).to_be_bytes(),
+            &key,
+            &token_bytes,
+            &value_length,
             value,
         ],
     );
-    assert_eq!(put, [2]);
+    assert_eq!(put, [3]);
 
-    let get = protocol_exchange(
-        &socket,
-        &[b"ZT", &1_u16.to_be_bytes(), &[1], &key.to_be_bytes()],
-    );
+    let get = protocol_exchange(&socket, &[b"ZT", &2_u16.to_be_bytes(), &[1], &key]);
     assert_eq!(get[0], 1, "expected a cache hit");
     let length = u32::from_be_bytes(get[1..5].try_into().unwrap()) as usize;
     assert_eq!(&get[5..5 + length], value);
@@ -1974,8 +2724,8 @@ fn gitstatusd_starts_lazily_and_reset_does_not_start_it() {
 
     assert!(!marker.exists(), "gitstatusd started during daemon startup");
 
-    let reset = protocol_exchange(&socket, &[b"ZT", &1_u16.to_be_bytes(), &[4]]);
-    assert_eq!(reset, [2]);
+    let reset = protocol_exchange(&socket, &[b"ZT", &2_u16.to_be_bytes(), &[4]]);
+    assert_eq!(reset, [3]);
     assert!(!marker.exists(), "RESET started an unused gitstatusd");
 
     let path = sandbox.home.as_os_str().as_bytes();
@@ -1983,7 +2733,7 @@ fn gitstatusd_starts_lazily_and_reset_does_not_start_it() {
         &socket,
         &[
             b"ZT",
-            &1_u16.to_be_bytes(),
+            &2_u16.to_be_bytes(),
             &[5],
             &[0],
             &(u32::try_from(path.len()).unwrap()).to_be_bytes(),
