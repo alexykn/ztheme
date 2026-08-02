@@ -51,6 +51,7 @@ struct BundledTheme {
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum SegmentId {
     Directory,
+    Clock,
     Git,
     Runtime(Runtime),
     Character,
@@ -133,7 +134,10 @@ impl ValidatedLayout {
                 LayoutSegment::BuiltIn(segment)
                     if matches!(
                         segment,
-                        SegmentId::Directory | SegmentId::Character | SegmentId::Status
+                        SegmentId::Directory
+                            | SegmentId::Clock
+                            | SegmentId::Character
+                            | SegmentId::Status
                     ) =>
                 {
                     segment.name()
@@ -153,6 +157,7 @@ impl SegmentId {
     pub fn parse(value: &str) -> Option<Self> {
         match value {
             "directory" => Some(Self::Directory),
+            "clock" => Some(Self::Clock),
             "git" => Some(Self::Git),
             "character" => Some(Self::Character),
             "status" => Some(Self::Status),
@@ -165,12 +170,13 @@ impl SegmentId {
     }
 
     pub const fn is_right_safe(self) -> bool {
-        matches!(self, Self::Directory | Self::Status)
+        matches!(self, Self::Directory | Self::Clock | Self::Status)
     }
 
     pub const fn name(self) -> &'static str {
         match self {
             Self::Directory => "directory",
+            Self::Clock => "clock",
             Self::Git => "git",
             Self::Runtime(runtime) => runtime.name(),
             Self::Character => "character",
@@ -711,16 +717,16 @@ lines = [["directory"], ["character"]]
         let overlay = r#"
 version = 1
 [layout]
-lines = [["directory", "clock"]]
+lines = [["directory", "time"]]
 right = ["cpu", "status"]
-[segments.custom.clock]
+[segments.custom.time]
 prefix = "☀ "
 style = { foreground = "accent" }
 [segments.custom.cpu]
 style = { foreground = "muted" }
 "#;
         let layout = validate(&merged_theme(overlay).unwrap()).unwrap();
-        assert_eq!(layout.lines[0][1].name(), "clock");
+        assert_eq!(layout.lines[0][1].name(), "time");
         assert_eq!(layout.right[0].name(), "cpu");
         assert!(layout.asynchronous.is_empty());
     }
@@ -730,7 +736,7 @@ style = { foreground = "muted" }
         let overlay = r#"
 version = 1
 [layout]
-lines = [["directory", "clock"]]
+lines = [["directory", "time"]]
 "#;
         let error = validate_overlay(overlay).unwrap_err();
         assert!(error.to_string().contains("missing configuration"));
@@ -738,7 +744,7 @@ lines = [["directory", "clock"]]
 
     #[test]
     fn reserved_custom_segment_ids_are_rejected() {
-        for reserved in ["git", "python", "directory", "status", "character"] {
+        for reserved in ["git", "python", "directory", "clock", "status", "character"] {
             let overlay = format!(
                 "version = 1\n[layout]\nlines = [[\"directory\"]]\n\
                  [segments.custom.{reserved}]\nstyle = {{ foreground = \"accent\" }}\n"
@@ -755,8 +761,8 @@ lines = [["directory", "clock"]]
         let overlay = r#"
 version = 1
 [layout]
-lines = [["directory", "clock-time"]]
-[segments.custom.clock-time]
+lines = [["directory", "time-time"]]
+[segments.custom.time-time]
 style = { foreground = "accent" }
 "#;
         assert!(validate_overlay(overlay).is_err());
@@ -764,8 +770,8 @@ style = { foreground = "accent" }
         let overlay = r#"
 version = 1
 [layout]
-lines = [["directory", "clock"], ["clock"]]
-[segments.custom.clock]
+lines = [["directory", "time"], ["time"]]
+[segments.custom.time]
 style = { foreground = "accent" }
 "#;
         let error = validate_overlay(overlay).unwrap_err();
@@ -778,7 +784,7 @@ style = { foreground = "accent" }
 version = 1
 [layout]
 lines = [["directory"]]
-[segments.custom.clock]
+[segments.custom.time]
 style = { foreground = "accent" }
 "#;
         assert!(validate_overlay(overlay).is_ok());
@@ -788,11 +794,11 @@ style = { foreground = "accent" }
     fn custom_segment_theme_contracts_are_validated() {
         for overlay in [
             // Control character in prefix.
-            "version = 1\n[layout]\nlines = [[\"clock\"]]\n[segments.custom.clock]\nprefix = \"bad\\n\"\nstyle = { foreground = \"accent\" }\n",
+            "version = 1\n[layout]\nlines = [[\"time\"]]\n[segments.custom.time]\nprefix = \"bad\\n\"\nstyle = { foreground = \"accent\" }\n",
             // Unknown palette color in style.
-            "version = 1\n[layout]\nlines = [[\"clock\"]]\n[segments.custom.clock]\nstyle = { foreground = \"nope\" }\n",
+            "version = 1\n[layout]\nlines = [[\"time\"]]\n[segments.custom.time]\nstyle = { foreground = \"nope\" }\n",
             // Excessive spacing.
-            "version = 1\n[layout]\nlines = [[\"clock\"]]\n[segments.custom.clock]\nstyle = { foreground = \"accent\" }\nspacing = { after = 17 }\n",
+            "version = 1\n[layout]\nlines = [[\"time\"]]\n[segments.custom.time]\nstyle = { foreground = \"accent\" }\nspacing = { after = 17 }\n",
         ] {
             assert!(validate_overlay(overlay).is_err(), "accepted {overlay}");
         }
@@ -803,8 +809,8 @@ style = { foreground = "accent" }
         let overlay = r#"
 version = 1
 [layout]
-lines = [["character", "clock"]]
-[segments.custom.clock]
+lines = [["character", "time"]]
+[segments.custom.time]
 style = { foreground = "accent" }
 "#;
         assert!(validate_overlay(overlay).is_err());

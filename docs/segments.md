@@ -8,8 +8,8 @@ providers, and both are first-class layout entries.
 **Shell-provided segments** run synchronously in the interactive Zsh process
 during `precmd`. Each is one Zsh function:
 
-- `directory`, `status`, `character` — bundled with ztheme
-- user-defined segments such as `clock` or `load`
+- `directory`, `clock`, `status`, `character` — bundled with ztheme
+- user-defined segments such as `time` or `load`
 
 **Client-provided segments** are computed asynchronously by the per-shell
 `ztheme __client-daemon` process and delivered as finished, pre-styled
@@ -50,7 +50,7 @@ version = 1
 theme = "catppuccin-mocha"
 
 [custom_segments]
-enabled = ["clock", "cpu"]
+enabled = ["time", "cpu"]
 ```
 
 An id in `enabled` but absent from the active theme's layout is ignored. A
@@ -65,15 +65,16 @@ never read or executed. The segments directory is never scanned.
 Every segment file begins with exactly one identity line:
 
 ```zsh
-# ztheme-segment-v1: clock
+# ztheme-segment-v1: time
 ```
 
 The value after the colon is the segment id and must equal the filename stem
-(`clock.zsh` → `clock`) and the enablement entry. Bundled segments carry the
+(`time.zsh` → `time`) and the enablement entry. Bundled segments carry the
 same header:
 
 ```zsh
 # ztheme-segment-v1: directory
+# ztheme-segment-v1: clock
 # ztheme-segment-v1: status
 ```
 
@@ -88,7 +89,7 @@ A custom id:
 
 - is 1–64 bytes;
 - matches `[a-z][a-z0-9_]*` (lowercase start; letters, digits, underscores);
-- must not equal a bundled id (`directory`, `git`, `character`, `status`);
+- must not equal a bundled id (`directory`, `clock`, `git`, `character`, `status`);
 - must not equal any supported runtime name (`python`, `perl`, `java`,
   `kotlin`, `scala`, `rust`, `go`, `node`, `ruby`, `dotnet`, `c`, `cpp`).
 
@@ -125,7 +126,7 @@ ztheme_segment_<id>() {
 The dispatcher calls the function with the previous command status:
 
 ```zsh
-ztheme_segment_clock "$last_status"
+ztheme_segment_time "$last_status"
 ```
 
 Available context inside the function:
@@ -160,7 +161,7 @@ typeset -gA __ZTHEME_SEGMENT_OPEN
 typeset -gA __ZTHEME_SEGMENT_CLOSE
 ```
 
-Entries exist for `directory:default`, `status:success`, `status:error`,
+Entries exist for `directory:default`, `clock:default`, `status:success`, `status:error`,
 `character:success`, `character:error`, and `<custom-id>:default`. The
 function owns only the middle value; the renderer applies
 `<spacing-before><style><prefix>` before it and `<suffix><style-reset><spacing-after>`
@@ -182,9 +183,9 @@ The theme layout lists segment ids, including custom ones:
 ```toml
 [layout]
 lines = [["directory", "git", "character"]]
-right = ["clock"]
+right = ["time"]
 
-[segments.custom.clock]
+[segments.custom.time]
 prefix = "🕐 "
 suffix = ""
 style = { foreground = "muted" }
@@ -202,6 +203,24 @@ Rules:
 
 Custom segments use one style each in v1; per-variant styling exists only for
 the bundled `character` and `status` segments.
+
+## Bundled clock
+
+`clock` renders the local time as `HH:MM` without spawning a process. It is a
+normal synchronous layout segment and needs no file or configuration entry. It
+uses Zsh's `strftime` builtin from the standard `zsh/datetime` module:
+
+```toml
+[layout]
+right = ["clock", "status"]
+
+[segments.clock]
+prefix = " "
+style = { foreground = "muted" }
+spacing = { after = 1 }
+```
+
+Vesper enables this layout by default.
 
 ## Reload workflow
 
@@ -237,34 +256,38 @@ The prompt hot path gained no filesystem work:
 All filesystem discovery and validation happens once, during
 `ztheme init zsh` or `ztheme theme reload`.
 
-## Example: clock
+## Example: time
 
 ```text
-~/.config/ztheme/segments/clock.zsh
+~/.config/ztheme/segments/time.zsh
 ```
 
 ```zsh
-# ztheme-segment-v1: clock
+# ztheme-segment-v1: time
 
-ztheme_segment_clock() {
+zmodload -F zsh/datetime b:strftime || return 1
+
+ztheme_segment_time() {
     emulate -L zsh
-    _ztheme_segment_render clock "${(%):-%D{%H:%M}}"
+    local value
+    strftime -s value '%H:%M'
+    _ztheme_segment_render time "$value"
 }
 ```
 
 ```toml
 # ~/.config/ztheme/config.toml
 [custom_segments]
-enabled = ["clock"]
+enabled = ["time"]
 ```
 
 ```toml
 # theme overlay
 [layout]
 lines = [["directory", "git", "character"]]
-right = ["clock"]
+right = ["time"]
 
-[segments.custom.clock]
+[segments.custom.time]
 prefix = "🕐 "
 style = { foreground = "muted" }
 spacing = { before = 1, after = 0 }

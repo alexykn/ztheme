@@ -118,6 +118,17 @@ fn emit_segment_themes(
         "directory:default",
     )?;
 
+    let clock = &segments.clock;
+    emit_style_entry(
+        output,
+        theme,
+        &clock.style,
+        &clock.prefix,
+        &clock.suffix,
+        clock.spacing,
+        "clock:default",
+    )?;
+
     let character = &segments.character;
     scalar(
         output,

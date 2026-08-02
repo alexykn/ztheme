@@ -68,8 +68,8 @@ lines = [
     ],
     ["character"],
 ]
-right = ["status"]
-separator = "  "
+right = ["status", "clock"]
+separator = " "
 blank_line_before = true
 
 [segments.directory]
@@ -81,6 +81,10 @@ style = { foreground = "path", bold = true }
 percent = 55
 minimum = 28
 maximum = 96
+
+[segments.clock]
+prefix = " "
+style = { foreground = "faint" }
 
 [segments.git]
 prefix = ""

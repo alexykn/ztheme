@@ -128,7 +128,7 @@ lines = [
     ["directory", "git", "python", "rust"],
     ["character"],
 ]
-right = ["status"]
+right = ["clock", "status"]
 
 [segments.git]
 prefix = "on "
@@ -148,7 +148,7 @@ ztheme theme edit my-theme
 ztheme theme reload
 ```
 
-Layouts may use `directory`, `git`, `character`, `status`, and the runtime
+Layouts may use `directory`, `clock`, `git`, `character`, `status`, and the runtime
 segments `python`, `perl`, `java`, `kotlin`, `scala`, `rust`, `go`, `bun`,
 `deno`, `node`, `ruby`, `php`, `dotnet`, `c`, `cpp`, `swift`, and `lua`.
 

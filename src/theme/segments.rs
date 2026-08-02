@@ -148,22 +148,23 @@ mod tests {
 
     #[test]
     fn identifier_grammar_accepts_and_rejects() {
-        for valid in ["clock", "cpu_load", "a", "z9_0"] {
+        for valid in ["time", "cpu_load", "a", "z9_0"] {
             assert!(valid_custom_identifier(valid), "rejected `{valid}`");
         }
         for invalid in [
             "",
             "Clock",
-            "0clock",
-            "clock-time",
-            "clock.time",
-            "clock time",
+            "0time",
+            "time-time",
+            "time.time",
+            "time time",
             "C",
             "a".repeat(65).as_str(),
             "git",
             "character",
             "status",
             "directory",
+            "clock",
             "python",
             "rust",
             "node",
@@ -175,15 +176,15 @@ mod tests {
     #[test]
     fn allowlist_rejects_duplicates_and_invalid_ids() {
         assert!(validate_enabled_segments(&[]).is_ok());
-        assert!(validate_enabled_segments(&["clock".to_owned()]).is_ok());
-        assert!(validate_enabled_segments(&["clock".to_owned(), "cpu".to_owned()]).is_ok());
+        assert!(validate_enabled_segments(&["time".to_owned()]).is_ok());
+        assert!(validate_enabled_segments(&["time".to_owned(), "cpu".to_owned()]).is_ok());
 
         assert!(
-            validate_enabled_segments(&["clock".to_owned(), "clock".to_owned()]).is_err(),
+            validate_enabled_segments(&["time".to_owned(), "time".to_owned()]).is_err(),
             "accepted a duplicate"
         );
         assert!(
-            validate_enabled_segments(&["clock-time".to_owned()]).is_err(),
+            validate_enabled_segments(&["time-time".to_owned()]).is_err(),
             "accepted an invalid id"
         );
         assert!(
@@ -200,16 +201,16 @@ mod tests {
     fn enabled_active_segment_resolves_with_matching_file_and_header() {
         let (root, _guard) = write_theme_files(|home| {
             std::fs::write(
-                segments_dir(home).join("clock.zsh"),
-                "# ztheme-segment-v1: clock\nztheme_segment_clock() { :; }\n",
+                segments_dir(home).join("time.zsh"),
+                "# ztheme-segment-v1: time\nztheme_segment_time() { :; }\n",
             )
             .unwrap();
         });
         let resolved =
-            resolve_custom_segments(&config(&["clock"]), &["clock".to_owned()], &root).unwrap();
+            resolve_custom_segments(&config(&["time"]), &["time".to_owned()], &root).unwrap();
         assert_eq!(resolved.len(), 1);
-        assert_eq!(resolved[0].id, "clock");
-        assert_eq!(resolved[0].path, segments_dir(&root).join("clock.zsh"));
+        assert_eq!(resolved[0].id, "time");
+        assert_eq!(resolved[0].path, segments_dir(&root).join("time.zsh"));
     }
 
     #[test]
@@ -220,9 +221,7 @@ mod tests {
         // A stray file is never scanned; resolving an unrelated id fails only
         // on the missing active file, and an empty active set resolves to
         // nothing.
-        assert!(
-            resolve_custom_segments(&config(&["clock"]), &["clock".to_owned()], &root).is_err()
-        );
+        assert!(resolve_custom_segments(&config(&["time"]), &["time".to_owned()], &root).is_err());
         let resolved = resolve_custom_segments(&config(&[]), &[], &root).unwrap();
         assert!(resolved.is_empty());
     }
@@ -231,13 +230,12 @@ mod tests {
     fn active_but_disabled_segment_fails() {
         let (root, _guard) = write_theme_files(|home| {
             std::fs::write(
-                segments_dir(home).join("clock.zsh"),
-                "# ztheme-segment-v1: clock\n",
+                segments_dir(home).join("time.zsh"),
+                "# ztheme-segment-v1: time\n",
             )
             .unwrap();
         });
-        let error =
-            resolve_custom_segments(&config(&[]), &["clock".to_owned()], &root).unwrap_err();
+        let error = resolve_custom_segments(&config(&[]), &["time".to_owned()], &root).unwrap_err();
         assert!(error.to_string().contains("not enabled"));
     }
 
@@ -245,7 +243,7 @@ mod tests {
     fn missing_active_file_fails() {
         let (root, _guard) = write_theme_files(|_| {});
         let error =
-            resolve_custom_segments(&config(&["clock"]), &["clock".to_owned()], &root).unwrap_err();
+            resolve_custom_segments(&config(&["time"]), &["time".to_owned()], &root).unwrap_err();
         assert!(error.to_string().contains("does not exist"));
     }
 
@@ -253,28 +251,26 @@ mod tests {
     fn headerless_file_fails() {
         let (root, _guard) = write_theme_files(|home| {
             std::fs::write(
-                segments_dir(home).join("clock.zsh"),
-                "ztheme_segment_clock() { :; }\n",
+                segments_dir(home).join("time.zsh"),
+                "ztheme_segment_time() { :; }\n",
             )
             .unwrap();
         });
-        assert!(
-            resolve_custom_segments(&config(&["clock"]), &["clock".to_owned()], &root).is_err()
-        );
+        assert!(resolve_custom_segments(&config(&["time"]), &["time".to_owned()], &root).is_err());
     }
 
     #[test]
     fn mismatched_or_unsupported_header_fails() {
         for header in [
             "# ztheme-segment-v1: watch\n",
-            "# ztheme-segment-v2: clock\n",
+            "# ztheme-segment-v2: time\n",
             "# ztheme-segment-v1:cloc\n",
-            " # ztheme-segment-v1: clock\n",
+            " # ztheme-segment-v1: time\n",
         ] {
             let (root, _guard) = write_theme_files(|home| {
-                std::fs::write(segments_dir(home).join("clock.zsh"), header).unwrap();
+                std::fs::write(segments_dir(home).join("time.zsh"), header).unwrap();
             });
-            let error = resolve_custom_segments(&config(&["clock"]), &["clock".to_owned()], &root)
+            let error = resolve_custom_segments(&config(&["time"]), &["time".to_owned()], &root)
                 .unwrap_err();
             assert!(
                 error.to_string().contains("must start with"),
@@ -288,18 +284,18 @@ mod tests {
         let (root, _guard) = write_theme_files(|home| {
             std::fs::write(
                 segments_dir(home).join("target.zsh"),
-                "# ztheme-segment-v1: clock\n",
+                "# ztheme-segment-v1: time\n",
             )
             .unwrap();
             std::os::unix::fs::symlink(
                 segments_dir(home).join("target.zsh"),
-                segments_dir(home).join("clock.zsh"),
+                segments_dir(home).join("time.zsh"),
             )
             .unwrap();
             std::fs::create_dir_all(segments_dir(home).join("cpu.zsh")).unwrap();
         });
         assert!(
-            resolve_custom_segments(&config(&["clock"]), &["clock".to_owned()], &root).is_err(),
+            resolve_custom_segments(&config(&["time"]), &["time".to_owned()], &root).is_err(),
             "accepted a symlink"
         );
         assert!(
@@ -312,8 +308,8 @@ mod tests {
     fn enabled_but_inactive_segment_is_not_sourced() {
         let (root, _guard) = write_theme_files(|home| {
             std::fs::write(
-                segments_dir(home).join("clock.zsh"),
-                "# ztheme-segment-v1: clock\n",
+                segments_dir(home).join("time.zsh"),
+                "# ztheme-segment-v1: time\n",
             )
             .unwrap();
             std::fs::write(
@@ -323,21 +319,21 @@ mod tests {
             .unwrap();
         });
         let resolved =
-            resolve_custom_segments(&config(&["clock", "cpu"]), &["clock".to_owned()], &root)
+            resolve_custom_segments(&config(&["time", "cpu"]), &["time".to_owned()], &root)
                 .unwrap();
         assert_eq!(resolved.len(), 1);
-        assert_eq!(resolved[0].id, "clock");
+        assert_eq!(resolved[0].id, "time");
     }
 
     #[test]
     fn crlf_line_endings_are_tolerated() {
         let (root, _guard) = write_theme_files(|home| {
             std::fs::write(
-                segments_dir(home).join("clock.zsh"),
-                "# ztheme-segment-v1: clock\r\nztheme_segment_clock() { :; }\r\n",
+                segments_dir(home).join("time.zsh"),
+                "# ztheme-segment-v1: time\r\nztheme_segment_time() { :; }\r\n",
             )
             .unwrap();
         });
-        assert!(resolve_custom_segments(&config(&["clock"]), &["clock".to_owned()], &root).is_ok());
+        assert!(resolve_custom_segments(&config(&["time"]), &["time".to_owned()], &root).is_ok());
     }
 }

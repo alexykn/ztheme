@@ -25,6 +25,7 @@ const REQUEST_TIMEOUT: Duration = Duration::from_millis(550);
 const ZSH_DEFAULTS: &str = include_str!("../../shell/defaults.zsh");
 const ZSH_INTEGRATION: &str = include_str!("../../shell/ztheme.zsh");
 const ZSH_DIRECTORY_SEGMENT: &str = include_str!("../../shell/segments/directory.zsh");
+const ZSH_CLOCK_SEGMENT: &str = include_str!("../../shell/segments/clock.zsh");
 const ZSH_STATUS_SEGMENT: &str = include_str!("../../shell/segments/status.zsh");
 const ZSH_CHARACTER_SEGMENT: &str = include_str!("../../shell/segments/character.zsh");
 
@@ -168,7 +169,9 @@ pub fn init_zsh(instance: &daemon::Instance, selector: Option<&str>) -> io::Resu
     // the segments directory; this is the only point that touches the
     // filesystem or the config outside the prompt hot path.
     let custom_segments = theme.custom_sources()?;
-    let bundled = format!("{ZSH_DIRECTORY_SEGMENT}{ZSH_STATUS_SEGMENT}{ZSH_CHARACTER_SEGMENT}");
+    let bundled = format!(
+        "{ZSH_DIRECTORY_SEGMENT}{ZSH_CLOCK_SEGMENT}{ZSH_STATUS_SEGMENT}{ZSH_CHARACTER_SEGMENT}"
+    );
     Ok(ZSH_INTEGRATION
         .replace("@ZTHEME_BIN@", &binary)
         .replace("@ZTHEME_INSTANCE_ARGS@", &instance_arguments)

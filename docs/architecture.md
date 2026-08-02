@@ -52,7 +52,7 @@ through one event loop.
 
 ## Segments
 
-Synchronous prompt segments (directory, status, character, and user-defined
+Synchronous prompt segments (directory, clock, status, character, and user-defined
 segments) are Zsh functions invoked once per prompt by a generic dispatcher.
 Custom segments are opt-in per file, validated at init/reload time, and
 embedded or sourced before the shell starts. Git and runtime segments remain

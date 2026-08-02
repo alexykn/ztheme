@@ -413,6 +413,7 @@ fn render_example_segments(
     for segment in segments {
         let fragment = match segment {
             LayoutSegment::BuiltIn(SegmentId::Directory) => sample_directory(theme, color)?,
+            LayoutSegment::BuiltIn(SegmentId::Clock) => String::new(),
             LayoutSegment::BuiltIn(SegmentId::Git) => sample_git(theme, color)?,
             LayoutSegment::BuiltIn(SegmentId::Runtime(Runtime::Python)) => {
                 sample_python(theme, color)?

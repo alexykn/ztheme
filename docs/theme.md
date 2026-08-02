@@ -73,7 +73,7 @@ lines = [
     ["directory", "git", "python", "rust"],
     ["character"],
 ]
-right = ["status"]
+right = ["clock", "status"]
 separator = " "
 blank_line_before = true
 ```
@@ -81,7 +81,7 @@ blank_line_before = true
 | Key | Type | Meaning |
 | --- | --- | --- |
 | `lines` | array of arrays of segment names | Left prompt, from top to bottom. There must be 1–8 non-empty lines. |
-| `right` | array of segment names | Right prompt. Only `directory` and `status` are allowed here. |
+| `right` | array of segment names | Right prompt. Only `directory`, `clock`, and `status` are allowed here. |
 | `separator` | string | Inserted between non-empty segments on the same side. |
 | `blank_line_before` | boolean | Adds one blank line before the left prompt. |
 
@@ -93,7 +93,7 @@ only.
 The accepted segment names are:
 
 ```text
-directory  git  character  status
+directory  clock  git  character  status
 python  perl  java  kotlin  scala  rust  go  bun  deno  node  ruby
 php  dotnet  c  cpp  swift  lua
 ```
@@ -124,6 +124,21 @@ maximum = 72
 theme. The display-width budget is `percent` of terminal width, clamped between
 `minimum` and `maximum`. `percent` must be 1–100; `minimum` must be positive
 and no greater than `maximum`.
+
+### `segments.clock`
+
+`clock` is immediate and renders the local time as `HH:MM` without spawning a
+process. It may appear on either prompt side.
+
+```toml
+[segments.clock]
+prefix = " "
+suffix = ""
+style = { foreground = "muted" }
+spacing = { before = 0, after = 0 }
+```
+
+Only `prefix`, `suffix`, and `spacing` are optional after inheritance.
 
 ### `segments.git`
 
@@ -257,6 +272,7 @@ layout.separator
 layout.blank_line_before
 segments.directory.*
 segments.directory.width.*
+segments.clock.*
 segments.git.*
 segments.git.symbols.*
 segments.git.styles.*

@@ -64,6 +64,7 @@ pub(super) struct Layout {
 #[derive(Clone, Deserialize)]
 pub(super) struct Segments {
     pub(super) directory: DirectoryTheme,
+    pub(super) clock: CustomSegmentTheme,
     pub(super) git: GitTheme,
     pub(super) character: CharacterTheme,
     pub(super) status: StatusTheme,

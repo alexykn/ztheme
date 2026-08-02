@@ -115,6 +115,11 @@ percent = 45
 minimum = 24
 maximum = 72
 
+[segments.clock]
+prefix = " "
+style = { foreground = "muted" }
+spacing = { before = 1 }
+
 [segments.git]
 prefix = "on "
 symbol = " "

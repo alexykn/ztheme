@@ -55,7 +55,7 @@ pub(super) fn compile(theme: &Theme, segments: &[SegmentId]) -> io::Result<Async
                     .ok_or_else(|| invalid(format!("missing segments.{}", runtime.name())))?;
                 runtimes.insert(*runtime, compile_runtime(runtime_theme, theme)?);
             }
-            SegmentId::Directory | SegmentId::Character | SegmentId::Status => {}
+            SegmentId::Directory | SegmentId::Clock | SegmentId::Character | SegmentId::Status => {}
         }
     }
     Ok(AsyncTheme { git, runtimes })
