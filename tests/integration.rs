@@ -347,8 +347,15 @@ fn wait_for_socket(child: &mut Child, directory: &Path) -> PathBuf {
                 let Ok(owner) = fs::read_to_string(&path) else {
                     continue;
                 };
-                if owner.trim() == pid.to_string() {
-                    return path.with_extension("sock");
+                if owner.trim() != pid.to_string() {
+                    continue;
+                }
+                // The daemon writes its pid to the lock file before binding
+                // the socket, so ownership alone is not a ready condition;
+                // wait for the socket file itself, which appears at bind.
+                let socket = path.with_extension("sock");
+                if fs::symlink_metadata(&socket).is_ok() {
+                    return socket;
                 }
             }
         }
@@ -361,7 +368,13 @@ fn wait_for_socket(child: &mut Child, directory: &Path) -> PathBuf {
 }
 
 fn shutdown_outdated_daemon(socket: &Path) {
-    let mut stream = UnixStream::connect(socket).unwrap();
+    let mut stream = UnixStream::connect(socket).unwrap_or_else(|error| {
+        panic!(
+            "connect to {} failed: {error} (socket exists: {})",
+            socket.display(),
+            socket.exists()
+        );
+    });
     stream.write_all(b"ZT").unwrap();
     stream.write_all(&3_u16.to_be_bytes()).unwrap();
     let mut response = [0];
