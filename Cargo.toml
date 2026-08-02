@@ -1,6 +1,6 @@
 [package]
 name = "ztheme"
-version = "1.5.1"
+version = "1.6.0"
 edition = "2024"
 rust-version = "1.97"
 description = "Fast asynchronous Zsh prompt"
