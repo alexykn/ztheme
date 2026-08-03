@@ -359,8 +359,7 @@ mod tests {
 
     const ENV_FIELD_COUNT: usize = REQUEST_FIELDS.len();
 
-    fn request(cwd: &[u8], fields: &[&[u8]]) -> Vec<u8> {
-        assert_eq!(fields.len(), ENV_FIELD_COUNT);
+    fn request(cwd: &[u8], values: &[(&str, &[u8])]) -> Vec<u8> {
         let mut bytes = REQUEST_MAGIC.to_vec();
         bytes.push(0);
         bytes.extend_from_slice(REQUEST_VERSION.as_bytes());
@@ -369,8 +368,14 @@ mod tests {
         bytes.push(0);
         bytes.extend_from_slice(cwd);
         bytes.push(0);
-        for field in fields {
-            bytes.extend_from_slice(field);
+        // The wire layout comes from the shared definition, so a field added
+        // to REQUEST_FIELDS appears here without a manual step.
+        for field in REQUEST_FIELDS {
+            let value = match values.iter().find(|&&(name, _)| name == *field) {
+                Some(&(_, value)) => value,
+                None => &[],
+            };
+            bytes.extend_from_slice(value);
             bytes.push(0);
         }
         bytes
@@ -378,38 +383,14 @@ mod tests {
 
     #[test]
     fn parses_a_complete_request_with_environment() {
-        let fields: [&[u8]; ENV_FIELD_COUNT] = [
-            b"/opt/bin:/usr/bin",
-            b"/home/user",
-            b"",
-            b"/work/tree",
-            b"",
-            b"",
-            b"",
-            b"",
-            b"",
-            b"",
-            b"",
-            b"",
-            b"",
-            b"",
-            b"",
-            b"",
-            b"",
-            b"",
-            b"",
-            b"",
-            b"",
-            b"",
-            b"",
-            b"",
-            b"",
-            b"",
-            b"",
-            b"",
-            b"",
-        ];
-        let bytes = request(b"/work/project", &fields);
+        let bytes = request(
+            b"/work/project",
+            &[
+                ("PATH", b"/opt/bin:/usr/bin"),
+                ("HOME", b"/home/user"),
+                ("GIT_WORK_TREE", b"/work/tree"),
+            ],
+        );
         let mut reader = BufReader::new(&bytes[..]);
         let request = read_request(&mut reader).unwrap().unwrap();
 
@@ -439,38 +420,17 @@ mod tests {
 
     #[test]
     fn new_selector_fields_round_trip_and_empty_values_are_none() {
-        let fields: [&[u8]; ENV_FIELD_COUNT] = [
-            b"",
-            b"",
-            b"",
-            b"",
-            b"",
-            b"",
-            b"",
-            b"",
-            b"",
-            b"",
-            b"",
-            b"",
-            b"",
-            b"",
-            b"",
-            b"",
-            b"",
-            b"",
-            b"",
-            b"",
-            b"",
-            b"",
-            b"",
-            b"release",
-            b"/depot-a",
-            b"@project",
-            b":",
-            b"/depot-b",
-            b"/x86_64",
-        ];
-        let bytes = request(b"/work", &fields);
+        let bytes = request(
+            b"/work",
+            &[
+                ("JULIAUP_CHANNEL", b"release"),
+                ("JULIAUP_DEPOT_PATH", b"/depot-a"),
+                ("JULIA_PROJECT", b"@project"),
+                ("JULIA_LOAD_PATH", b":"),
+                ("JULIA_DEPOT_PATH", b"/depot-b"),
+                ("R_ARCH", b"/x86_64"),
+            ],
+        );
         let mut reader = BufReader::new(&bytes[..]);
         let request = read_request(&mut reader).unwrap().unwrap();
 
@@ -506,10 +466,13 @@ mod tests {
         channel.push(0xff);
         let mut arch = b"R_".to_vec();
         arch.push(0xfe);
-        let mut fields: [&[u8]; ENV_FIELD_COUNT] = [b""; ENV_FIELD_COUNT];
-        fields[23] = &channel;
-        fields[28] = &arch;
-        let bytes = request(b"/work", &fields);
+        let bytes = request(
+            b"/work",
+            &[
+                ("JULIAUP_CHANNEL", channel.as_slice()),
+                ("R_ARCH", arch.as_slice()),
+            ],
+        );
         let mut reader = BufReader::new(&bytes[..]);
         let request = read_request(&mut reader).unwrap().unwrap();
 
@@ -527,11 +490,9 @@ mod tests {
     fn non_utf8_cwd_and_environment_round_trip() {
         let mut git_dir = b"/repo-".to_vec();
         git_dir.push(0xff);
-        let mut fields: [&[u8]; ENV_FIELD_COUNT] = [b""; ENV_FIELD_COUNT];
-        fields[2] = &git_dir;
         let mut cwd = b"/cwd-".to_vec();
         cwd.push(0xfe);
-        let bytes = request(&cwd, &fields);
+        let bytes = request(&cwd, &[("GIT_DIR", git_dir.as_slice())]);
         let mut reader = BufReader::new(&bytes[..]);
         let request = read_request(&mut reader).unwrap().unwrap();
 
@@ -544,8 +505,7 @@ mod tests {
 
     #[test]
     fn malformed_requests_are_rejected() {
-        let empty: [&[u8]; ENV_FIELD_COUNT] = [b""; ENV_FIELD_COUNT];
-        let valid = request(b"/work", &empty);
+        let valid = request(b"/work", &[]);
 
         // bytes: ZTREQ\0 3\0 42\0 /work\0 then 29 empty fields
         let mut bad_magic = valid.clone();
