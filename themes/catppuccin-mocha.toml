@@ -287,3 +287,39 @@ prefix = "via "
 symbol = " "
 version_prefix = "v"
 style = { foreground = "accent" }
+
+[segments.r]
+prefix = "via "
+symbol = "󰟢 "
+version_prefix = "v"
+style = { foreground = "accent" }
+
+[segments.julia]
+prefix = "via "
+symbol = " "
+version_prefix = "v"
+style = { foreground = "accent" }
+
+[segments.elixir]
+prefix = "via "
+symbol = " "
+version_prefix = "v"
+style = { foreground = "accent" }
+
+[segments.dart]
+prefix = "via "
+symbol = " "
+version_prefix = "v"
+style = { foreground = "accent" }
+
+[segments.haskell]
+prefix = "via "
+symbol = " "
+version_prefix = "v"
+style = { foreground = "accent" }
+
+[segments.zig]
+prefix = "via "
+symbol = " "
+version_prefix = "v"
+style = { foreground = "accent" }

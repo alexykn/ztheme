@@ -47,6 +47,7 @@ pub(crate) enum VolatileReason {
     UnsupportedContextualSelection,
     UnreadableDependency,
     SearchDepthExceeded,
+    NotYetCacheable,
 }
 
 #[derive(Clone, Debug)]
@@ -190,13 +191,24 @@ fn finalize_plan(cwd: &Path, plan: BasePlan, environment: &PromptEnvironment) ->
         };
     }
 
-    if runtime == Runtime::Dotnet {
-        return volatile(
-            runtime,
-            spec,
-            program,
-            VolatileReason::UnsupportedContextualSelection,
-        );
+    match runtime {
+        Runtime::Dotnet => {
+            return volatile(
+                runtime,
+                spec,
+                program,
+                VolatileReason::UnsupportedContextualSelection,
+            );
+        }
+        Runtime::R
+        | Runtime::Julia
+        | Runtime::Elixir
+        | Runtime::Dart
+        | Runtime::Haskell
+        | Runtime::Zig => {
+            return volatile(runtime, spec, program, VolatileReason::NotYetCacheable);
+        }
+        _ => {}
     }
 
     classify_resolved_target(runtime, spec, program.clone(), program)
@@ -1633,6 +1645,54 @@ mod tests {
             "unexpected rustup plan: {:?}",
             plan[0]
         );
+    }
+
+    #[test]
+    fn new_runtimes_are_volatile_until_caching_is_evaluated() {
+        let directory = TestDirectory::new();
+        for marker in [
+            "DESCRIPTION",
+            "Project.toml",
+            "mix.exs",
+            "pubspec.yaml",
+            "stack.yaml",
+            "build.zig",
+        ] {
+            fs::write(directory.path().join(marker), b"").unwrap();
+        }
+        let bin = directory.path().join("bin");
+        fs::create_dir(&bin).unwrap();
+        for program in ["R", "julia", "elixir", "dart", "ghc", "zig"] {
+            executable(&bin.join(program));
+        }
+        let environment = PromptEnvironment {
+            path: Some(bin.clone().into()),
+            ..PromptEnvironment::default()
+        };
+        let runtimes = [
+            Runtime::R,
+            Runtime::Julia,
+            Runtime::Elixir,
+            Runtime::Dart,
+            Runtime::Haskell,
+            Runtime::Zig,
+        ];
+
+        for runtime in runtimes {
+            let plan = plan_for(directory.path(), &[runtime], &environment)
+                .into_iter()
+                .next()
+                .unwrap();
+            assert!(
+                matches!(
+                    plan.cache,
+                    Cacheability::Volatile(VolatileReason::NotYetCacheable)
+                ),
+                "unexpected plan for {}: {:?}",
+                runtime.name(),
+                plan
+            );
+        }
     }
 
     #[test]

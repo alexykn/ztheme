@@ -233,9 +233,6 @@ impl AsyncTheme {
 
     pub fn render_runtime(&self, value: &RuntimeValue) -> Option<String> {
         let theme = self.runtimes.get(&value.runtime)?;
-        if value.version.is_empty() {
-            return Some(String::new());
-        }
         let mut fragment = format!(
             "{}{}{}{}",
             theme.before, theme.style, theme.prefix, theme.symbol
@@ -243,13 +240,21 @@ impl AsyncTheme {
         if let Some(label) = value.label.as_deref() {
             write!(fragment, "{} ", prompt_text(label)).expect("writing to a String cannot fail");
         }
-        write!(
-            fragment,
-            "{}{}{STYLE_RESET}",
-            theme.version_prefix,
-            prompt_text(&value.version)
-        )
-        .expect("writing to a String cannot fail");
+        match &value.version {
+            Some(version) => {
+                write!(
+                    fragment,
+                    "{}{}{STYLE_RESET}",
+                    theme.version_prefix,
+                    prompt_text(version)
+                )
+                .expect("writing to a String cannot fail");
+            }
+            // The executable is missing: keep the symbol and show the language
+            // name instead of a version, so the detected runtime stays visible.
+            None => write!(fragment, "{}{STYLE_RESET}", value.runtime.display_name())
+                .expect("writing to a String cannot fail"),
+        }
         if let Some(environment) = value.environment.as_deref() {
             write!(
                 fragment,
@@ -514,7 +519,7 @@ mod tests {
         git.changes = STAGED | UNTRACKED;
         let runtime = RuntimeValue {
             runtime: Runtime::Python,
-            version: "3.14.6".to_owned(),
+            version: Some("3.14.6".to_owned()),
             label: Some("cpython".to_owned()),
             environment: Some(".venv".to_owned()),
         };
@@ -557,7 +562,7 @@ mod tests {
     }
 
     #[test]
-    fn empty_git_and_runtime_values_do_not_render_content() {
+    fn missing_executable_renders_the_symbol_and_language_name_without_version() {
         let theme = compiled();
         assert_eq!(theme.render_git(None), "");
 
@@ -568,11 +573,14 @@ mod tests {
 
         let runtime = RuntimeValue {
             runtime: Runtime::Python,
-            version: String::new(),
+            version: None,
             label: None,
             environment: None,
         };
-        assert_eq!(theme.render_runtime(&runtime).as_deref(), Some(""));
+        let rendered = theme.render_runtime(&runtime).unwrap();
+        assert!(!rendered.is_empty());
+        assert!(rendered.contains("Python"));
+        assert!(!rendered.contains("."));
     }
 
     #[test]
@@ -580,7 +588,7 @@ mod tests {
         let rendered = compiled()
             .render_runtime(&RuntimeValue {
                 runtime: Runtime::Python,
-                version: "3.14%dev".to_owned(),
+                version: Some("3.14%dev".to_owned()),
                 label: Some("cpython\nfast".to_owned()),
                 environment: Some("venv\tone".to_owned()),
             })

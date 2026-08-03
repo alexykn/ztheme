@@ -95,7 +95,7 @@ The accepted segment names are:
 ```text
 directory  clock  git  character  status
 python  perl  java  kotlin  scala  rust  go  bun  deno  node  ruby
-php  dotnet  c  cpp  swift  lua
+php  dotnet  c  cpp  swift  lua  r  julia  elixir  dart  haskell  zig
 ```
 
 ## Prompt segments
@@ -227,7 +227,8 @@ their decimal code and `style`. `prefix`, `suffix`, and `spacing` are optional.
 ### Runtime segments
 
 The runtime names are `python`, `perl`, `java`, `kotlin`, `scala`, `rust`, `go`,
-`bun`, `deno`, `node`, `ruby`, `php`, `dotnet`, `c`, `cpp`, `swift`, and `lua`.
+`bun`, `deno`, `node`, `ruby`, `php`, `dotnet`, `c`, `cpp`, `swift`, `lua`, `r`,
+`julia`, `elixir`, `dart`, `haskell`, and `zig`.
 Each is configured with the same schema:
 
 ```toml

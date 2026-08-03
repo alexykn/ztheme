@@ -136,6 +136,10 @@ Volatile execution is the conservative fallback. It preserves current results
 without requiring ztheme to become a general-purpose version or package
 manager.
 
+The `r`, `julia`, `elixir`, `dart`, `haskell`, and `zig` runtimes are currently
+always volatile while their caching model is being evaluated. They execute on
+every prompt where detected and are never stored in the semantic cache.
+
 ## Command environment
 
 Every runtime command starts from a cleared environment with deterministic

@@ -150,7 +150,8 @@ ztheme theme reload
 
 Layouts may use `directory`, `clock`, `git`, `character`, `status`, and the runtime
 segments `python`, `perl`, `java`, `kotlin`, `scala`, `rust`, `go`, `bun`,
-`deno`, `node`, `ruby`, `php`, `dotnet`, `c`, `cpp`, `swift`, and `lua`.
+`deno`, `node`, `ruby`, `php`, `dotnet`, `c`, `cpp`, `swift`, `lua`, `r`,
+`julia`, `elixir`, `dart`, `haskell`, and `zig`.
 
 Colors accept palette names or `#RRGGBB`. Styles support `foreground`,
 `background`, `bold`, `underline`, and `standout`.

@@ -239,6 +239,59 @@ fn detect_markers(names: &HashSet<OsString>, runtimes: &mut HashSet<Runtime>) {
     if has_any(names, &[".luarc.json", ".luacheckrc", ".lua-version"]) {
         runtimes.insert(Runtime::Lua);
     }
+
+    if has_any(
+        names,
+        &[
+            "DESCRIPTION",
+            "NAMESPACE",
+            "renv.lock",
+            "packrat.lock",
+            ".Rprofile",
+        ],
+    ) {
+        runtimes.insert(Runtime::R);
+    }
+
+    if has_any(
+        names,
+        &["Project.toml", "Manifest.toml", "JuliaProject.toml"],
+    ) {
+        runtimes.insert(Runtime::Julia);
+    }
+
+    if has_any(names, &["mix.exs", "mix.lock", ".elixir-version"]) {
+        runtimes.insert(Runtime::Elixir);
+    }
+
+    if has_any(
+        names,
+        &[
+            "pubspec.yaml",
+            "pubspec.lock",
+            "analysis_options.yaml",
+            ".dart_tool",
+        ],
+    ) {
+        runtimes.insert(Runtime::Dart);
+    }
+
+    if has_any(
+        names,
+        &[
+            "cabal.project",
+            "stack.yaml",
+            "stack.yaml.lock",
+            "package.yaml",
+            "Setup.hs",
+        ],
+    ) {
+        runtimes.insert(Runtime::Haskell);
+    }
+
+    if has_any(names, &["build.zig", "build.zig.zon", "zig-out"]) {
+        runtimes.insert(Runtime::Zig);
+    }
 }
 
 fn detect_javascript(names: &HashSet<OsString>) -> Option<Runtime> {
@@ -285,6 +338,12 @@ fn detect_project_extensions(names: &HashSet<OsString>, runtimes: &mut HashSet<R
             }
             "rockspec" => {
                 runtimes.insert(Runtime::Lua);
+            }
+            "Rproj" => {
+                runtimes.insert(Runtime::R);
+            }
+            "cabal" => {
+                runtimes.insert(Runtime::Haskell);
             }
             _ => {}
         }
@@ -400,6 +459,62 @@ mod tests {
         );
         assert!(project.runtimes.contains(&Runtime::Cpp));
         assert!(!project.runtimes.contains(&Runtime::C));
+    }
+
+    #[test]
+    fn detects_new_volatile_runtime_markers() {
+        let directory = TestDirectory::new();
+        fs::write(directory.path().join("DESCRIPTION"), b"Package: foo\n").unwrap();
+        fs::write(directory.path().join("Project.toml"), b"").unwrap();
+        fs::write(directory.path().join("mix.exs"), b"").unwrap();
+        fs::write(directory.path().join("pubspec.yaml"), b"").unwrap();
+        fs::write(directory.path().join("stack.yaml"), b"").unwrap();
+        fs::write(directory.path().join("build.zig"), b"").unwrap();
+
+        let project = detect(
+            directory.path(),
+            Some(directory.path()),
+            &Runtime::ALL,
+            &PromptEnvironment::default(),
+        );
+        assert!(project.runtimes.contains(&Runtime::R));
+        assert!(project.runtimes.contains(&Runtime::Julia));
+        assert!(project.runtimes.contains(&Runtime::Elixir));
+        assert!(project.runtimes.contains(&Runtime::Dart));
+        assert!(project.runtimes.contains(&Runtime::Haskell));
+        assert!(project.runtimes.contains(&Runtime::Zig));
+    }
+
+    #[test]
+    fn rproj_extension_detects_the_r_runtime() {
+        let directory = TestDirectory::new();
+        fs::write(directory.path().join("project.Rproj"), b"").unwrap();
+
+        let project = detect(
+            directory.path(),
+            Some(directory.path()),
+            &Runtime::ALL,
+            &PromptEnvironment::default(),
+        );
+        assert!(project.runtimes.contains(&Runtime::R));
+    }
+
+    #[test]
+    fn cabal_extension_detects_haskell() {
+        let directory = TestDirectory::new();
+        fs::write(
+            directory.path().join("my-package.cabal"),
+            b"cabal-version: 3.0\n",
+        )
+        .unwrap();
+
+        let project = detect(
+            directory.path(),
+            Some(directory.path()),
+            &Runtime::ALL,
+            &PromptEnvironment::default(),
+        );
+        assert!(project.runtimes.contains(&Runtime::Haskell));
     }
 
     #[test]

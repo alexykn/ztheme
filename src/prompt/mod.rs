@@ -404,10 +404,13 @@ async fn cached_runtime_values(
 
                 let cached_values = values
                     .iter()
-                    .map(|value| runtime::CachedRuntimeValue {
-                        runtime: value.runtime,
-                        version: value.version.clone(),
-                        label: value.label.clone(),
+                    .filter_map(|value| {
+                        let version = value.version.as_ref()?;
+                        Some(runtime::CachedRuntimeValue {
+                            runtime: value.runtime,
+                            version: version.clone(),
+                            label: value.label.clone(),
+                        })
                     })
                     .collect::<Vec<_>>();
                 let encoded = runtime::encode(&cached_values)?;
@@ -465,7 +468,19 @@ fn execution_values(
     for execution in executions {
         match execution.outcome {
             RuntimeOutcome::Value(value) => values.push(runtime::materialize(value, environment)),
-            RuntimeOutcome::MissingExecutable | RuntimeOutcome::TransientFailure => {
+            RuntimeOutcome::MissingExecutable => {
+                // The runtime is detected but its executable is not installed.
+                // Surface an empty-version value so the segment can still render
+                // its symbol and language name (without a version).
+                complete = false;
+                values.push(RuntimeValue {
+                    runtime: execution.runtime,
+                    version: None,
+                    label: None,
+                    environment: None,
+                });
+            }
+            RuntimeOutcome::TransientFailure => {
                 complete = false;
             }
         }

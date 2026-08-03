@@ -20,7 +20,7 @@ const OUTPUT_LIMIT: u64 = 4_097;
 const MAX_FIELD_BYTES: usize = 4_096;
 
 macro_rules! define_runtimes {
-    ($($variant:ident = $id:literal => $name:literal),+ $(,)?) => {
+    ($($variant:ident = $id:literal => $name:literal => $display:literal),+ $(,)?) => {
         #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
         #[repr(u8)]
         pub(crate) enum Runtime {
@@ -42,6 +42,14 @@ macro_rules! define_runtimes {
                 }
             }
 
+            /// Canonical human-readable name used for display (e.g. `C++`,
+            /// `PHP`, `.NET`). Distinct from the lowercase config `name()`.
+            pub(crate) const fn display_name(self) -> &'static str {
+                match self {
+                    $(Self::$variant => $display),+
+                }
+            }
+
             pub(crate) const fn from_id(value: u8) -> Option<Self> {
                 match value {
                     $($id => Some(Self::$variant),)+
@@ -60,29 +68,36 @@ macro_rules! define_runtimes {
 }
 
 define_runtimes! {
-    Python = 0 => "python",
-    Perl = 1 => "perl",
-    Java = 2 => "java",
-    Kotlin = 3 => "kotlin",
-    Scala = 4 => "scala",
-    Rust = 5 => "rust",
-    Go = 6 => "go",
-    Bun = 7 => "bun",
-    Deno = 8 => "deno",
-    Node = 9 => "node",
-    Ruby = 10 => "ruby",
-    Php = 11 => "php",
-    Dotnet = 12 => "dotnet",
-    C = 13 => "c",
-    Cpp = 14 => "cpp",
-    Swift = 15 => "swift",
-    Lua = 16 => "lua",
+    Python = 0 => "python" => "Python",
+    Perl = 1 => "perl" => "Perl",
+    Java = 2 => "java" => "Java",
+    Kotlin = 3 => "kotlin" => "Kotlin",
+    Scala = 4 => "scala" => "Scala",
+    Rust = 5 => "rust" => "Rust",
+    Go = 6 => "go" => "Go",
+    Bun = 7 => "bun" => "Bun",
+    Deno = 8 => "deno" => "Deno",
+    Node = 9 => "node" => "Node.js",
+    Ruby = 10 => "ruby" => "Ruby",
+    Php = 11 => "php" => "PHP",
+    Dotnet = 12 => "dotnet" => ".NET",
+    C = 13 => "c" => "C",
+    Cpp = 14 => "cpp" => "C++",
+    Swift = 15 => "swift" => "Swift",
+    Lua = 16 => "lua" => "Lua",
+    R = 17 => "r" => "R",
+    Julia = 18 => "julia" => "Julia",
+    Elixir = 19 => "elixir" => "Elixir",
+    Dart = 20 => "dart" => "Dart",
+    Haskell = 21 => "haskell" => "Haskell",
+    Zig = 22 => "zig" => "Zig",
 }
 
 #[derive(Clone, Debug)]
 pub(crate) struct RuntimeValue {
     pub(crate) runtime: Runtime,
-    pub(crate) version: String,
+    /// `None` when the runtime is detected but its executable is missing.
+    pub(crate) version: Option<String>,
     pub(crate) label: Option<String>,
     pub(crate) environment: Option<String>,
 }
@@ -113,7 +128,7 @@ pub(crate) fn materialize(
 ) -> RuntimeValue {
     RuntimeValue {
         runtime: cached.runtime,
-        version: cached.version,
+        version: Some(cached.version),
         label: cached.label,
         environment: runtime_environment(cached.runtime, environment),
     }
@@ -174,9 +189,13 @@ pub(crate) fn decode(bytes: &[u8]) -> io::Result<Vec<CachedRuntimeValue>> {
     for _ in 0..count {
         let runtime = Runtime::from_id(decoder.u8()?)
             .ok_or_else(|| invalid_data("runtime cache contains an unknown runtime"))?;
+        let version = decoder.text()?;
+        if version.is_empty() {
+            return Err(invalid_data("runtime cache contains an empty version"));
+        }
         values.push(CachedRuntimeValue {
             runtime,
-            version: decoder.text()?,
+            version,
             label: decoder.optional_text()?,
         });
     }
@@ -233,6 +252,12 @@ pub(super) fn spec(runtime: Runtime) -> RuntimeSpec {
         Runtime::Cpp => compiler_spec(true, true),
         Runtime::Swift => static_spec("swift", &["--version"], false, parse_numeric),
         Runtime::Lua => static_spec("lua", &["-v"], true, parse_second_word),
+        Runtime::R => static_spec("R", &["--version"], false, parse_r),
+        Runtime::Julia => static_spec("julia", &["--version"], false, parse_julia),
+        Runtime::Elixir => static_spec("elixir", &["--version"], false, parse_elixir),
+        Runtime::Dart => static_spec("dart", &["--version"], true, parse_dart),
+        Runtime::Haskell => static_spec("ghc", &["--version"], false, parse_ghc),
+        Runtime::Zig => static_spec("zig", &["version"], false, parse_line),
     }
 }
 
@@ -433,6 +458,45 @@ fn numeric_word(line: &str) -> Option<String> {
     })
 }
 
+fn parse_r(output: &str) -> Option<String> {
+    first_line(output)?
+        .strip_prefix("R version ")
+        .and_then(|version| version.split_whitespace().next())
+        .map(str::to_owned)
+}
+
+fn parse_julia(output: &str) -> Option<String> {
+    first_line(output)?
+        .strip_prefix("julia version ")
+        .and_then(|version| version.split_whitespace().next())
+        .map(str::to_owned)
+}
+
+fn parse_elixir(output: &str) -> Option<String> {
+    output
+        .lines()
+        .find(|line| line.trim_start().starts_with("Elixir"))
+        .and_then(|line| line.split_whitespace().nth(1))
+        .map(str::to_owned)
+}
+
+fn parse_dart(output: &str) -> Option<String> {
+    output
+        .lines()
+        .find_map(|line| {
+            let (_, rest) = line.split_once("Dart SDK version: ")?;
+            rest.split_whitespace().next()
+        })
+        .map(str::to_owned)
+}
+
+fn parse_ghc(output: &str) -> Option<String> {
+    first_line(output)?
+        .split_whitespace()
+        .next_back()
+        .map(str::to_owned)
+}
+
 fn python_environment(environment: &PromptEnvironment) -> Option<String> {
     environment
         .virtual_env
@@ -620,6 +684,28 @@ mod tests {
                 "6.2",
             ),
             (Runtime::Lua, "Lua 5.4.8  Copyright (C)\n", "5.4.8"),
+            (
+                Runtime::R,
+                "R version 4.5.1 (2025-06-02) -- \"Sock It To Ya\"\n",
+                "4.5.1",
+            ),
+            (Runtime::Julia, "julia version 1.11.5\n", "1.11.5"),
+            (
+                Runtime::Elixir,
+                "Erlang/OTP 27 [erts-15.2] [64-bit]\nElixir 1.18.4 (compiled with Erlang/OTP 27)\n",
+                "1.18.4",
+            ),
+            (
+                Runtime::Dart,
+                "Dart SDK version: 3.7.2 (stable) (Tue Mar 11 2025)\n",
+                "3.7.2",
+            ),
+            (
+                Runtime::Haskell,
+                "The Glorious Glasgow Haskell Compilation System, version 9.10.1\n",
+                "9.10.1",
+            ),
+            (Runtime::Zig, "0.14.1\n", "0.14.1"),
         ];
 
         for (runtime, output, expected) in cases {
