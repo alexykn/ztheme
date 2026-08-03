@@ -1812,6 +1812,51 @@ _ztheme_stop_client
 }
 
 #[test]
+fn client_diagnoses_a_stale_request_version() {
+    let sandbox = Sandbox::new();
+    let instance = format!("stale-version-{}", SEQUENCE.fetch_add(1, Ordering::Relaxed));
+    // A runtime-free theme avoids the gitstatusd prerequisite in `init zsh`.
+    sandbox.write_theme(
+        "stale-test",
+        "version = 1\n\
+         [layout]\n\
+         lines = [[\"directory\"]]\n\
+         right = []\n\
+         separator = \" | \"\n\
+         blank_line_before = false\n",
+    );
+    let hex = theme_hex(&sandbox, &instance, "stale-test");
+
+    let mut client = sandbox
+        .command()
+        .args([
+            "__client-daemon",
+            "--shell-pid",
+            &std::process::id().to_string(),
+            "--theme",
+            &hex,
+            "--dev",
+            &instance,
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut stdin = client.stdin.take().unwrap();
+    // A v2 request (magic, old version, generation, cwd); the version check
+    // fires before any environment field is consumed.
+    stdin.write_all(b"ZTREQ\x002\x007\x00/work\x00").unwrap();
+    drop(stdin);
+
+    let output = client.wait_with_output().unwrap();
+    assert_success(&output);
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("ZTHEME1\t7\terror\tsnapshot\t"));
+    assert!(stdout.contains("ztheme init zsh"));
+}
+
+#[test]
 fn client_death_surfaces_eof_on_the_response_fifo() {
     let sandbox = Sandbox::new();
     sandbox.install_fake_gitstatus();

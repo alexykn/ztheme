@@ -57,44 +57,65 @@ pub async fn serve_client(
     loop {
         tokio::select! {
             request = receiver.recv() => {
-                if let Some(request) = request {
-                    // A new request supersedes any in-flight work: the records
-                    // of an older generation would be ignored by the shell, and
-                    // letting the work run on would waste time and read the new
-                    // request's environment. The superseded task is aborted and
-                    // awaited before the environment is touched: its JoinSet
-                    // drops only when the task is actually destroyed, and the
-                    // request tasks read environment values after awaits, so
-                    // without the await they could resume after the mutation
-                    // below with the new request's environment. This ordering
-                    // (destroy the request task and its JoinSet, then mutate
-                    // the environment) is the correctness invariant; the
-                    // integration tests can only observe its black-box
-                    // consequences (no stale records, clean per-request
-                    // environment), so this comment carries the stronger
-                    // guarantee.
-                    if let Some(handle) = current.take() {
-                        handle.abort();
-                        if let Ok(Err(error)) = handle.await {
-                            // The request's records could not be written, so
-                            // the response pipe is gone; keep serving has no
-                            // point.
-                            return Err(error);
+                if let Some(input) = request {
+                    match input {
+                        ClientInput::Request(request) => {
+                            // A new request supersedes any in-flight work: the
+                            // records of an older generation would be ignored by
+                            // the shell, and letting the work run on would waste
+                            // time and read the new request's environment. The
+                            // superseded task is aborted and awaited before the
+                            // environment is touched: its JoinSet drops only when
+                            // the task is actually destroyed, and the request
+                            // tasks read environment values after awaits, so
+                            // without the await they could resume after the
+                            // mutation below with the new request's environment.
+                            // This ordering (destroy the request task and its
+                            // JoinSet, then mutate the environment) is the
+                            // correctness invariant; the integration tests can
+                            // only observe its black-box consequences (no stale
+                            // records, clean per-request environment), so this
+                            // comment carries the stronger guarantee.
+                            if let Some(handle) = current.take() {
+                                handle.abort();
+                                if let Ok(Err(error)) = handle.await {
+                                    // The request's records could not be written,
+                                    // so the response pipe is gone; keep serving
+                                    // has no point.
+                                    return Err(error);
+                                }
+                            }
+                            let request = *request;
+                            let instance = instance.clone();
+                            let theme = Arc::clone(&theme);
+                            let environment = Arc::new(request.environment);
+                            current = Some(tokio::spawn(async move {
+                                snapshot(
+                                    request.generation,
+                                    request.cwd,
+                                    instance,
+                                    environment,
+                                    &theme,
+                                )
+                                .await
+                            }));
+                        }
+                        ClientInput::ProtocolError { generation, message } => {
+                            // The shell sent an unsupported request version:
+                            // emit a generation-tagged record the shell can
+                            // surface through `zle -M`, then exit. A stale shell
+                            // integration otherwise degrades to a plain prompt
+                            // with no explanation.
+                            crate::prompt::protocol::write_error(
+                                &mut io::stdout().lock(),
+                                generation,
+                                "snapshot",
+                                message,
+                            )?;
+                            cancel_current(&mut current).await;
+                            return Ok(());
                         }
                     }
-                    let instance = instance.clone();
-                    let theme = Arc::clone(&theme);
-                    let environment = Arc::new(request.environment);
-                    current = Some(tokio::spawn(async move {
-                        snapshot(
-                            request.generation,
-                            request.cwd,
-                            instance,
-                            environment,
-                            &theme,
-                        )
-                        .await
-                    }));
                 } else {
                     // EOF only arrives after the writer closes, so finish any
                     // in-flight request first: its records still have a reader,
@@ -134,7 +155,7 @@ async fn cancel_current(current: &mut Option<JoinHandle<io::Result<()>>>) {
 /// never waits on the stdin read: when the parent watchdog exits the client
 /// while the request pipe is still open, the runtime must shut down without
 /// joining a read that can never return.
-fn spawn_request_reader(sender: mpsc::Sender<Request>) {
+fn spawn_request_reader(sender: mpsc::Sender<ClientInput>) {
     std::thread::Builder::new()
         .name("ztheme-client-requests".into())
         .spawn(move || {
@@ -142,12 +163,30 @@ fn spawn_request_reader(sender: mpsc::Sender<Request>) {
             loop {
                 match read_request(&mut reader) {
                     Ok(Some(request)) => {
-                        if sender.blocking_send(request).is_err() {
+                        if sender
+                            .blocking_send(ClientInput::Request(Box::new(request)))
+                            .is_err()
+                        {
                             return;
                         }
                     }
                     Ok(None) => return,
                     Err(error) => {
+                        if let Some(mismatch) = error
+                            .get_ref()
+                            .and_then(|cause| cause.downcast_ref::<RequestVersionMismatch>())
+                        {
+                            if sender
+                                .blocking_send(ClientInput::ProtocolError {
+                                    generation: mismatch.generation,
+                                    message: SHELL_INTEGRATION_OUT_OF_DATE,
+                                })
+                                .is_err()
+                            {
+                                return;
+                            }
+                            return;
+                        }
                         eprintln!("ztheme: client daemon request failed: {error}");
                         return;
                     }
@@ -161,6 +200,44 @@ struct Request {
     generation: u64,
     cwd: PathBuf,
     environment: PromptEnvironment,
+}
+
+/// What the request reader passes to the serving loop: a parseable request,
+/// or a version mismatch that must be reported to the shell before exiting.
+enum ClientInput {
+    Request(Box<Request>),
+    ProtocolError {
+        generation: u64,
+        message: &'static str,
+    },
+}
+
+/// Shown once through the shell's `zle -M` before the client exits, so a
+/// stale shell integration is a diagnosed one-liner instead of a silent
+/// plain prompt.
+const SHELL_INTEGRATION_OUT_OF_DATE: &str = "client request version is unsupported; \
+    regenerate the shell integration with `ztheme init zsh` and restart the shell";
+
+/// Payload attached to the version-mismatch error so the request reader can
+/// surface a generation-tagged diagnostic.
+#[derive(Debug)]
+struct RequestVersionMismatch {
+    generation: u64,
+}
+
+impl std::fmt::Display for RequestVersionMismatch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("client request version is unsupported")
+    }
+}
+
+impl std::error::Error for RequestVersionMismatch {}
+
+fn request_version_mismatch(generation: u64) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        RequestVersionMismatch { generation },
+    )
 }
 
 /// Parses one NUL-delimited request. `Ok(None)` means a clean EOF before any
@@ -178,15 +255,19 @@ where
         return Err(invalid_data("client request magic is invalid"));
     }
     let version = read_field(reader)?.ok_or_else(truncated)?;
-    if version != REQUEST_VERSION.as_bytes() {
-        return Err(invalid_data("client request version is unsupported"));
-    }
 
     let generation = read_field(reader)?.ok_or_else(truncated)?;
     let generation = std::str::from_utf8(&generation)
         .ok()
         .and_then(|value| value.parse().ok())
         .ok_or_else(|| invalid_data("client request generation is invalid"))?;
+
+    // The version is checked after the generation is read so a stale shell
+    // integration can be diagnosed with a generation-tagged record instead of
+    // failing without a trace.
+    if version != REQUEST_VERSION.as_bytes() {
+        return Err(request_version_mismatch(generation));
+    }
 
     let cwd = read_field(reader)?.ok_or_else(truncated)?;
     let cwd = PathBuf::from(OsString::from_vec(cwd));
@@ -273,7 +354,7 @@ mod tests {
 
     use std::io::BufReader;
 
-    use super::{REQUEST_MAGIC, REQUEST_VERSION, read_request};
+    use super::{REQUEST_MAGIC, REQUEST_VERSION, RequestVersionMismatch, read_request};
     use crate::prompt::protocol::REQUEST_FIELDS;
 
     const ENV_FIELD_COUNT: usize = REQUEST_FIELDS.len();
@@ -485,6 +566,29 @@ mod tests {
 
         let truncated = &valid[..valid.len() - 3];
         assert!(read_request(&mut BufReader::new(truncated)).is_err());
+
+        // An older request version: the mismatch must carry the generation so
+        // the reader can emit a diagnostic the shell can surface.
+        let mut stale = REQUEST_MAGIC.to_vec();
+        stale.push(0);
+        stale.extend_from_slice(b"2");
+        stale.push(0);
+        stale.extend_from_slice(b"42");
+        stale.push(0);
+        stale.extend_from_slice(b"/work");
+        stale.push(0);
+        stale.resize(stale.len() + ENV_FIELD_COUNT, 0);
+
+        let error = match read_request(&mut BufReader::new(&stale[..])) {
+            Ok(_) => panic!("an old request version must be rejected"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        let mismatch = error
+            .get_ref()
+            .and_then(|cause| cause.downcast_ref::<RequestVersionMismatch>())
+            .expect("version mismatch must carry a typed payload");
+        assert_eq!(mismatch.generation, 42);
     }
 
     #[test]
