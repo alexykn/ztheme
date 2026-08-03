@@ -144,11 +144,13 @@ second.
   exactly **1** runtime execution.
 - **Daemon restart**: a daemon restart reuses persisted cache entries — the
   runtime-execution counter is unchanged across the restart (26 → 26).
-- **Realistic workload**: 5000 prompts across 40 project directories (mixed
-  monorepos, python, node, rust, plus the later cacheable runtimes dart, zig,
-  julia, and r as single-language projects; a pyenv shim group; PATH noise; a
-  mid-run daemon restart; a python and a julia executable replacement; a
-  `.python-version` selector switch):
+- **Realistic workload**: measured on the current development tree (the
+  expanded workload covering the dart, zig, julia, and r cacheables is not
+  part of any released binary): 5000 prompts across 40 project directories
+  (mixed monorepos, python, node, rust, plus dart, zig, julia, and r as
+  single-language projects; a pyenv shim group; PATH noise; a mid-run daemon
+  restart; a python and a julia executable replacement; a `.python-version`
+  selector switch):
 
   | Metric | Value |
   | --- | ---: |
