@@ -104,28 +104,20 @@ EOF
 request_payload() {
     local path=$1
     local generation=$2
+    local -A field_value=(
+        PATH "$path"
+        HOME "$home"
+        CONDA_DEFAULT_ENV "$conda_default_env"
+        RUSTUP_TOOLCHAIN "$rustup_toolchain"
+        GOTOOLCHAIN "$gotoolchain"
+    )
     local request_line="ZTREQ"$'\0'"$wire_version"$'\0'"$generation"$'\0'"$project"$'\0'
-    request_line+="$path"$'\0'"$home"$'\0'
-    # Protocol v2 fields: GIT_DIR GIT_WORK_TREE GIT_CEILING_DIRECTORIES
-    request_line+=$'\0'$'\0'$'\0'
-    # VIRTUAL_ENV CONDA_PREFIX CONDA_DEFAULT_ENV
-    request_line+=$'\0'$'\0'"$conda_default_env"$'\0'
-    # PERLBREW_PERL PLENV_VERSION PYENV_VERSION PYENV_DIR
-    request_line+=$'\0'$'\0'
-    request_line+=$'\0'$'\0'
-    # RUSTUP_TOOLCHAIN RUSTUP_HOME RBENV_DIR RBENV_VERSION
-    request_line+="$rustup_toolchain"$'\0'$'\0'
-    request_line+=$'\0'$'\0'
-    # NODENV_VERSION NODENV_DIR PLENV_DIR RUBY_VERSION JAVA_HOME
-    request_line+=$'\0'$'\0'
-    request_line+=$'\0'$'\0'
-    # GOTOOLCHAIN DOTNET_ROOT
-    request_line+=$'\0'"$gotoolchain"$'\0'$'\0'
-    if (( wire_version >= 3 )); then
-        # Protocol v3 fields: JULIAUP_CHANNEL JULIAUP_DEPOT_PATH JULIA_PROJECT
-        # JULIA_LOAD_PATH JULIA_DEPOT_PATH R_ARCH
-        request_line+=$'\0'$'\0'$'\0'$'\0'$'\0'$'\0'
-    fi
+    # The field order comes from the generated integration (see load_theme), so
+    # the payload writer can never drift from the daemon's parser.
+    local field
+    for field in "${request_fields[@]}"; do
+        request_line+="${field_value[$field]:-}"$'\0'
+    done
     print -rn -- "$request_line"
 }
 
@@ -281,6 +273,20 @@ load_theme() {
     theme_hex=$(print -r -- "$init_output" |
         awk -F"'" '/__ZTHEME_ASYNC_THEME/ { print $2; exit }')
     [[ -n "$theme_hex" ]] || { print -u2 "could not extract compiled theme $theme_name"; exit 1; }
+
+    # Derive the request protocol (version and field order) from the generated
+    # integration instead of hand-writing it, so the payload writer can never
+    # drift from the daemon's parser.
+    wire_version=$(print -r -- "$init_output" |
+        awk -F'"' '/ZTREQ/ { print $4; exit }')
+    [[ "$wire_version" =~ '^[0-9]+$' ]] || {
+        print -u2 "could not extract the request protocol version"; exit 1
+    }
+    request_fields=($(print -r -- "$init_output" |
+        sed -n 's/.*request_line+="\${\([A-Z_][A-Z_]*\):-}".*/\1/p'))
+    (( ${#request_fields[@]} >= 23 )) || {
+        print -u2 "could not extract the request protocol fields"; exit 1
+    }
 }
 
 start_scenario() {
@@ -586,8 +592,7 @@ measure_build() {
     setopt errexit nounset pipefail
     unsetopt bgnice
     local label=$1
-    wire_version=$2
-    binary=$3
+    binary=$2
 
     fixture="$temp_root/$label-fixture"
     home="$fixture/home"
@@ -1030,10 +1035,10 @@ check_latency_regressions() {
 }
 
 if (( skip_baseline )); then
-    measure_build candidate 3 "$candidate_binary"
+    measure_build candidate "$candidate_binary"
 else
-    measure_build baseline 2 "$baseline_binary"
-    measure_build candidate 3 "$candidate_binary"
+    measure_build baseline "$baseline_binary"
+    measure_build candidate "$candidate_binary"
     check_latency_regressions
 
     if (( realistic_execution_counts[candidate] >= realistic_execution_counts[baseline] )); then
