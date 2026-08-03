@@ -1,10 +1,13 @@
 # Benchmarks
 
-Current measured behavior of the released binary. All numbers below were
-measured with ztheme **v1.6.0** on an Apple M1 Pro (macOS 26.5.2, arm64).
-Prompt latency is machine- and filesystem-dependent; treat the absolute
-numbers as indicative and the *relative* numbers (e.g. the marginal cost of a
-custom segment) as the stable signal.
+Current measured behavior of the released binary. The warm, git, and
+cold-miss numbers below were measured with ztheme v1.6.0 and are
+statistically unchanged on v1.7.0; the realistic-workload numbers are
+measured on the current development tree (see below). All runs were on an
+Apple M1 Pro (macOS 26.5.2, arm64). Prompt latency is machine- and
+filesystem-dependent; treat the absolute numbers as indicative and the
+*relative* numbers (e.g. the marginal cost of a custom segment) as the
+stable signal.
 
 ## Scope
 
