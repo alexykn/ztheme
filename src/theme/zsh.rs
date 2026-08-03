@@ -30,12 +30,30 @@ impl CompiledTheme {
             "__ZTHEME_HAS_ASYNC",
             u64::from(!self.layout.asynchronous.is_empty()),
         );
+        // Per-asynchronous-group presence flags let the shell compute how many
+        // groups are actually pending (and can be locked) for this layout.
+        integer(
+            &mut output,
+            "__ZTHEME_HAS_GIT",
+            u64::from(self.layout.asynchronous.contains(&SegmentId::Git)),
+        );
+        integer(
+            &mut output,
+            "__ZTHEME_HAS_RUNTIME",
+            u64::from(
+                self.layout
+                    .asynchronous
+                    .iter()
+                    .any(|segment| matches!(segment, SegmentId::Runtime(_))),
+            ),
+        );
         emit_input_theme(&mut output, theme, &theme.input)?;
         emit_segment_themes(&mut output, theme, &theme.segments, &self.layout)?;
         emit_sync_segments(&mut output, &self.layout);
 
         emit_segment_state(&mut output, &self.layout);
         emit_clear_async(&mut output, &self.layout.asynchronous);
+        emit_clear_async_group(&mut output, &self.layout.asynchronous);
         emit_assign_async(&mut output, &self.layout.asynchronous);
         emit_layout_renderer(&mut output, &self.layout, &theme.layout);
         Ok(output)
@@ -312,6 +330,42 @@ fn emit_clear_async(output: &mut String, segments: &[SegmentId]) {
     output.push_str("}\n");
 }
 
+/// Emits a group-scoped async clear dispatcher. The shell's error records carry
+/// a group name (`git` or `runtime`); clearing only that group keeps a
+/// successful unlocked group from being erased when another group reports an
+/// error.
+fn emit_clear_async_group(output: &mut String, segments: &[SegmentId]) {
+    output.push_str("_ztheme_clear_async_group() {\n    emulate -L zsh\n    case \"$1\" in\n");
+    if segments.contains(&SegmentId::Git) {
+        writeln!(
+            output,
+            "        git)\n            {}=''\n            ;;\n",
+            segment_variable(&LayoutSegment::BuiltIn(SegmentId::Git))
+        )
+        .expect("writing to a String cannot fail");
+    }
+    let runtimes = segments
+        .iter()
+        .filter_map(|segment| match segment {
+            SegmentId::Runtime(runtime) => Some(*runtime),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    if !runtimes.is_empty() {
+        output.push_str("        runtime)\n");
+        for runtime in runtimes {
+            writeln!(
+                output,
+                "            {}=''",
+                segment_variable(&LayoutSegment::BuiltIn(SegmentId::Runtime(runtime)))
+            )
+            .expect("writing to a String cannot fail");
+        }
+        output.push_str("            ;;\n");
+    }
+    output.push_str("        *) return 1 ;;\n    esac\n}\n");
+}
+
 fn emit_assign_async(output: &mut String, segments: &[SegmentId]) {
     output.push_str("_ztheme_assign_async_segment() {\n    emulate -L zsh\n    case \"$1\" in\n");
     for segment in segments {
@@ -328,7 +382,7 @@ fn emit_assign_async(output: &mut String, segments: &[SegmentId]) {
 
 fn emit_layout_renderer(output: &mut String, layout: &ValidatedLayout, source: &Layout) {
     output.push_str(
-        "_ztheme_render_layout() {\n    emulate -L zsh\n    (( ! ZTHEME_ASYNC_PENDING )) || return\n    local prompt='' right='' line='' separator=''\n",
+        "_ztheme_render_layout(){\n    emulate -L zsh\n    (( ! ZTHEME_LOCKED_PENDING )) || return\n    local prompt='' right='' line='' separator=''\n",
     );
     if source.blank_line_before {
         output.push_str("    prompt=$'\\n'\n");

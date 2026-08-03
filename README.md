@@ -158,6 +158,39 @@ Colors accept palette names or `#RRGGBB`. Styles support `foreground`,
 See the complete [theme schema](docs/theme.md), including every layout and
 segment key.
 
+## Asynchronous rendering
+
+Git and runtime segments are resolved asynchronously. Git is *locked* by
+default: the prompt stays blank until Git resolves (or the shared deadline
+expires), then appears in one atomic redraw. Runtime segments are *unlocked*
+by default: the prompt renders as soon as Git is done and each runtime value is
+drawn in when its version command finishes. That ordering reflects the real
+cost of each group — `gitstatusd` is fast, while some runtime version commands
+(such as `swift`) can take long enough to delay every prompt if the prompt
+waited for them.
+
+Configure this per group in `config.toml`:
+
+```toml
+version = 1
+theme = "my-theme"
+
+[async.lock]
+git_segment = true      # wait for Git (default: true)
+runtime_segment = false # don't wait for language/runtime versions (default: false)
+```
+
+- `git_segment` controls the Git segment. It defaults to `true` (wait).
+- `runtime_segment` controls the language, package manager, and runtime
+  segments (`python`, `rust`, `node`, and so on). It defaults to `false`
+  (don't wait).
+
+Setting a group to `true` makes the prompt wait for it (holding the whole
+prompt blank until it resolves, then rendering once); `false` renders as soon
+as every locked group is done and redraws that group in when it is ready. If
+you unlock a group, be aware the prompt's width can change when that segment
+later appears.
+
 ## Syntax highlighting
 
 Syntax highlighting is part of the theme, not a separate color configuration.

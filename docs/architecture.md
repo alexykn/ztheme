@@ -23,11 +23,19 @@ per-request state between prompts other than its compiled theme and its
 connection to the server daemon.
 
 The shell stores the incoming fragments but does not redraw the prompt for each
-one. It waits for the client's final `done` record, then renders the complete
-prompt once. While a snapshot is pending, Zsh leaves the prompt empty; it only
-appears once every requested async segment has completed or the deadline has
-expired. This makes the update atomic without adding a second animation
-protocol.
+one. By default it waits for the locked Git group's `complete` record, then
+renders the complete prompt once. While a locked group is pending, Zsh leaves
+the prompt empty; it only appears once every locked async segment has completed
+or the deadline has expired. This makes the update atomic without adding a
+second animation protocol.
+
+Each asynchronous group (`git` and `runtime`) can be toggled through
+`[async.lock]`. A lock tells the shell to wait for that group before rendering;
+an unlock tells it not to, so the prompt renders as soon as every still-locked
+group has delivered its `complete` record (immediately when none are locked)
+and redraws each time an unlocked group's records arrive. By default the Git
+group is locked (it stays fast via `gitstatusd`) and the runtime group is
+unlocked, because a slow runtime version command should not delay every prompt.
 
 The server daemon provides shared background state. It hosts two independent
 long-lived capabilities:
@@ -78,14 +86,16 @@ Zsh precmd/chpwd
 └── leave the prompt empty until the snapshot finishes
 
 prompt protocol records
-└── Zsh stores current-generation fragments without redrawing
+├── Zsh stores current-generation fragments without redrawing
+└── each group's `complete` marker releases that group's rendering lock
+    (an unlocked group redraws the prompt when its records arrive)
 
 shared 550 ms deadline
 ├── cancel unfinished client tasks
 └── write final done record
 
-done record
-└── Zsh renders all collected segments and redraws once
+done record / all locked groups complete
+└── Zsh renders the collected segments and redraws once
 ```
 
 Git and runtime records may still arrive in either order on the prompt
@@ -401,7 +411,8 @@ is the per-request engine used by the client daemon:
 - starts the Git task first and lets it begin its daemon request;
 - starts runtime detection immediately afterward;
 - applies one shared 550 ms deadline;
-- writes completed segments to the prompt stream;
+- writes completed segments to the prompt stream, followed by that group's
+  `complete` marker so the shell can release its rendering lock;
 - cancels unfinished work;
 - always writes the final `done` record;
 - sanitizes errors before sending them to Zsh.
@@ -566,6 +577,7 @@ daemon to stdout and consumed by the Zsh integration:
 ```text
 ZTHEME1<TAB>generation<TAB>segment<TAB>name<TAB>rendered-fragment<NL>
 ZTHEME1<TAB>generation<TAB>error<TAB>source<TAB>message<NL>
+ZTHEME1<TAB>generation<TAB>complete<TAB>group<NL>
 ZTHEME1<TAB>generation<TAB>done<NL>
 ```
 
@@ -575,11 +587,20 @@ and control characters are escaped before dynamic text enters a prompt
 fragment. Error records replace tabs, newlines, and other controls and are
 bounded before output.
 
-Zsh accepts and stores segment and error records for the current generation,
-but does not redraw for each record. The final `done` record releases the
-generation's rendering barrier and causes one complete prompt redraw. If the
-worker cannot start or exits without `done`, the shell falls back to rendering
-the immediate segments rather than leaving the prompt stuck.
+A `complete` record is written immediately after a group's segment records
+(`git` or `runtime`) by the client. It lets the shell release that group's
+rendering barrier as soon as the group is done, rather than holding the prompt
+blank until every asynchronous group finishes.
+
+By default the Git group is *locked* and the runtime group is *unlocked*: the
+shell stores Git segment and error records without redrawing until Git's
+`complete` record releases its barrier (or `done` arrives), while runtime
+records arrive as unlocked and redraw the prompt as they complete. A group can
+be locked via `[async.lock]` to make the shell wait for it instead. The `done`
+record remains the safety net: if a locked group never completed before
+the shared deadline, `done` forces the render even though one was expected. If
+the worker cannot start or exits without `done`, the shell falls back to
+rendering the immediate segments rather than leaving the prompt stuck.
 
 The generation is allocated by the shell integration. Zsh ignores records from
 superseded generations, allowing directory changes to cancel or outlive an

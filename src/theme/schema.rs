@@ -11,6 +11,58 @@ pub(super) struct Config {
     #[serde(default)]
     #[serde(skip_serializing_if = "CustomSegmentsConfig::is_empty")]
     pub(super) custom_segments: CustomSegmentsConfig,
+
+    /// `[async]` prompt-rendering behavior. Currently holds only the per-group
+    /// lock settings that decide whether the prompt waits for an asynchronous
+    /// segment group or renders immediately and redraws when it is ready.
+    #[serde(default)]
+    #[serde(rename = "async")]
+    #[serde(skip_serializing_if = "AsyncSection::is_default")]
+    pub(super) async_section: AsyncSection,
+}
+
+#[derive(Clone, Default, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub(super) struct AsyncSection {
+    pub(super) lock: AsyncLock,
+}
+
+impl AsyncSection {
+    pub(super) fn is_default(&self) -> bool {
+        self.lock.git_segment && !self.lock.runtime_segment
+    }
+}
+
+/// Per-asynchronous-group prompt lock. A locked group holds the prompt blank
+/// until it completes (or the shared deadline expires); an unlocked group lets
+/// the prompt render immediately and redraw when its value arrives. The Git
+/// group is locked by default; the runtime group is unlocked by default,
+/// because runtime version commands (such as Swift) are often the slow part
+/// while `gitstatusd` is fast.
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub(crate) struct AsyncLock {
+    #[serde(default = "default_true")]
+    pub(crate) git_segment: bool,
+    #[serde(default = "default_false")]
+    pub(crate) runtime_segment: bool,
+}
+
+impl Default for AsyncLock {
+    fn default() -> Self {
+        Self {
+            git_segment: true,
+            runtime_segment: false,
+        }
+    }
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_false() -> bool {
+    false
 }
 
 #[derive(Clone, Default, Deserialize, Serialize)]

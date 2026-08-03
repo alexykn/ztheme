@@ -17,8 +17,9 @@ use crate::runtime::Runtime;
 pub use async_theme::AsyncTheme;
 pub(crate) use manage::{apply, edit, list, persist};
 use schema::{
-    CharacterTheme, Config, CustomSegmentTheme, CustomSegmentsConfig, DirectoryTheme, GitSymbols,
-    InputTheme, Layout, RuntimeTheme, Segments, Spacing, StatusTheme, Style, SyntaxStyle, Theme,
+    AsyncLock, AsyncSection, CharacterTheme, Config, CustomSegmentTheme, CustomSegmentsConfig,
+    DirectoryTheme, GitSymbols, InputTheme, Layout, RuntimeTheme, Segments, Spacing, StatusTheme,
+    Style, SyntaxStyle, Theme,
 };
 pub(crate) use segments::ResolvedCustomSegment;
 use segments::{resolve_custom_segments, validate_enabled_segments};
@@ -299,7 +300,17 @@ fn default_config() -> Config {
         version: THEME_VERSION,
         theme: DEFAULT_THEME_SELECTOR.to_owned(),
         custom_segments: CustomSegmentsConfig::default(),
+        async_section: AsyncSection::default(),
     }
+}
+
+/// The per-asynchronous-group lock configuration from `config.toml`, defaulting
+/// to locked (wait for the group) when unset. Read outside the prompt hot path
+/// and baked into the generated shell integration by `init_zsh`.
+pub(crate) fn async_lock() -> io::Result<AsyncLock> {
+    Ok(load_config()?
+        .map(|config| config.async_section.lock)
+        .unwrap_or_default())
 }
 
 fn config_root() -> Option<PathBuf> {
@@ -634,6 +645,146 @@ mod tests {
             }
             .git_enabled()
         );
+    }
+
+    #[test]
+    fn compiled_theme_reports_async_group_presence() {
+        let git_theme = merged_theme("version = 1\n[layout]\nlines = [[\"git\"]]").unwrap();
+        let git_layout = validate(&git_theme).unwrap();
+        let zsh = CompiledTheme {
+            theme: git_theme,
+            layout: git_layout,
+            selector: "git".to_owned(),
+        }
+        .zsh()
+        .unwrap();
+        assert!(zsh.contains("__ZTHEME_HAS_GIT=1"));
+        assert!(zsh.contains("__ZTHEME_HAS_RUNTIME=0"));
+
+        let runtime_theme = merged_theme("version = 1\n[layout]\nlines = [[\"python\"]]").unwrap();
+        let runtime_layout = validate(&runtime_theme).unwrap();
+        let zsh = CompiledTheme {
+            theme: runtime_theme,
+            layout: runtime_layout,
+            selector: "runtime".to_owned(),
+        }
+        .zsh()
+        .unwrap();
+        assert!(zsh.contains("__ZTHEME_HAS_GIT=0"));
+        assert!(zsh.contains("__ZTHEME_HAS_RUNTIME=1"));
+
+        let sync_theme = merged_theme("version = 1\n[layout]\nlines = [[\"directory\"]]").unwrap();
+        let sync_layout = validate(&sync_theme).unwrap();
+        let zsh = CompiledTheme {
+            theme: sync_theme,
+            layout: sync_layout,
+            selector: "sync".to_owned(),
+        }
+        .zsh()
+        .unwrap();
+        assert!(zsh.contains("__ZTHEME_HAS_GIT=0"));
+        assert!(zsh.contains("__ZTHEME_HAS_RUNTIME=0"));
+        assert!(zsh.contains("__ZTHEME_HAS_ASYNC=0"));
+    }
+
+    /// Returns the generated `_ztheme_clear_async_group` function body.
+    fn async_group_clear(generated: &str) -> &str {
+        let start = generated.find("_ztheme_clear_async_group() {").unwrap();
+        let rest = &generated[start..];
+        let end = rest.find("\n}\n").unwrap();
+        &rest[..end]
+    }
+
+    /// Returns the text of one `_ztheme_clear_async_group` branch arm (`git` or
+    /// `runtime`), or `None` when that branch was not generated.
+    fn branch_body(helper: &str, label: &str) -> Option<String> {
+        let needle = format!("\n        {label})\n");
+        let start = helper.find(&needle).map(|index| index + needle.len())?;
+        let rest = &helper[start..];
+        let end = rest.find(";;\n")?;
+        Some(rest[..end].to_owned())
+    }
+
+    #[test]
+    fn generated_group_clear_is_scoped_to_the_errored_group() {
+        // git + two runtimes: each variable must land in its own group's branch.
+        let theme =
+            merged_theme("version = 1\n[layout]\nlines = [[\"git\", \"python\", \"rust\"]]")
+                .unwrap();
+        let layout = validate(&theme).unwrap();
+        let zsh = CompiledTheme {
+            theme,
+            layout,
+            selector: "groups".to_owned(),
+        }
+        .zsh()
+        .unwrap();
+        let helper = async_group_clear(&zsh);
+
+        let git = branch_body(helper, "git").unwrap();
+        assert!(git.contains("ZTHEME_SEGMENT_GIT=''"));
+        assert!(!git.contains("PYTHON"));
+        assert!(!git.contains("RUST"));
+
+        let runtime = branch_body(helper, "runtime").unwrap();
+        assert!(runtime.contains("ZTHEME_SEGMENT_PYTHON=''"));
+        assert!(runtime.contains("ZTHEME_SEGMENT_RUST=''"));
+        assert!(!runtime.contains("GIT"));
+
+        // runtimes only: no git branch is generated at all.
+        let theme = merged_theme("version = 1\n[layout]\nlines = [[\"python\"]]").unwrap();
+        let layout = validate(&theme).unwrap();
+        let zsh = CompiledTheme {
+            theme,
+            layout,
+            selector: "runtime-only".to_owned(),
+        }
+        .zsh()
+        .unwrap();
+        let helper = async_group_clear(&zsh);
+        assert!(branch_body(helper, "git").is_none());
+        let runtime = branch_body(helper, "runtime").unwrap();
+        assert!(runtime.contains("ZTHEME_SEGMENT_PYTHON=''"));
+        assert!(!runtime.contains("GIT"));
+    }
+
+    #[test]
+    fn async_lock_defaults_and_parses_overrides() {
+        use crate::theme::schema::Config;
+        use crate::theme::schema::{AsyncLock, AsyncSection};
+
+        // No [async] section: git is locked, runtimes are not (the default).
+        let config: Config = toml::from_str("version = 1\ntheme = \"x\"\n").unwrap();
+        assert!(config.async_section.lock.git_segment);
+        assert!(!config.async_section.lock.runtime_segment);
+
+        // Overriding only git keeps runtime's default (unlocked).
+        let config: Config =
+            toml::from_str("version = 1\ntheme = \"x\"\n[async.lock]\ngit_segment = false\n")
+                .unwrap();
+        assert!(!config.async_section.lock.git_segment);
+        assert!(!config.async_section.lock.runtime_segment);
+
+        // Both groups can be set explicitly and independently.
+        let config: Config = toml::from_str(
+            "version = 1\ntheme = \"x\"\n[async.lock]\ngit_segment = false\nruntime_segment = false\n",
+        )
+        .unwrap();
+        assert!(!config.async_section.lock.git_segment);
+        assert!(!config.async_section.lock.runtime_segment);
+        let config: Config =
+            toml::from_str("version = 1\ntheme = \"x\"\n[async.lock]\nruntime_segment = true\n")
+                .unwrap();
+        assert!(config.async_section.lock.git_segment);
+        assert!(config.async_section.lock.runtime_segment);
+
+        // Defaults struct matches the parsed default so a missing table and a
+        // missing config both produce the same (git locked, runtimes unlocked).
+        assert!(AsyncSection::default().lock.git_segment);
+        assert!(!AsyncSection::default().lock.runtime_segment);
+        assert!(AsyncLock::default().git_segment);
+        assert!(!AsyncLock::default().runtime_segment);
+        assert!(AsyncSection::default().is_default());
     }
 
     #[test]

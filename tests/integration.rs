@@ -1779,6 +1779,7 @@ while (( ! found_done )); do
     case "$kind" in
         segment) ;;
         error) ;;
+        complete) ;;
         done) found_done=1 ;;
         *) exit 87 ;;
     esac

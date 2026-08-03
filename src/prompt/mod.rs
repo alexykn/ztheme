@@ -105,19 +105,24 @@ fn write_result(
     active_runtimes: &[Runtime],
     theme: &theme::AsyncTheme,
 ) -> io::Result<()> {
+    let mut output = io::stdout().lock();
     match result {
-        Ok(SnapshotResult::Git(Ok(snapshot))) => protocol::write_segment(
-            &mut io::stdout().lock(),
-            generation,
-            "git",
-            &theme.render_git(snapshot.as_ref()),
-        ),
-        Ok(SnapshotResult::Git(Err(error))) => protocol::write_error(
-            &mut io::stdout().lock(),
-            generation,
-            "git",
-            &record_error(&error),
-        ),
+        Ok(SnapshotResult::Git(Ok(snapshot))) => {
+            protocol::write_segment(
+                &mut output,
+                generation,
+                "git",
+                &theme.render_git(snapshot.as_ref()),
+            )?;
+            // Each group finishes with a `complete` marker so the shell can
+            // release that group's rendering lock as soon as it is done,
+            // instead of holding the prompt blank until the final `done`.
+            protocol::write_complete(&mut output, generation, "git")
+        }
+        Ok(SnapshotResult::Git(Err(error))) => {
+            protocol::write_error(&mut output, generation, "git", &record_error(&error))?;
+            protocol::write_complete(&mut output, generation, "git")
+        }
         Ok(SnapshotResult::Runtimes(Ok(values))) => {
             for runtime in active_runtimes {
                 let fragment = values
@@ -125,23 +130,16 @@ fn write_result(
                     .find(|value| value.runtime == *runtime)
                     .and_then(|value| theme.render_runtime(value))
                     .unwrap_or_default();
-                protocol::write_segment(
-                    &mut io::stdout().lock(),
-                    generation,
-                    runtime.name(),
-                    &fragment,
-                )?;
+                protocol::write_segment(&mut output, generation, runtime.name(), &fragment)?;
             }
-            Ok(())
+            protocol::write_complete(&mut output, generation, "runtime")
         }
-        Ok(SnapshotResult::Runtimes(Err(error))) => protocol::write_error(
-            &mut io::stdout().lock(),
-            generation,
-            "runtime",
-            &record_error(&error),
-        ),
+        Ok(SnapshotResult::Runtimes(Err(error))) => {
+            protocol::write_error(&mut output, generation, "runtime", &record_error(&error))?;
+            protocol::write_complete(&mut output, generation, "runtime")
+        }
         Err(error) => protocol::write_error(
-            &mut io::stdout().lock(),
+            &mut output,
             generation,
             "snapshot",
             &record_error(&io::Error::other(error)),
@@ -169,6 +167,7 @@ pub fn init_zsh(instance: &daemon::Instance, selector: Option<&str>) -> io::Resu
     // the segments directory; this is the only point that touches the
     // filesystem or the config outside the prompt hot path.
     let custom_segments = theme.custom_sources()?;
+    let lock = theme::async_lock()?;
     let bundled = format!(
         "{ZSH_DIRECTORY_SEGMENT}{ZSH_CLOCK_SEGMENT}{ZSH_STATUS_SEGMENT}{ZSH_CHARACTER_SEGMENT}"
     );
@@ -183,6 +182,8 @@ pub fn init_zsh(instance: &daemon::Instance, selector: Option<&str>) -> io::Resu
             "@ZTHEME_SYNTAX_HIGHLIGHTING@",
             &shell_quote(&setup::syntax_highlighting_script().to_string_lossy()),
         )
+        .replace("@ZTHEME_LOCK_GIT@", &lock_flag(lock.git_segment))
+        .replace("@ZTHEME_LOCK_RUNTIME@", &lock_flag(lock.runtime_segment))
         .replace("@ZTHEME_SHELL_DEFAULTS@", ZSH_DEFAULTS)
         .replace("@ZTHEME_COMPILED_THEME@", &theme_zsh)
         .replace("@ZTHEME_BUNDLED_SEGMENTS@", &bundled)
@@ -190,6 +191,11 @@ pub fn init_zsh(instance: &daemon::Instance, selector: Option<&str>) -> io::Resu
             "@ZTHEME_CUSTOM_SEGMENTS@",
             &custom_segment_block(&custom_segments),
         ))
+}
+
+/// Renders a boolean lock flag as a `0`/`1` zsh integer literal.
+fn lock_flag(enabled: bool) -> String {
+    if enabled { "1" } else { "0" }.to_owned()
 }
 
 /// Emits one `source` line and a declared-function check per resolved custom

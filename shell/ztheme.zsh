@@ -61,12 +61,14 @@ typeset -g __ZTHEME_BIN=@ZTHEME_BIN@
 typeset -ga __ZTHEME_INSTANCE_ARGS=(@ZTHEME_INSTANCE_ARGS@)
 typeset -g __ZTHEME_AUTOSUGGESTIONS=@ZTHEME_AUTOSUGGESTIONS@
 typeset -g __ZTHEME_SYNTAX_HIGHLIGHTING=@ZTHEME_SYNTAX_HIGHLIGHTING@
+typeset -gi __ZTHEME_LOCK_GIT=@ZTHEME_LOCK_GIT@
+typeset -gi __ZTHEME_LOCK_RUNTIME=@ZTHEME_LOCK_RUNTIME@
 typeset -g ZTHEME_PROMPT=""
 typeset -g ZTHEME_RPROMPT=""
 typeset -g ZTHEME_CONTEXT_KEY=""
 typeset -g ZTHEME_LAST_ERROR=""
 typeset -gi ZTHEME_GENERATION=0
-typeset -gi ZTHEME_ASYNC_PENDING=0
+typeset -gi ZTHEME_LOCKED_PENDING=0
 typeset -g ZTHEME_CLIENT_PID=""
 typeset -gi ZTHEME_CLIENT_READY=0
 typeset -gi ZTHEME_REQ_FD=-1
@@ -218,7 +220,7 @@ _ztheme_stop_client() {
     local -i response_fd="${ZTHEME_RESP_FD:--1}"
     ZTHEME_CLIENT_PID=""
     ZTHEME_CLIENT_READY=0
-    ZTHEME_ASYNC_PENDING=0
+    ZTHEME_LOCKED_PENDING=0
     ZTHEME_REQ_FD=-1
     ZTHEME_RESP_FD=-1
 
@@ -266,17 +268,57 @@ _ztheme_async_callback() {
     case "$kind" in
         segment)
             ZTHEME_LAST_ERROR=""
-            _ztheme_assign_async_segment "$segment" "$fragment"
+            # Only redraw when the value actually changed: an unchanged or empty
+            # fragment (runtimes emit one record per configured runtime) needs
+            # no second `reset-prompt`.
+            if _ztheme_assign_async_segment "$segment" "$fragment"; then
+                # An unlocked segment arriving after the prompt rendered appears
+                # via a redraw; a segment for a still-locked group is stored and
+                # shown when that group's `complete` releases the barrier.
+                (( ! ZTHEME_LOCKED_PENDING )) && redraw=1
+            fi
             ;;
         error)
-            _ztheme_clear_async_segments
+            # Clear only the group that errored (`git` or `runtime`); a
+            # successful unlocked group must not be erased. An unrecognized
+            # source (such as an internal `snapshot` error) clears nothing and
+            # needs no redraw. Otherwise, when the prompt already rendered,
+            # redraw so the visible prompt reflects the cleared group.
+            if _ztheme_clear_async_group "$segment"; then
+                (( ! ZTHEME_LOCKED_PENDING )) && redraw=1
+            fi
             if [[ -n "$fragment" && "$fragment" != "$ZTHEME_LAST_ERROR" ]]; then
                 ZTHEME_LAST_ERROR="$fragment"
                 builtin zle -M "ztheme: $fragment"
             fi
             ;;
+        complete)
+            # A group finished. Release its rendering lock (when present and
+            # locked); when no locked group remains pending, render the prompt.
+            case "$segment" in
+                git)
+                    if (( __ZTHEME_HAS_GIT && __ZTHEME_LOCK_GIT && ZTHEME_LOCKED_PENDING )); then
+                        (( ZTHEME_LOCKED_PENDING-- ))
+                        (( ZTHEME_LOCKED_PENDING == 0 )) && redraw=1
+                    fi
+                    ;;
+                runtime)
+                    if (( __ZTHEME_HAS_RUNTIME && __ZTHEME_LOCK_RUNTIME && ZTHEME_LOCKED_PENDING )); then
+                        (( ZTHEME_LOCKED_PENDING-- ))
+                        (( ZTHEME_LOCKED_PENDING == 0 )) && redraw=1
+                    fi
+                    ;;
+            esac
+            ;;
         done)
-            redraw=1
+            # Shared deadline passed or all work finished. This is the safety
+            # net for a locked group that never delivered a `complete` before
+            # the deadline: when nothing is pending the prompt was already
+            # rendered, so skip the redundant second redraw.
+            if (( ZTHEME_LOCKED_PENDING )); then
+                ZTHEME_LOCKED_PENDING=0
+                redraw=1
+            fi
             ;;
         *)
             return
@@ -284,7 +326,6 @@ _ztheme_async_callback() {
     esac
 
     if (( redraw )); then
-        ZTHEME_ASYNC_PENDING=0
         _ztheme_render_layout
         builtin zle reset-prompt
     fi
@@ -339,7 +380,12 @@ _ztheme_start_worker() {
         return 1
     fi
 
-    ZTHEME_ASYNC_PENDING=1
+    # Count how many present asynchronous groups are locked (wait for them
+    # before rendering). Any unlocked group does not block the prompt; it is
+    # drawn in via a redraw when its records arrive.
+    ZTHEME_LOCKED_PENDING=0
+    (( __ZTHEME_HAS_GIT && __ZTHEME_LOCK_GIT )) && (( ZTHEME_LOCKED_PENDING++ ))
+    (( __ZTHEME_HAS_RUNTIME && __ZTHEME_LOCK_RUNTIME )) && (( ZTHEME_LOCKED_PENDING++ ))
     ZTHEME_PROMPT=""
     ZTHEME_RPROMPT=""
     return 0
@@ -403,8 +449,7 @@ _ztheme_precmd() {
     emulate -L zsh
     setopt localoptions no_shwordsplit
 
-    local -i worker_started=0
-    _ztheme_start_worker && worker_started=1
+    _ztheme_start_worker
 
     _ztheme_compute_sync_segments "$last_status"
 
@@ -425,9 +470,11 @@ _ztheme_precmd() {
         ZTHEME_LAST_ERROR=""
     fi
 
-    if (( ! worker_started )); then
-        _ztheme_render_layout
-    fi
+    # Rendering is always attempted here: `_ztheme_render_layout` returns early
+    # while a locked group is still pending, and otherwise draws the prompt
+    # immediately (which is what lets an unlocked-only layout appear at once
+    # instead of waiting for the async records).
+    _ztheme_render_layout
 }
 
 _ztheme_load_shell_plugins() {

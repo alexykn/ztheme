@@ -130,7 +130,7 @@ fn first_line(path: &Path) -> io::Result<String> {
 mod tests {
     use super::{resolve_custom_segments, valid_custom_identifier, validate_enabled_segments};
     use crate::theme::tests_support::write_theme_files;
-    use crate::theme::{Config, CustomSegmentsConfig};
+    use crate::theme::{AsyncSection, Config, CustomSegmentsConfig};
 
     fn config(enabled: &[&str]) -> Config {
         Config {
@@ -139,6 +139,7 @@ mod tests {
             custom_segments: CustomSegmentsConfig {
                 enabled: enabled.iter().map(|value| (*value).to_owned()).collect(),
             },
+            async_section: AsyncSection::default(),
         }
     }
 
