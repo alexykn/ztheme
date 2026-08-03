@@ -402,15 +402,32 @@ async fn cached_runtime_values(
                     return Ok(values);
                 }
 
+                // A completed execution must produce a version for every value.
+                // Enforce that invariant explicitly instead of silently
+                // dropping missing versions: a cacheable runtime that executed
+                // without a parseable version is an internal error, and caching
+                // a versionless value would poison the semantic cache.
+                for value in &values {
+                    if value.version.is_none() {
+                        let _ = daemon::runtime_cache_release(instance, key, token).await;
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!(
+                                "runtime {} completed without a version while caching was required",
+                                value.runtime.name()
+                            ),
+                        ));
+                    }
+                }
                 let cached_values = values
                     .iter()
-                    .filter_map(|value| {
-                        let version = value.version.as_ref()?;
-                        Some(runtime::CachedRuntimeValue {
-                            runtime: value.runtime,
-                            version: version.clone(),
-                            label: value.label.clone(),
-                        })
+                    .map(|value| runtime::CachedRuntimeValue {
+                        runtime: value.runtime,
+                        version: value
+                            .version
+                            .clone()
+                            .expect("version presence verified above"),
+                        label: value.label.clone(),
                     })
                     .collect::<Vec<_>>();
                 let encoded = runtime::encode(&cached_values)?;
@@ -470,8 +487,8 @@ fn execution_values(
             RuntimeOutcome::Value(value) => values.push(runtime::materialize(value, environment)),
             RuntimeOutcome::MissingExecutable => {
                 // The runtime is detected but its executable is not installed.
-                // Surface an empty-version value so the segment can still render
-                // its symbol and language name (without a version).
+                // Surface a value without a version so the segment can still
+                // render its symbol and language name.
                 complete = false;
                 values.push(RuntimeValue {
                     runtime: execution.runtime,

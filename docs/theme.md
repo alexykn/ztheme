@@ -253,8 +253,9 @@ to an empty value. The environment subsegment is rendered only when detection
 has an environment label; configuring it does not force one to appear.
 
 Runtime detection is asynchronous. A runtime segment remains empty when ztheme
-does not detect that runtime in the current project or cannot determine a
-version.
+does not detect that runtime in the current project. When a runtime is detected
+but its executable is missing, the segment renders its symbol and language name
+without a version.
 
 ## Complete shape
 

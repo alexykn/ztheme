@@ -200,12 +200,7 @@ fn finalize_plan(cwd: &Path, plan: BasePlan, environment: &PromptEnvironment) ->
                 VolatileReason::UnsupportedContextualSelection,
             );
         }
-        Runtime::R
-        | Runtime::Julia
-        | Runtime::Elixir
-        | Runtime::Dart
-        | Runtime::Haskell
-        | Runtime::Zig => {
+        Runtime::R | Runtime::Julia | Runtime::Elixir | Runtime::Haskell => {
             return volatile(runtime, spec, program, VolatileReason::NotYetCacheable);
         }
         _ => {}
@@ -1648,7 +1643,7 @@ mod tests {
     }
 
     #[test]
-    fn new_runtimes_are_volatile_until_caching_is_evaluated() {
+    fn new_runtimes_volatility_and_cacheability() {
         let directory = TestDirectory::new();
         for marker in [
             "DESCRIPTION",
@@ -1669,16 +1664,15 @@ mod tests {
             path: Some(bin.clone().into()),
             ..PromptEnvironment::default()
         };
-        let runtimes = [
+
+        // R, Julia, Elixir, and Haskell stay volatile while their caching
+        // model is being evaluated.
+        for runtime in [
             Runtime::R,
             Runtime::Julia,
             Runtime::Elixir,
-            Runtime::Dart,
             Runtime::Haskell,
-            Runtime::Zig,
-        ];
-
-        for runtime in runtimes {
+        ] {
             let plan = plan_for(directory.path(), &[runtime], &environment)
                 .into_iter()
                 .next()
@@ -1687,6 +1681,41 @@ mod tests {
                 matches!(
                     plan.cache,
                     Cacheability::Volatile(VolatileReason::NotYetCacheable)
+                ),
+                "unexpected plan for {}: {:?}",
+                runtime.name(),
+                plan
+            );
+        }
+
+        // Direct native Dart and Zig SDK executables are identity-stable and
+        // therefore cacheable.
+        for runtime in [Runtime::Dart, Runtime::Zig] {
+            let plan = plan_for(directory.path(), &[runtime], &environment)
+                .into_iter()
+                .next()
+                .unwrap();
+            assert!(
+                matches!(plan.cache, Cacheability::Cacheable(_)),
+                "unexpected plan for {}: {:?}",
+                runtime.name(),
+                plan
+            );
+        }
+
+        // Script-based Dart/Zig frontends (e.g. Flutter or version-manager
+        // wrappers) stay volatile through shebang detection.
+        script(&bin.join("dart"));
+        script(&bin.join("zig"));
+        for runtime in [Runtime::Dart, Runtime::Zig] {
+            let plan = plan_for(directory.path(), &[runtime], &environment)
+                .into_iter()
+                .next()
+                .unwrap();
+            assert!(
+                matches!(
+                    plan.cache,
+                    Cacheability::Volatile(VolatileReason::ScriptWrapper)
                 ),
                 "unexpected plan for {}: {:?}",
                 runtime.name(),
