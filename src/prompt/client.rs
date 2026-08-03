@@ -539,9 +539,8 @@ mod tests {
         stale.push(0);
         stale.resize(stale.len() + ENV_FIELD_COUNT, 0);
 
-        let error = match read_request(&mut BufReader::new(&stale[..])) {
-            Ok(_) => panic!("an old request version must be rejected"),
-            Err(error) => error,
+        let Err(error) = read_request(&mut BufReader::new(&stale[..])) else {
+            panic!("an old request version must be rejected");
         };
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
         let mismatch = error
