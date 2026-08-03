@@ -1157,7 +1157,7 @@ fn shell_word(path: &Path) -> String {
     format!("'{}'", path.to_string_lossy().replace('\'', "'\\''"))
 }
 
-const REQUEST_ENV_NAMES: [&str; 23] = [
+const REQUEST_ENV_NAMES: [&str; 29] = [
     "PATH",
     "HOME",
     "GIT_DIR",
@@ -1181,6 +1181,12 @@ const REQUEST_ENV_NAMES: [&str; 23] = [
     "JAVA_HOME",
     "GOTOOLCHAIN",
     "DOTNET_ROOT",
+    "JULIAUP_CHANNEL",
+    "JULIAUP_DEPOT_PATH",
+    "JULIA_PROJECT",
+    "JULIA_LOAD_PATH",
+    "JULIA_DEPOT_PATH",
+    "R_ARCH",
 ];
 
 fn client_request(generation: u64, cwd: &[u8]) -> Vec<u8> {
@@ -1188,7 +1194,7 @@ fn client_request(generation: u64, cwd: &[u8]) -> Vec<u8> {
 }
 
 fn client_request_with_env(generation: u64, cwd: &[u8], env: &[(&str, &str)]) -> Vec<u8> {
-    let mut fields: [&[u8]; 23] = [b""; 23];
+    let mut fields: [&[u8]; 29] = [b""; 29];
     for (name, value) in env {
         let index = REQUEST_ENV_NAMES
             .iter()
@@ -1197,7 +1203,7 @@ fn client_request_with_env(generation: u64, cwd: &[u8], env: &[(&str, &str)]) ->
         fields[index] = value.as_bytes();
     }
     let mut bytes = b"ZTREQ\0".to_vec();
-    bytes.extend_from_slice(b"2\0");
+    bytes.extend_from_slice(b"3\0");
     bytes.extend_from_slice(generation.to_string().as_bytes());
     bytes.push(0);
     bytes.extend_from_slice(cwd);
@@ -1750,7 +1756,7 @@ add-zsh-hook -D preexec _ztheme_preexec 2>/dev/null
 # requires zle -F registration, which is only meaningful in an interactive
 # shell, and the test drives the wire protocol itself.
 typeset -i request_generation=5
-local request_line="ZTREQ"$'\0'"2"$'\0'"$request_generation"$'\0'"$PWD"$'\0'
+local request_line="ZTREQ"$'\0'"3"$'\0'"$request_generation"$'\0'"$PWD"$'\0'
 request_line+="${{PATH:-}}"$'\0'"${{HOME:-}}"$'\0'
 request_line+="${{GIT_DIR:-}}"$'\0'"${{GIT_WORK_TREE:-}}"$'\0'
 request_line+="${{GIT_CEILING_DIRECTORIES:-}}"$'\0'
@@ -1763,6 +1769,9 @@ request_line+="${{RBENV_DIR:-}}"$'\0'"${{RBENV_VERSION:-}}"$'\0'
 request_line+="${{NODENV_VERSION:-}}"$'\0'"${{NODENV_DIR:-}}"$'\0'
 request_line+="${{PLENV_DIR:-}}"$'\0'"${{RUBY_VERSION:-}}"$'\0'
 request_line+="${{JAVA_HOME:-}}"$'\0'"${{GOTOOLCHAIN:-}}"$'\0'"${{DOTNET_ROOT:-}}"$'\0'
+request_line+="${{JULIAUP_CHANNEL:-}}"$'\0'"${{JULIAUP_DEPOT_PATH:-}}"$'\0'
+request_line+="${{JULIA_PROJECT:-}}"$'\0'"${{JULIA_LOAD_PATH:-}}"$'\0'
+request_line+="${{JULIA_DEPOT_PATH:-}}"$'\0'"${{R_ARCH:-}}"$'\0'
 if ! print -rn -- "$request_line" >&"$ZTHEME_REQ_FD"; then
     exit 83
 fi
@@ -2304,6 +2313,305 @@ fn volatile_runtime_commands_use_a_cleared_request_environment() {
         "volatile command retained the previous request environment: {second}"
     );
     assert_eq!(fs::read_to_string(&counter).unwrap().trim(), "2");
+
+    drop(stdin);
+    assert!(
+        wait_for_exit(&mut child, PROCESS_TIMEOUT)
+            .unwrap()
+            .success()
+    );
+    shutdown_server(server, &socket);
+}
+
+fn write_julia_theme(sandbox: &Sandbox, name: &str) {
+    sandbox.write_theme(
+        name,
+        "version = 1\n[layout]\nlines = [[\"julia\"]]\nright = []\nseparator = \" | \"\nblank_line_before = false\n[segments.julia]\nsymbol = \"jl\"\n",
+    );
+}
+
+fn write_r_theme(sandbox: &Sandbox, name: &str) {
+    sandbox.write_theme(
+        name,
+        "version = 1\n[layout]\nlines = [[\"r\"]]\nright = []\nseparator = \" | \"\nblank_line_before = false\n[segments.r]\nsymbol = \"r\"\n",
+    );
+}
+
+fn write_julia_r_theme(sandbox: &Sandbox, name: &str) {
+    sandbox.write_theme(
+        name,
+        "version = 1\n[layout]\nlines = [[\"julia\", \"r\"]]\nright = []\nseparator = \" | \"\nblank_line_before = false\n[segments.julia]\nsymbol = \"jl\"\n[segments.r]\nsymbol = \"r\"\n",
+    );
+}
+
+fn julia_fragment(records: &[String]) -> String {
+    records
+        .iter()
+        .find_map(|record| {
+            let fields: Vec<&str> = record.trim_end_matches('\n').split('\t').collect();
+            (fields.get(2) == Some(&"segment") && fields.get(3) == Some(&"julia"))
+                .then(|| fields.get(4).copied().unwrap_or_default().to_owned())
+        })
+        .unwrap_or_default()
+}
+
+fn r_fragment(records: &[String]) -> String {
+    records
+        .iter()
+        .find_map(|record| {
+            let fields: Vec<&str> = record.trim_end_matches('\n').split('\t').collect();
+            (fields.get(2) == Some(&"segment") && fields.get(3) == Some(&"r"))
+                .then(|| fields.get(4).copied().unwrap_or_default().to_owned())
+        })
+        .unwrap_or_default()
+}
+
+/// Installs a shebang wrapper for `program` that writes an observation line
+/// built from `observe` (a shell double-quoted expansion) to `log` and prints
+/// `version_line` on stdout for version parsing. Returns the bin directory.
+fn install_observing_wrapper(
+    sandbox: &Sandbox,
+    program: &str,
+    log: &Path,
+    version_line: &str,
+    observe: &str,
+) -> String {
+    let bin = sandbox.home.join(format!("{program}-wrapper-bin"));
+    fs::create_dir_all(&bin).unwrap();
+    let path = bin.join(program);
+    fs::write(
+        &path,
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"{observe}\" > '{}'\nprintf '%s\\n' '{version_line}'\n",
+            log.display()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+    bin.to_str().unwrap().to_owned()
+}
+
+/// Compiles a native `program` that counts invocations in `counter` and prints
+/// `version_line`, returning the bin directory.
+fn install_counting_native(
+    sandbox: &Sandbox,
+    program: &str,
+    version_line: &str,
+    counter: &Path,
+) -> String {
+    let bin = sandbox.home.join(format!("{program}-bin"));
+    fs::create_dir_all(&bin).unwrap();
+    let source_path = sandbox.home.join(format!("counting-{program}.c"));
+    let binary = bin.join(program);
+    let source = format!(
+        r#"#include <fcntl.h>
+#include <stdio.h>
+#include <sys/file.h>
+#include <unistd.h>
+int main(void) {{
+    int fd = open("{}", O_CREAT | O_RDWR, 0600);
+    if (fd < 0 || flock(fd, LOCK_EX) != 0) return 2;
+    char value[32] = {{0}};
+    int count = 0;
+    if (read(fd, value, sizeof(value) - 1) > 0) sscanf(value, "%d", &count);
+    ++count;
+    lseek(fd, 0, SEEK_SET);
+    ftruncate(fd, 0);
+    dprintf(fd, "%d\n", count);
+    flock(fd, LOCK_UN);
+    close(fd);
+    printf("{}\n");
+    return 0;
+}}
+"#,
+        counter.display(),
+        version_line
+    );
+    fs::write(&source_path, source).unwrap();
+    let compiled = Command::new("cc")
+        .arg(&source_path)
+        .arg("-o")
+        .arg(&binary)
+        .status()
+        .unwrap();
+    assert!(compiled.success(), "failed to compile counting {program}");
+    fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();
+    bin.to_str().unwrap().to_owned()
+}
+
+#[test]
+fn juliaup_selector_environment_reaches_volatile_julia_execution() {
+    let sandbox = Sandbox::new();
+    let instance = format!(
+        "runtime-cache-juliaup-{}",
+        SEQUENCE.fetch_add(1, Ordering::Relaxed)
+    );
+    write_julia_theme(&sandbox, "juliaup-julia");
+    fs::write(sandbox.home.join("Project.toml"), b"").unwrap();
+    let log = sandbox.home.join("julia-observations");
+    let request_path = install_observing_wrapper(
+        &sandbox,
+        "julia",
+        &log,
+        "julia version 1.11.5",
+        "${JULIAUP_CHANNEL:-unset}|${JULIAUP_DEPOT_PATH:-unset}|${JULIA_PROJECT:-unset}|${JULIA_LOAD_PATH:-unset}|${JULIA_DEPOT_PATH:-unset}|${HOME:-unset}|$PWD",
+    );
+    let wrapper = Path::new(request_path.split(':').next().unwrap()).join("julia");
+    warm_executable(&wrapper);
+    let (server, socket) = spawn_server(&sandbox, &instance);
+    let hex = theme_hex(&sandbox, &instance, "juliaup-julia");
+    let (mut child, mut stdin, mut stdout) = spawn_client_daemon(&sandbox, &instance, &hex, &[]);
+    let cwd = sandbox.home.to_str().unwrap().as_bytes().to_vec();
+
+    let records = send_and_read_until_done(
+        &mut stdin,
+        &mut stdout,
+        1,
+        &cwd,
+        &[
+            ("PATH", &request_path),
+            ("HOME", "/custom-home"),
+            ("JULIAUP_CHANNEL", "release"),
+            ("JULIAUP_DEPOT_PATH", "/juliaup-depot"),
+            ("JULIA_PROJECT", "@sandbox"),
+            ("JULIA_LOAD_PATH", ":/custom"),
+            ("JULIA_DEPOT_PATH", "/julia-depot"),
+        ],
+    );
+    assert!(
+        julia_fragment(&records).contains("1.11.5"),
+        "julia version did not render: {records:?}"
+    );
+    let cwd_text = fs::canonicalize(&sandbox.home)
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_owned();
+    assert_eq!(
+        fs::read_to_string(&log).unwrap().trim(),
+        format!("release|/juliaup-depot|@sandbox|:/custom|/julia-depot|/custom-home|{cwd_text}")
+    );
+
+    drop(stdin);
+    assert!(
+        wait_for_exit(&mut child, PROCESS_TIMEOUT)
+            .unwrap()
+            .success()
+    );
+    shutdown_server(server, &socket);
+}
+
+#[test]
+fn r_arch_reaches_volatile_r_execution() {
+    let sandbox = Sandbox::new();
+    let instance = format!(
+        "runtime-cache-r-arch-{}",
+        SEQUENCE.fetch_add(1, Ordering::Relaxed)
+    );
+    write_r_theme(&sandbox, "r-arch-r");
+    fs::write(sandbox.home.join("DESCRIPTION"), b"Package: foo\n").unwrap();
+    let log = sandbox.home.join("r-observations");
+    let request_path =
+        install_observing_wrapper(&sandbox, "R", &log, "R version 4.5.1", "${R_ARCH:-unset}");
+    let wrapper = Path::new(request_path.split(':').next().unwrap()).join("R");
+    warm_executable(&wrapper);
+    let (server, socket) = spawn_server(&sandbox, &instance);
+    let hex = theme_hex(&sandbox, &instance, "r-arch-r");
+    let (mut child, mut stdin, mut stdout) = spawn_client_daemon(&sandbox, &instance, &hex, &[]);
+    let cwd = sandbox.home.to_str().unwrap().as_bytes().to_vec();
+
+    let records = send_and_read_until_done(
+        &mut stdin,
+        &mut stdout,
+        1,
+        &cwd,
+        &[
+            ("PATH", &request_path),
+            ("HOME", "/custom-home"),
+            ("R_ARCH", "/x86_64"),
+        ],
+    );
+    assert!(
+        r_fragment(&records).contains("4.5.1"),
+        "r version did not render: {records:?}"
+    );
+    assert_eq!(fs::read_to_string(&log).unwrap().trim(), "/x86_64");
+
+    drop(stdin);
+    assert!(
+        wait_for_exit(&mut child, PROCESS_TIMEOUT)
+            .unwrap()
+            .success()
+    );
+    shutdown_server(server, &socket);
+}
+
+#[test]
+fn direct_julia_and_r_survive_launcher_selector_switches() {
+    let sandbox = Sandbox::new();
+    let instance = format!(
+        "runtime-cache-direct-julia-r-{}",
+        SEQUENCE.fetch_add(1, Ordering::Relaxed)
+    );
+    write_julia_r_theme(&sandbox, "direct-julia-r");
+    fs::write(sandbox.home.join("Project.toml"), b"").unwrap();
+    fs::write(sandbox.home.join("DESCRIPTION"), b"Package: foo\n").unwrap();
+    let julia_counter = sandbox.home.join("julia-count");
+    let r_counter = sandbox.home.join("r-count");
+    fs::write(&julia_counter, b"0\n").unwrap();
+    fs::write(&r_counter, b"0\n").unwrap();
+    let julia_path =
+        install_counting_native(&sandbox, "julia", "julia version 1.11.5", &julia_counter);
+    let r_path = install_counting_native(&sandbox, "R", "R version 4.5.1", &r_counter);
+    let combined = format!("{julia_path}:{r_path}");
+    warm_executable(&Path::new(&julia_path).join("julia"));
+    warm_executable(&Path::new(&r_path).join("R"));
+    fs::write(&julia_counter, b"0\n").unwrap();
+    fs::write(&r_counter, b"0\n").unwrap();
+    let (server, socket) = spawn_server(&sandbox, &instance);
+    let hex = theme_hex(&sandbox, &instance, "direct-julia-r");
+    let (mut child, mut stdin, mut stdout) = spawn_client_daemon(&sandbox, &instance, &hex, &[]);
+    let cwd = sandbox.home.to_str().unwrap().as_bytes().to_vec();
+
+    let first = send_and_read_until_done(
+        &mut stdin,
+        &mut stdout,
+        1,
+        &cwd,
+        &[
+            ("PATH", &combined),
+            ("JULIAUP_CHANNEL", "release"),
+            ("R_ARCH", "/x86_64"),
+        ],
+    );
+    assert!(julia_fragment(&first).contains("1.11.5"));
+    assert!(r_fragment(&first).contains("4.5.1"));
+
+    // Launcher-only selectors cannot redirect a direct native executable, so
+    // switching them must not invalidate the cached identity.
+    let second = send_and_read_until_done(
+        &mut stdin,
+        &mut stdout,
+        2,
+        &cwd,
+        &[
+            ("PATH", &combined),
+            ("JULIAUP_CHANNEL", "nightly"),
+            ("R_ARCH", "/arm64"),
+        ],
+    );
+    assert!(julia_fragment(&second).contains("1.11.5"));
+    assert!(r_fragment(&second).contains("4.5.1"));
+    assert_eq!(
+        fs::read_to_string(&julia_counter).unwrap().trim(),
+        "1",
+        "julia selector switch invalidated the direct cache"
+    );
+    assert_eq!(
+        fs::read_to_string(&r_counter).unwrap().trim(),
+        "1",
+        "r selector switch invalidated the direct cache"
+    );
 
     drop(stdin);
     assert!(
@@ -2865,7 +3173,7 @@ fn client_exits_after_shell_killed_during_active_request() {
     let socket = wait_for_socket(server.child(), &sandbox.runtime);
 
     // A request whose git query is still in flight when the shell dies.
-    let preamble = r#"print -rn -- "ZTREQ"$'\0'"2"$'\0'"1"$'\0'"$PWD"$'\0'"${PATH:-}"$'\0'"${HOME:-}"$'\0'"${GIT_DIR:-}"$'\0'"${GIT_WORK_TREE:-}"$'\0'"${GIT_CEILING_DIRECTORIES:-}"$'\0'"${VIRTUAL_ENV:-}"$'\0'"${CONDA_PREFIX:-}"$'\0'"${CONDA_DEFAULT_ENV:-}"$'\0'"${PERLBREW_PERL:-}"$'\0'"${PLENV_VERSION:-}"$'\0'"${PYENV_VERSION:-}"$'\0'"${PYENV_DIR:-}"$'\0'"${RUSTUP_TOOLCHAIN:-}"$'\0'"${RUSTUP_HOME:-}"$'\0'"${RBENV_DIR:-}"$'\0'"${RBENV_VERSION:-}"$'\0'"${NODENV_VERSION:-}"$'\0'"${NODENV_DIR:-}"$'\0'"${PLENV_DIR:-}"$'\0'"${RUBY_VERSION:-}"$'\0'"${JAVA_HOME:-}"$'\0'"${GOTOOLCHAIN:-}"$'\0'"${DOTNET_ROOT:-}"$'\0' >&"$ZTHEME_REQ_FD"
+    let preamble = r#"print -rn -- "ZTREQ"$'\0'"3"$'\0'"1"$'\0'"$PWD"$'\0'"${PATH:-}"$'\0'"${HOME:-}"$'\0'"${GIT_DIR:-}"$'\0'"${GIT_WORK_TREE:-}"$'\0'"${GIT_CEILING_DIRECTORIES:-}"$'\0'"${VIRTUAL_ENV:-}"$'\0'"${CONDA_PREFIX:-}"$'\0'"${CONDA_DEFAULT_ENV:-}"$'\0'"${PERLBREW_PERL:-}"$'\0'"${PLENV_VERSION:-}"$'\0'"${PYENV_VERSION:-}"$'\0'"${PYENV_DIR:-}"$'\0'"${RUSTUP_TOOLCHAIN:-}"$'\0'"${RUSTUP_HOME:-}"$'\0'"${RBENV_DIR:-}"$'\0'"${RBENV_VERSION:-}"$'\0'"${NODENV_VERSION:-}"$'\0'"${NODENV_DIR:-}"$'\0'"${PLENV_DIR:-}"$'\0'"${RUBY_VERSION:-}"$'\0'"${JAVA_HOME:-}"$'\0'"${GOTOOLCHAIN:-}"$'\0'"${DOTNET_ROOT:-}"$'\0'"${JULIAUP_CHANNEL:-}"$'\0'"${JULIAUP_DEPOT_PATH:-}"$'\0'"${JULIA_PROJECT:-}"$'\0'"${JULIA_LOAD_PATH:-}"$'\0'"${JULIA_DEPOT_PATH:-}"$'\0'"${R_ARCH:-}"$'\0' >&"$ZTHEME_REQ_FD"
 "#;
     let (mut shell, client_pid) = spawn_live_shell(&sandbox, &instance, preamble);
     thread::sleep(Duration::from_millis(100));

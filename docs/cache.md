@@ -136,10 +136,18 @@ Volatile execution is the conservative fallback. It preserves current results
 without requiring ztheme to become a general-purpose version or package
 manager.
 
-Dart and Zig are cacheable when they resolve to a direct native SDK
-executable. Script-based frontends (such as Flutter or version-manager
+Dart, Zig, Julia, and R are cacheable when they resolve to a direct native
+SDK executable. Script-based frontends (such as Flutter or version-manager
 wrappers), shims, and dispatchers remain volatile through shebang and shim
-detection. The `r`, `julia`, `elixir`, and `haskell` runtimes are currently
+detection.
+
+Juliaup remains volatile: it performs contextual channel selection (channel
+environment, directory overrides, project/manifest selection, then its
+configured default channel), so its launcher identity alone cannot prove which
+Julia will run. R's standard Unix launcher is a shell script and remains
+volatile because it selects the sub-architecture through `R_ARCH`; that
+variable is forwarded to volatile execution so `R --version` observes the same
+selection as the shell. The `elixir` and `haskell` runtimes are currently
 always volatile while their caching model is being evaluated. They execute on
 every prompt where detected and are never stored in the semantic cache.
 

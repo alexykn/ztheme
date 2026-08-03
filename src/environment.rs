@@ -32,6 +32,12 @@ pub(crate) struct PromptEnvironment {
     pub(crate) java_home: Option<OsString>,
     pub(crate) gotoolchain: Option<OsString>,
     pub(crate) dotnet_root: Option<OsString>,
+    pub(crate) juliaup_channel: Option<OsString>,
+    pub(crate) juliaup_depot_path: Option<OsString>,
+    pub(crate) julia_project: Option<OsString>,
+    pub(crate) julia_load_path: Option<OsString>,
+    pub(crate) julia_depot_path: Option<OsString>,
+    pub(crate) r_arch: Option<OsString>,
 }
 
 impl PromptEnvironment {
@@ -84,6 +90,20 @@ impl PromptEnvironment {
         apply(command, "JAVA_HOME", self.java_home.as_deref());
         apply(command, "GOTOOLCHAIN", self.gotoolchain.as_deref());
         apply(command, "DOTNET_ROOT", self.dotnet_root.as_deref());
+        apply(command, "JULIAUP_CHANNEL", self.juliaup_channel.as_deref());
+        apply(
+            command,
+            "JULIAUP_DEPOT_PATH",
+            self.juliaup_depot_path.as_deref(),
+        );
+        apply(command, "JULIA_PROJECT", self.julia_project.as_deref());
+        apply(command, "JULIA_LOAD_PATH", self.julia_load_path.as_deref());
+        apply(
+            command,
+            "JULIA_DEPOT_PATH",
+            self.julia_depot_path.as_deref(),
+        );
+        apply(command, "R_ARCH", self.r_arch.as_deref());
     }
 }
 
@@ -112,6 +132,12 @@ mod tests {
             git_ceilings: Some(OsString::from("/repo")),
             virtual_env: Some(OsString::from("/venv-a")),
             rustup_toolchain: Some(OsString::from("nightly")),
+            juliaup_channel: Some(OsString::from("release")),
+            juliaup_depot_path: Some(OsString::from("/depot-a")),
+            julia_project: Some(OsString::from("@project")),
+            julia_load_path: Some(OsString::from(":")),
+            julia_depot_path: Some(OsString::from("/depot-b")),
+            r_arch: Some(OsString::from("/x86_64")),
             ..PromptEnvironment::default()
         };
 
@@ -133,6 +159,21 @@ mod tests {
             get("RUSTUP_TOOLCHAIN"),
             Some(Some(OsString::from("nightly")))
         );
+        assert_eq!(
+            get("JULIAUP_CHANNEL"),
+            Some(Some(OsString::from("release")))
+        );
+        assert_eq!(
+            get("JULIAUP_DEPOT_PATH"),
+            Some(Some(OsString::from("/depot-a")))
+        );
+        assert_eq!(get("JULIA_PROJECT"), Some(Some(OsString::from("@project"))));
+        assert_eq!(get("JULIA_LOAD_PATH"), Some(Some(OsString::from(":"))));
+        assert_eq!(
+            get("JULIA_DEPOT_PATH"),
+            Some(Some(OsString::from("/depot-b")))
+        );
+        assert_eq!(get("R_ARCH"), Some(Some(OsString::from("/x86_64"))));
         // Clearing the command environment means unset controls do not appear
         // as inherited values or as a synthetic environment entry.
         for name in [

@@ -16,7 +16,7 @@ use crate::prompt::snapshot;
 use crate::theme::AsyncTheme;
 
 const REQUEST_MAGIC: &[u8] = b"ZTREQ";
-const REQUEST_VERSION: &[u8] = b"2";
+const REQUEST_VERSION: &[u8] = b"3";
 
 /// How often the client verifies that the shell that spawned it is still its
 /// parent. EOF on the request pipe is the primary lifetime signal; this
@@ -220,6 +220,12 @@ where
         java_home: env_field(read_field(reader)?)?,
         gotoolchain: env_field(read_field(reader)?)?,
         dotnet_root: env_field(read_field(reader)?)?,
+        juliaup_channel: env_field(read_field(reader)?)?,
+        juliaup_depot_path: env_field(read_field(reader)?)?,
+        julia_project: env_field(read_field(reader)?)?,
+        julia_load_path: env_field(read_field(reader)?)?,
+        julia_depot_path: env_field(read_field(reader)?)?,
+        r_arch: env_field(read_field(reader)?)?,
     };
 
     Ok(Some(Request {
@@ -271,7 +277,7 @@ mod tests {
 
     use super::{REQUEST_MAGIC, REQUEST_VERSION, read_request};
 
-    const ENV_FIELD_COUNT: usize = 23;
+    const ENV_FIELD_COUNT: usize = 29;
 
     fn request(cwd: &[u8], fields: &[&[u8]]) -> Vec<u8> {
         assert_eq!(fields.len(), ENV_FIELD_COUNT);
@@ -316,6 +322,12 @@ mod tests {
             b"",
             b"",
             b"",
+            b"",
+            b"",
+            b"",
+            b"",
+            b"",
+            b"",
         ];
         let bytes = request(b"/work/project", &fields);
         let mut reader = BufReader::new(&bytes[..]);
@@ -336,7 +348,99 @@ mod tests {
             request.environment.git_work_tree.as_deref(),
             Some(OsStr::new("/work/tree"))
         );
+        assert_eq!(request.environment.juliaup_channel, None);
+        assert_eq!(request.environment.juliaup_depot_path, None);
+        assert_eq!(request.environment.julia_project, None);
+        assert_eq!(request.environment.julia_load_path, None);
+        assert_eq!(request.environment.julia_depot_path, None);
+        assert_eq!(request.environment.r_arch, None);
         assert!(read_request(&mut reader).unwrap().is_none());
+    }
+
+    #[test]
+    fn new_selector_fields_round_trip_and_empty_values_are_none() {
+        let fields: [&[u8]; ENV_FIELD_COUNT] = [
+            b"",
+            b"",
+            b"",
+            b"",
+            b"",
+            b"",
+            b"",
+            b"",
+            b"",
+            b"",
+            b"",
+            b"",
+            b"",
+            b"",
+            b"",
+            b"",
+            b"",
+            b"",
+            b"",
+            b"",
+            b"",
+            b"",
+            b"",
+            b"release",
+            b"/depot-a",
+            b"@project",
+            b":",
+            b"/depot-b",
+            b"/x86_64",
+        ];
+        let bytes = request(b"/work", &fields);
+        let mut reader = BufReader::new(&bytes[..]);
+        let request = read_request(&mut reader).unwrap().unwrap();
+
+        assert_eq!(
+            request.environment.juliaup_channel.as_deref(),
+            Some(OsStr::new("release"))
+        );
+        assert_eq!(
+            request.environment.juliaup_depot_path.as_deref(),
+            Some(OsStr::new("/depot-a"))
+        );
+        assert_eq!(
+            request.environment.julia_project.as_deref(),
+            Some(OsStr::new("@project"))
+        );
+        assert_eq!(
+            request.environment.julia_load_path.as_deref(),
+            Some(OsStr::new(":"))
+        );
+        assert_eq!(
+            request.environment.julia_depot_path.as_deref(),
+            Some(OsStr::new("/depot-b"))
+        );
+        assert_eq!(
+            request.environment.r_arch.as_deref(),
+            Some(OsStr::new("/x86_64"))
+        );
+    }
+
+    #[test]
+    fn non_utf8_selector_values_round_trip_as_os_string() {
+        let mut channel = b"julia-".to_vec();
+        channel.push(0xff);
+        let mut arch = b"R_".to_vec();
+        arch.push(0xfe);
+        let mut fields: [&[u8]; ENV_FIELD_COUNT] = [b""; ENV_FIELD_COUNT];
+        fields[23] = &channel;
+        fields[28] = &arch;
+        let bytes = request(b"/work", &fields);
+        let mut reader = BufReader::new(&bytes[..]);
+        let request = read_request(&mut reader).unwrap().unwrap();
+
+        assert_eq!(
+            request.environment.juliaup_channel.as_deref(),
+            Some(OsStr::from_bytes(&channel))
+        );
+        assert_eq!(
+            request.environment.r_arch.as_deref(),
+            Some(OsStr::from_bytes(&arch))
+        );
     }
 
     #[test]
@@ -363,13 +467,13 @@ mod tests {
         let empty: [&[u8]; ENV_FIELD_COUNT] = [b""; ENV_FIELD_COUNT];
         let valid = request(b"/work", &empty);
 
-        // bytes: ZTREQ\0 2\0 42\0 /work\0 then 23 empty fields
+        // bytes: ZTREQ\0 3\0 42\0 /work\0 then 29 empty fields
         let mut bad_magic = valid.clone();
         bad_magic[0] = b'X';
         assert!(read_request(&mut BufReader::new(&bad_magic[..])).is_err());
 
         let mut bad_version = valid.clone();
-        bad_version[6] = b'1';
+        bad_version[6] = b'2';
         assert!(read_request(&mut BufReader::new(&bad_version[..])).is_err());
 
         let mut bad_generation = valid.clone();

@@ -615,16 +615,18 @@ stdin for every asynchronous prompt. It is a single NUL-delimited record, so
 fields need no escaping and non-UTF-8 paths round-trip byte-exact:
 
 ```text
-ZTREQ<NUL>2<NUL>generation<NUL>cwd<NUL>
+ZTREQ<NUL>3<NUL>generation<NUL>cwd<NUL>
 PATH<NUL>HOME<NUL>GIT_DIR<NUL>GIT_WORK_TREE<NUL>GIT_CEILING_DIRECTORIES<NUL>
 VIRTUAL_ENV<NUL>CONDA_PREFIX<NUL>CONDA_DEFAULT_ENV<NUL>
 PERLBREW_PERL<NUL>PLENV_VERSION<NUL>PYENV_VERSION<NUL>PYENV_DIR<NUL>
 RUSTUP_TOOLCHAIN<NUL>RUSTUP_HOME<NUL>RBENV_DIR<NUL>RBENV_VERSION<NUL>
 NODENV_VERSION<NUL>NODENV_DIR<NUL>PLENV_DIR<NUL>RUBY_VERSION<NUL>
 JAVA_HOME<NUL>GOTOOLCHAIN<NUL>DOTNET_ROOT<NUL>
+JULIAUP_CHANNEL<NUL>JULIAUP_DEPOT_PATH<NUL>JULIA_PROJECT<NUL>
+JULIA_LOAD_PATH<NUL>JULIA_DEPOT_PATH<NUL>R_ARCH<NUL>
 ```
 
-`ZTREQ` and version `2` guard against garbage input. The environment subset is
+`ZTREQ` and version `3` guard against garbage input. The environment subset is
 exactly what runtime detection, command resolution, and the Git query read.
 The client does not apply it to its own process: the values are threaded
 through the request explicitly and applied only to the child commands that

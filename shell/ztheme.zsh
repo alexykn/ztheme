@@ -362,7 +362,7 @@ _ztheme_start_worker() {
     # zsh strings can hold NUL bytes, and backslash continuations would join
     # separate arguments, so the NUL-delimited request is assembled with
     # incremental appends, one assignment per line.
-    local request_line="ZTREQ"$'\0'"2"$'\0'"$generation"$'\0'"$PWD"$'\0'
+    local request_line="ZTREQ"$'\0'"3"$'\0'"$generation"$'\0'"$PWD"$'\0'
     request_line+="${PATH:-}"$'\0'"${HOME:-}"$'\0'
     request_line+="${GIT_DIR:-}"$'\0'"${GIT_WORK_TREE:-}"$'\0'
     request_line+="${GIT_CEILING_DIRECTORIES:-}"$'\0'
@@ -375,6 +375,9 @@ _ztheme_start_worker() {
     request_line+="${NODENV_VERSION:-}"$'\0'"${NODENV_DIR:-}"$'\0'
     request_line+="${PLENV_DIR:-}"$'\0'"${RUBY_VERSION:-}"$'\0'
     request_line+="${JAVA_HOME:-}"$'\0'"${GOTOOLCHAIN:-}"$'\0'"${DOTNET_ROOT:-}"$'\0'
+    request_line+="${JULIAUP_CHANNEL:-}"$'\0'"${JULIAUP_DEPOT_PATH:-}"$'\0'
+    request_line+="${JULIA_PROJECT:-}"$'\0'"${JULIA_LOAD_PATH:-}"$'\0'
+    request_line+="${JULIA_DEPOT_PATH:-}"$'\0'"${R_ARCH:-}"$'\0'
     if ! print -rn -- "$request_line" >&"$ZTHEME_REQ_FD" 2>/dev/null; then
         _ztheme_stop_client
         return 1
@@ -462,6 +465,9 @@ _ztheme_precmd() {
     context_key+="|${RBENV_DIR:-}|${RBENV_VERSION:-}"
     context_key+="|${NODENV_VERSION:-}|${NODENV_DIR:-}|${PLENV_DIR:-}"
     context_key+="|${RUBY_VERSION:-}|${JAVA_HOME:-}|${GOTOOLCHAIN:-}|${DOTNET_ROOT:-}"
+    context_key+="|${JULIAUP_CHANNEL:-}|${JULIAUP_DEPOT_PATH:-}"
+    context_key+="|${JULIA_PROJECT:-}|${JULIA_LOAD_PATH:-}"
+    context_key+="|${JULIA_DEPOT_PATH:-}|${R_ARCH:-}"
     context_key+="|${NVM_BIN:-}|$PATH"
 
     if [[ "$context_key" != "$ZTHEME_CONTEXT_KEY" ]]; then

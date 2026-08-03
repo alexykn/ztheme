@@ -580,7 +580,7 @@ mod tests {
         let rendered = theme.render_runtime(&runtime).unwrap();
         assert!(!rendered.is_empty());
         assert!(rendered.contains("Python"));
-        assert!(!rendered.contains("."));
+        assert!(!rendered.contains('.'));
     }
 
     #[test]

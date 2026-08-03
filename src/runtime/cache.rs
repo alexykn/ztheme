@@ -184,6 +184,23 @@ fn finalize_plan(cwd: &Path, plan: BasePlan, environment: &PromptEnvironment) ->
         return resolve_rustup(runtime, spec, program, cwd, environment);
     }
 
+    if runtime == Runtime::Julia {
+        match is_juliaup_launcher(&program) {
+            Ok(true) => {
+                return volatile(
+                    runtime,
+                    spec,
+                    program,
+                    VolatileReason::UnsupportedContextualSelection,
+                );
+            }
+            Ok(false) => {}
+            Err(_) => {
+                return volatile(runtime, spec, program, VolatileReason::UnreadableDependency);
+            }
+        }
+    }
+
     if program.parent().and_then(Path::file_name) == Some(OsStr::new("shims")) {
         return match resolve_supported_shim(runtime, spec.clone(), &program, cwd, environment) {
             Ok(plan) => plan,
@@ -200,7 +217,7 @@ fn finalize_plan(cwd: &Path, plan: BasePlan, environment: &PromptEnvironment) ->
                 VolatileReason::UnsupportedContextualSelection,
             );
         }
-        Runtime::R | Runtime::Julia | Runtime::Elixir | Runtime::Haskell => {
+        Runtime::Elixir | Runtime::Haskell => {
             return volatile(runtime, spec, program, VolatileReason::NotYetCacheable);
         }
         _ => {}
@@ -418,6 +435,20 @@ fn canonical_name_is_dispatcher(path: &Path) -> io::Result<bool> {
                 "asdf" | "mise" | "pyenv" | "rbenv" | "nodenv" | "plenv" | "rustup"
             )
         }))
+}
+
+/// True when the resolved Julia executable is Juliaup's native `julialauncher`.
+/// Juliaup performs contextual channel selection (channel environment,
+/// directory overrides, project/manifest selection, then its configured
+/// default channel), so the launcher's identity alone cannot prove which Julia
+/// will run. Kept separate from the global dispatcher list so the domain
+/// reason stays explicit and unrelated runtimes are unaffected.
+fn is_juliaup_launcher(path: &Path) -> io::Result<bool> {
+    let canonical = fs::canonicalize(path)?;
+    Ok(canonical
+        .file_name()
+        .and_then(OsStr::to_str)
+        .is_some_and(|name| name == "julialauncher"))
 }
 
 struct ShimFamily {
@@ -1665,14 +1696,9 @@ mod tests {
             ..PromptEnvironment::default()
         };
 
-        // R, Julia, Elixir, and Haskell stay volatile while their caching
-        // model is being evaluated.
-        for runtime in [
-            Runtime::R,
-            Runtime::Julia,
-            Runtime::Elixir,
-            Runtime::Haskell,
-        ] {
+        // Elixir and Haskell stay volatile while their caching model is being
+        // evaluated.
+        for runtime in [Runtime::Elixir, Runtime::Haskell] {
             let plan = plan_for(directory.path(), &[runtime], &environment)
                 .into_iter()
                 .next()
@@ -1688,9 +1714,9 @@ mod tests {
             );
         }
 
-        // Direct native Dart and Zig SDK executables are identity-stable and
-        // therefore cacheable.
-        for runtime in [Runtime::Dart, Runtime::Zig] {
+        // Direct native Dart, Zig, R, and Julia executables are
+        // identity-stable and therefore cacheable.
+        for runtime in [Runtime::Dart, Runtime::Zig, Runtime::R, Runtime::Julia] {
             let plan = plan_for(directory.path(), &[runtime], &environment)
                 .into_iter()
                 .next()
@@ -1703,11 +1729,13 @@ mod tests {
             );
         }
 
-        // Script-based Dart/Zig frontends (e.g. Flutter or version-manager
-        // wrappers) stay volatile through shebang detection.
-        script(&bin.join("dart"));
-        script(&bin.join("zig"));
-        for runtime in [Runtime::Dart, Runtime::Zig] {
+        // Script-based frontends (e.g. Flutter or version-manager wrappers,
+        // R's Unix shell launcher, Julia script wrappers) stay volatile
+        // through shebang detection.
+        for program in ["R", "julia", "dart", "zig"] {
+            script(&bin.join(program));
+        }
+        for runtime in [Runtime::R, Runtime::Julia, Runtime::Dart, Runtime::Zig] {
             let plan = plan_for(directory.path(), &[runtime], &environment)
                 .into_iter()
                 .next()
@@ -1722,6 +1750,90 @@ mod tests {
                 plan
             );
         }
+    }
+
+    #[test]
+    fn juliaup_launcher_is_volatile_even_when_native() {
+        let directory = TestDirectory::new();
+        fs::write(directory.path().join("Project.toml"), b"").unwrap();
+        let bin = directory.path().join("bin");
+        fs::create_dir(&bin).unwrap();
+        executable(&bin.join("julialauncher"));
+        std::os::unix::fs::symlink(bin.join("julialauncher"), bin.join("julia")).unwrap();
+        let environment = PromptEnvironment {
+            path: Some(bin.clone().into()),
+            ..PromptEnvironment::default()
+        };
+
+        let plan = plan_for(directory.path(), &[Runtime::Julia], &environment)
+            .into_iter()
+            .next()
+            .unwrap();
+        assert!(
+            matches!(
+                plan.cache,
+                Cacheability::Volatile(VolatileReason::UnsupportedContextualSelection)
+            ),
+            "unexpected plan: {plan:?}"
+        );
+    }
+
+    #[test]
+    fn direct_julia_and_r_keys_ignore_launcher_only_selectors() {
+        let directory = TestDirectory::new();
+        fs::write(directory.path().join("Project.toml"), b"").unwrap();
+        fs::write(directory.path().join("DESCRIPTION"), b"Package: foo\n").unwrap();
+        let bin = directory.path().join("bin");
+        fs::create_dir(&bin).unwrap();
+        executable(&bin.join("julia"));
+        executable(&bin.join("R"));
+        let path = bin.to_str().unwrap();
+        let julia = plan_for(
+            directory.path(),
+            &[Runtime::Julia],
+            &PromptEnvironment {
+                path: Some(path.into()),
+                ..PromptEnvironment::default()
+            },
+        )
+        .into_iter()
+        .next()
+        .unwrap();
+        let r = plan_for(
+            directory.path(),
+            &[Runtime::R],
+            &PromptEnvironment {
+                path: Some(path.into()),
+                ..PromptEnvironment::default()
+            },
+        )
+        .into_iter()
+        .next()
+        .unwrap();
+
+        let julia_selectors = PromptEnvironment {
+            path: Some(path.into()),
+            juliaup_channel: Some("release".into()),
+            juliaup_depot_path: Some("/depot".into()),
+            julia_project: Some("@project".into()),
+            julia_load_path: Some(":".into()),
+            julia_depot_path: Some("/depot-b".into()),
+            ..PromptEnvironment::default()
+        };
+        assert_eq!(
+            cache_key(std::slice::from_ref(&julia), &PromptEnvironment::default()),
+            cache_key(std::slice::from_ref(&julia), &julia_selectors)
+        );
+
+        let r_selectors = PromptEnvironment {
+            path: Some(path.into()),
+            r_arch: Some("/x86_64".into()),
+            ..PromptEnvironment::default()
+        };
+        assert_eq!(
+            cache_key(std::slice::from_ref(&r), &PromptEnvironment::default()),
+            cache_key(std::slice::from_ref(&r), &r_selectors)
+        );
     }
 
     #[test]

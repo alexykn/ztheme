@@ -128,9 +128,12 @@ fn directory_names(directory: &Path) -> HashSet<OsString> {
         .collect()
 }
 
-fn detect_markers(names: &HashSet<OsString>, runtimes: &mut HashSet<Runtime>) {
-    if has_any(
-        names,
+/// Marker files that identify a project as using a runtime. Detection is a
+/// set membership test: any single marker selects the runtime. Kept as data
+/// so the detection loop stays a small linear scan over the table.
+const RUNTIME_MARKERS: &[(Runtime, &[&str])] = &[
+    (
+        Runtime::Python,
         &[
             "pyproject.toml",
             "setup.py",
@@ -143,12 +146,9 @@ fn detect_markers(names: &HashSet<OsString>, runtimes: &mut HashSet<Runtime>) {
             ".python-version",
             "__init__.py",
         ],
-    ) {
-        runtimes.insert(Runtime::Python);
-    }
-
-    if has_any(
-        names,
+    ),
+    (
+        Runtime::Perl,
         &[
             "Makefile.PL",
             "Build.PL",
@@ -159,12 +159,9 @@ fn detect_markers(names: &HashSet<OsString>, runtimes: &mut HashSet<Runtime>) {
             "dist.ini",
             ".perl-version",
         ],
-    ) {
-        runtimes.insert(Runtime::Perl);
-    }
-
-    if has_any(
-        names,
+    ),
+    (
+        Runtime::Java,
         &[
             "pom.xml",
             "build.gradle",
@@ -175,16 +172,13 @@ fn detect_markers(names: &HashSet<OsString>, runtimes: &mut HashSet<Runtime>) {
             ".java-version",
             ".sdkmanrc",
         ],
-    ) {
-        runtimes.insert(Runtime::Java);
-    }
-
-    if has_any(names, &["build.gradle.kts", "settings.gradle.kts"]) {
-        runtimes.insert(Runtime::Kotlin);
-    }
-
-    if has_any(
-        names,
+    ),
+    (
+        Runtime::Kotlin,
+        &["build.gradle.kts", "settings.gradle.kts"],
+    ),
+    (
+        Runtime::Scala,
         &[
             "build.sbt",
             "build.properties",
@@ -192,56 +186,38 @@ fn detect_markers(names: &HashSet<OsString>, runtimes: &mut HashSet<Runtime>) {
             ".sbtenv",
             ".metals",
         ],
-    ) {
-        runtimes.insert(Runtime::Scala);
-    }
-
-    if has_any(
-        names,
+    ),
+    (
+        Runtime::Rust,
         &[
             "Cargo.toml",
             "Cargo.lock",
             "rust-toolchain",
             "rust-toolchain.toml",
         ],
-    ) {
-        runtimes.insert(Runtime::Rust);
-    }
-
-    if has_any(names, &["go.mod", "go.work"]) {
-        runtimes.insert(Runtime::Go);
-    }
-
-    if has_any(names, &["Gemfile", "Rakefile", ".ruby-version"]) {
-        runtimes.insert(Runtime::Ruby);
-    }
-
-    if has_any(names, &["composer.json", "composer.lock", ".php-version"]) {
-        runtimes.insert(Runtime::Php);
-    }
-
-    if has_any(
-        names,
+    ),
+    (Runtime::Go, &["go.mod", "go.work"]),
+    (Runtime::Ruby, &["Gemfile", "Rakefile", ".ruby-version"]),
+    (
+        Runtime::Php,
+        &["composer.json", "composer.lock", ".php-version"],
+    ),
+    (
+        Runtime::Dotnet,
         &[
             "global.json",
             "Directory.Build.props",
             "Directory.Build.targets",
             "Directory.Packages.props",
         ],
-    ) {
-        runtimes.insert(Runtime::Dotnet);
-    }
-
-    if has_any(names, &["Package.swift"]) {
-        runtimes.insert(Runtime::Swift);
-    }
-
-    if has_any(names, &[".luarc.json", ".luacheckrc", ".lua-version"]) {
-        runtimes.insert(Runtime::Lua);
-    }
-
-    if has_any(
-        names,
+    ),
+    (Runtime::Swift, &["Package.swift"]),
+    (
+        Runtime::Lua,
+        &[".luarc.json", ".luacheckrc", ".lua-version"],
+    ),
+    (
+        Runtime::R,
         &[
             "DESCRIPTION",
             "NAMESPACE",
@@ -249,35 +225,23 @@ fn detect_markers(names: &HashSet<OsString>, runtimes: &mut HashSet<Runtime>) {
             "packrat.lock",
             ".Rprofile",
         ],
-    ) {
-        runtimes.insert(Runtime::R);
-    }
-
-    if has_any(
-        names,
+    ),
+    (
+        Runtime::Julia,
         &["Project.toml", "Manifest.toml", "JuliaProject.toml"],
-    ) {
-        runtimes.insert(Runtime::Julia);
-    }
-
-    if has_any(names, &["mix.exs", "mix.lock", ".elixir-version"]) {
-        runtimes.insert(Runtime::Elixir);
-    }
-
-    if has_any(
-        names,
+    ),
+    (Runtime::Elixir, &["mix.exs", "mix.lock", ".elixir-version"]),
+    (
+        Runtime::Dart,
         &[
             "pubspec.yaml",
             "pubspec.lock",
             "analysis_options.yaml",
             ".dart_tool",
         ],
-    ) {
-        runtimes.insert(Runtime::Dart);
-    }
-
-    if has_any(
-        names,
+    ),
+    (
+        Runtime::Haskell,
         &[
             "cabal.project",
             "stack.yaml",
@@ -285,12 +249,15 @@ fn detect_markers(names: &HashSet<OsString>, runtimes: &mut HashSet<Runtime>) {
             "package.yaml",
             "Setup.hs",
         ],
-    ) {
-        runtimes.insert(Runtime::Haskell);
-    }
+    ),
+    (Runtime::Zig, &["build.zig", "build.zig.zon", "zig-out"]),
+];
 
-    if has_any(names, &["build.zig", "build.zig.zon", "zig-out"]) {
-        runtimes.insert(Runtime::Zig);
+fn detect_markers(names: &HashSet<OsString>, runtimes: &mut HashSet<Runtime>) {
+    for (runtime, markers) in RUNTIME_MARKERS {
+        if has_any(names, markers) {
+            runtimes.insert(*runtime);
+        }
     }
 }
 
