@@ -190,6 +190,15 @@ pub fn init_zsh(instance: &daemon::Instance, selector: Option<&str>) -> io::Resu
         .replace(
             "@ZTHEME_CUSTOM_SEGMENTS@",
             &custom_segment_block(&custom_segments),
+        )
+        .replace("@ZTHEME_REQUEST_VERSION@", protocol::REQUEST_VERSION)
+        .replace(
+            "    @ZTHEME_REQUEST_FIELDS@",
+            &protocol::request_field_lines(),
+        )
+        .replace(
+            "    @ZTHEME_CONTEXT_FIELDS@",
+            &protocol::context_field_lines(),
         ))
 }
 
@@ -536,4 +545,86 @@ fn record_error(error: &io::Error) -> String {
 
 fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use super::{ZSH_INTEGRATION, init_zsh};
+    use crate::daemon::Instance;
+    use crate::prompt::protocol::{CONTEXT_EXCLUDED, REQUEST_FIELDS, REQUEST_VERSION};
+
+    /// A scratch directory for init-time artifacts, removed on drop.
+    struct Scratch(PathBuf);
+
+    impl Scratch {
+        fn new() -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "ztheme-prompt-protocol-tests-{}",
+                std::process::id()
+            ));
+            std::fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn shell_template_carries_the_request_protocol_placeholders() {
+        for token in [
+            "@ZTHEME_REQUEST_VERSION@",
+            "@ZTHEME_REQUEST_FIELDS@",
+            "@ZTHEME_CONTEXT_FIELDS@",
+        ] {
+            assert!(ZSH_INTEGRATION.contains(token), "missing {token}");
+        }
+    }
+
+    #[test]
+    fn generated_shell_derives_the_request_protocol_from_the_central_definition() {
+        let scratch = Scratch::new();
+        let theme = scratch.0.join("theme.toml");
+        // A runtime-free layout avoids the gitstatusd prerequisite in init_zsh.
+        std::fs::write(
+            &theme,
+            "version = 1\n[layout]\nlines = [[\"directory\"]]\nright = []\nseparator = \" | \"\nblank_line_before = false\n",
+        )
+        .unwrap();
+        let script = init_zsh(
+            &Instance::Development("protocol-test".to_owned()),
+            Some(theme.to_str().unwrap()),
+        )
+        .unwrap();
+
+        let version_line = format!("\"ZTREQ\"$'\\0'\"{REQUEST_VERSION}\"$'\\0'");
+        assert!(script.contains(&version_line), "version not spliced");
+
+        for field in REQUEST_FIELDS {
+            let line = format!("request_line+=\"${{{field}:-}}\"$'\\0'");
+            assert!(script.contains(&line), "missing request field line {line}");
+        }
+        for field in REQUEST_FIELDS
+            .iter()
+            .copied()
+            .filter(|field| !CONTEXT_EXCLUDED.contains(field))
+        {
+            let line = format!("context_key+=\"|${{{field}:-}}\"");
+            assert!(script.contains(&line), "missing context field line {line}");
+        }
+        assert!(script.contains("context_key+=\"|${NVM_BIN:-}|$PATH\""));
+
+        for token in [
+            "@ZTHEME_REQUEST_VERSION@",
+            "@ZTHEME_REQUEST_FIELDS@",
+            "@ZTHEME_CONTEXT_FIELDS@",
+        ] {
+            assert!(!script.contains(token), "placeholder leaked: {token}");
+        }
+    }
 }

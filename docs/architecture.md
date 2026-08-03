@@ -628,6 +628,9 @@ JULIA_LOAD_PATH<NUL>JULIA_DEPOT_PATH<NUL>R_ARCH<NUL>
 
 `ZTREQ` and version `3` guard against garbage input. The environment subset is
 exactly what runtime detection, command resolution, and the Git query read.
+The field order and count are defined once in `src/prompt/protocol.rs`
+(`REQUEST_FIELDS`); the daemon parser and the generated shell integration
+both derive from that list, so the two sides cannot drift apart.
 The client does not apply it to its own process: the values are threaded
 through the request explicitly and applied only to the child commands that
 need them (set when present, removed when empty), because the client outlives

@@ -362,22 +362,8 @@ _ztheme_start_worker() {
     # zsh strings can hold NUL bytes, and backslash continuations would join
     # separate arguments, so the NUL-delimited request is assembled with
     # incremental appends, one assignment per line.
-    local request_line="ZTREQ"$'\0'"3"$'\0'"$generation"$'\0'"$PWD"$'\0'
-    request_line+="${PATH:-}"$'\0'"${HOME:-}"$'\0'
-    request_line+="${GIT_DIR:-}"$'\0'"${GIT_WORK_TREE:-}"$'\0'
-    request_line+="${GIT_CEILING_DIRECTORIES:-}"$'\0'
-    request_line+="${VIRTUAL_ENV:-}"$'\0'"${CONDA_PREFIX:-}"$'\0'
-    request_line+="${CONDA_DEFAULT_ENV:-}"$'\0'
-    request_line+="${PERLBREW_PERL:-}"$'\0'"${PLENV_VERSION:-}"$'\0'
-    request_line+="${PYENV_VERSION:-}"$'\0'"${PYENV_DIR:-}"$'\0'
-    request_line+="${RUSTUP_TOOLCHAIN:-}"$'\0'"${RUSTUP_HOME:-}"$'\0'
-    request_line+="${RBENV_DIR:-}"$'\0'"${RBENV_VERSION:-}"$'\0'
-    request_line+="${NODENV_VERSION:-}"$'\0'"${NODENV_DIR:-}"$'\0'
-    request_line+="${PLENV_DIR:-}"$'\0'"${RUBY_VERSION:-}"$'\0'
-    request_line+="${JAVA_HOME:-}"$'\0'"${GOTOOLCHAIN:-}"$'\0'"${DOTNET_ROOT:-}"$'\0'
-    request_line+="${JULIAUP_CHANNEL:-}"$'\0'"${JULIAUP_DEPOT_PATH:-}"$'\0'
-    request_line+="${JULIA_PROJECT:-}"$'\0'"${JULIA_LOAD_PATH:-}"$'\0'
-    request_line+="${JULIA_DEPOT_PATH:-}"$'\0'"${R_ARCH:-}"$'\0'
+    local request_line="ZTREQ"$'\0'"@ZTHEME_REQUEST_VERSION@"$'\0'"$generation"$'\0'"$PWD"$'\0'
+    @ZTHEME_REQUEST_FIELDS@
     if ! print -rn -- "$request_line" >&"$ZTHEME_REQ_FD" 2>/dev/null; then
         _ztheme_stop_client
         return 1
@@ -457,17 +443,8 @@ _ztheme_precmd() {
     _ztheme_compute_sync_segments "$last_status"
 
     local context_key
-    context_key="$PWD|${GIT_DIR:-}|${GIT_WORK_TREE:-}"
-    context_key+="|${VIRTUAL_ENV:-}|${CONDA_PREFIX:-}"
-    context_key+="|${CONDA_DEFAULT_ENV:-}|${PERLBREW_PERL:-}|${PLENV_VERSION:-}"
-    context_key+="|${PYENV_VERSION:-}|${PYENV_DIR:-}"
-    context_key+="|${RUSTUP_TOOLCHAIN:-}|${RUSTUP_HOME:-}"
-    context_key+="|${RBENV_DIR:-}|${RBENV_VERSION:-}"
-    context_key+="|${NODENV_VERSION:-}|${NODENV_DIR:-}|${PLENV_DIR:-}"
-    context_key+="|${RUBY_VERSION:-}|${JAVA_HOME:-}|${GOTOOLCHAIN:-}|${DOTNET_ROOT:-}"
-    context_key+="|${JULIAUP_CHANNEL:-}|${JULIAUP_DEPOT_PATH:-}"
-    context_key+="|${JULIA_PROJECT:-}|${JULIA_LOAD_PATH:-}"
-    context_key+="|${JULIA_DEPOT_PATH:-}|${R_ARCH:-}"
+    context_key="$PWD"
+    @ZTHEME_CONTEXT_FIELDS@
     context_key+="|${NVM_BIN:-}|$PATH"
 
     if [[ "$context_key" != "$ZTHEME_CONTEXT_KEY" ]]; then

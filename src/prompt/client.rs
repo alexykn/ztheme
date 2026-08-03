@@ -12,11 +12,9 @@ use tokio::time::{Instant, MissedTickBehavior, interval_at};
 
 use crate::daemon;
 use crate::environment::PromptEnvironment;
+use crate::prompt::protocol::{REQUEST_MAGIC, REQUEST_VERSION};
 use crate::prompt::snapshot;
 use crate::theme::AsyncTheme;
-
-const REQUEST_MAGIC: &[u8] = b"ZTREQ";
-const REQUEST_VERSION: &[u8] = b"3";
 
 /// How often the client verifies that the shell that spawned it is still its
 /// parent. EOF on the request pipe is the primary lifetime signal; this
@@ -180,7 +178,7 @@ where
         return Err(invalid_data("client request magic is invalid"));
     }
     let version = read_field(reader)?.ok_or_else(truncated)?;
-    if version != REQUEST_VERSION {
+    if version != REQUEST_VERSION.as_bytes() {
         return Err(invalid_data("client request version is unsupported"));
     }
 
@@ -276,14 +274,15 @@ mod tests {
     use std::io::BufReader;
 
     use super::{REQUEST_MAGIC, REQUEST_VERSION, read_request};
+    use crate::prompt::protocol::REQUEST_FIELDS;
 
-    const ENV_FIELD_COUNT: usize = 29;
+    const ENV_FIELD_COUNT: usize = REQUEST_FIELDS.len();
 
     fn request(cwd: &[u8], fields: &[&[u8]]) -> Vec<u8> {
         assert_eq!(fields.len(), ENV_FIELD_COUNT);
         let mut bytes = REQUEST_MAGIC.to_vec();
         bytes.push(0);
-        bytes.extend_from_slice(REQUEST_VERSION);
+        bytes.extend_from_slice(REQUEST_VERSION.as_bytes());
         bytes.push(0);
         bytes.extend_from_slice(b"42");
         bytes.push(0);

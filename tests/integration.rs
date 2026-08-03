@@ -1755,6 +1755,9 @@ add-zsh-hook -D preexec _ztheme_preexec 2>/dev/null
 # Write the request directly instead of _ztheme_start_worker: that function
 # requires zle -F registration, which is only meaningful in an interactive
 # shell, and the test drives the wire protocol itself.
+# The version literal is a black-box fixture mirroring REQUEST_VERSION in
+# src/prompt/protocol.rs; a bump fails this test loudly (the daemon rejects
+# the old version), so the fixtures are updated deliberately.
 typeset -i request_generation=5
 local request_line="ZTREQ"$'\0'"3"$'\0'"$request_generation"$'\0'"$PWD"$'\0'
 request_line+="${{PATH:-}}"$'\0'"${{HOME:-}}"$'\0'
@@ -3173,6 +3176,9 @@ fn client_exits_after_shell_killed_during_active_request() {
     let socket = wait_for_socket(server.child(), &sandbox.runtime);
 
     // A request whose git query is still in flight when the shell dies.
+    // The request version is a black-box fixture mirroring REQUEST_VERSION in
+    // src/prompt/protocol.rs; a bump fails this test loudly (the daemon
+    // rejects the old version), so it is updated deliberately.
     let preamble = r#"print -rn -- "ZTREQ"$'\0'"3"$'\0'"1"$'\0'"$PWD"$'\0'"${PATH:-}"$'\0'"${HOME:-}"$'\0'"${GIT_DIR:-}"$'\0'"${GIT_WORK_TREE:-}"$'\0'"${GIT_CEILING_DIRECTORIES:-}"$'\0'"${VIRTUAL_ENV:-}"$'\0'"${CONDA_PREFIX:-}"$'\0'"${CONDA_DEFAULT_ENV:-}"$'\0'"${PERLBREW_PERL:-}"$'\0'"${PLENV_VERSION:-}"$'\0'"${PYENV_VERSION:-}"$'\0'"${PYENV_DIR:-}"$'\0'"${RUSTUP_TOOLCHAIN:-}"$'\0'"${RUSTUP_HOME:-}"$'\0'"${RBENV_DIR:-}"$'\0'"${RBENV_VERSION:-}"$'\0'"${NODENV_VERSION:-}"$'\0'"${NODENV_DIR:-}"$'\0'"${PLENV_DIR:-}"$'\0'"${RUBY_VERSION:-}"$'\0'"${JAVA_HOME:-}"$'\0'"${GOTOOLCHAIN:-}"$'\0'"${DOTNET_ROOT:-}"$'\0'"${JULIAUP_CHANNEL:-}"$'\0'"${JULIAUP_DEPOT_PATH:-}"$'\0'"${JULIA_PROJECT:-}"$'\0'"${JULIA_LOAD_PATH:-}"$'\0'"${JULIA_DEPOT_PATH:-}"$'\0'"${R_ARCH:-}"$'\0' >&"$ZTHEME_REQ_FD"
 "#;
     let (mut shell, client_pid) = spawn_live_shell(&sandbox, &instance, preamble);
