@@ -134,6 +134,10 @@ send_request() {
     local path=$2
     last_python_fragment=""
     last_rust_fragment=""
+    last_dart_fragment=""
+    last_zig_fragment=""
+    last_julia_fragment=""
+    last_r_fragment=""
     last_response_summary=""
     request_payload "$path" "$generation" >&"${request_fd}"
     local protocol response_generation kind name fragment
@@ -149,6 +153,18 @@ send_request() {
         fi
         if [[ "$kind" == segment && "$name" == rust ]]; then
             last_rust_fragment=$fragment
+        fi
+        if [[ "$kind" == segment && "$name" == dart ]]; then
+            last_dart_fragment=$fragment
+        fi
+        if [[ "$kind" == segment && "$name" == zig ]]; then
+            last_zig_fragment=$fragment
+        fi
+        if [[ "$kind" == segment && "$name" == julia ]]; then
+            last_julia_fragment=$fragment
+        fi
+        if [[ "$kind" == segment && "$name" == r ]]; then
+            last_r_fragment=$fragment
         fi
         if [[ "$kind" == segment || "$kind" == error ]]; then
             last_response_summary+="$kind:$name=$fragment;"
@@ -439,13 +455,14 @@ run_realistic_workload() {
     local realistic_bin=$1
     local pyenv_root=$2
     local replacement=$3
+    local julia_replacement=$4
     local before after started ended request_path idx group i
     local stale_results=0 runtime_opportunities=0
     local selector_pending=0
     local -F 6 elapsed
     local -a samples
 
-    start_scenario four "${realistic_dirs[1]}"
+    start_scenario realistic "${realistic_dirs[1]}"
     generation=1
     before=$(counter_value)
     samples=()
@@ -453,7 +470,7 @@ run_realistic_workload() {
         if (( i == realistic_prompts / 2 + 1 )); then
             stop_client
             shutdown_server_process
-            start_scenario four "${realistic_dirs[1]}"
+            start_scenario realistic "${realistic_dirs[1]}"
             generation=1
         fi
 
@@ -467,6 +484,10 @@ run_realistic_workload() {
         if (( i == 1700 )); then
             print -r -- "3.12" > "${realistic_dirs[40]}/.python-version"
             selector_pending=1
+        fi
+        if (( i == 2405 )); then
+            cp "$julia_replacement" "$realistic_bin/julia"
+            chmod 700 "$realistic_bin/julia"
         fi
 
         if (( selector_pending )); then
@@ -502,6 +523,10 @@ run_realistic_workload() {
         fi
         if (( i == 1700 )) && [[ "$last_python_fragment" != *3.12.0* ]]; then
             print -u2 -- "$label stale result after pyenv selector switch: $last_response_summary"
+            (( ++stale_results ))
+        fi
+        if (( i == 2405 )) && [[ "$last_julia_fragment" != *1.12.0* ]]; then
+            print -u2 -- "$label stale result after julia executable replacement: $last_response_summary"
             (( ++stale_results ))
         fi
         (( ++generation ))
@@ -593,10 +618,18 @@ measure_build() {
     compile_runtime node "v22.0.0" 20
     compile_runtime rustc "rustc 1.80.0" 20
     compile_runtime go "go version go1.23.0 darwin/arm64" 20
+    compile_runtime dart "Dart SDK version: 3.7.2 (stable)" 20
+    compile_runtime zig "0.14.1" 20
+    compile_runtime julia "julia version 1.11.5" 20
+    compile_runtime R "R version 4.5.1 (2025-06-02)" 20
     warm_executable "$fixture/bin/python"
     warm_executable "$fixture/bin/node"
     warm_executable "$fixture/bin/rustc"
     warm_executable "$fixture/bin/go"
+    warm_executable "$fixture/bin/dart"
+    warm_executable "$fixture/bin/zig"
+    warm_executable "$fixture/bin/julia"
+    warm_executable "$fixture/bin/R"
     print -r -- 0 > "$counter_file"
 
     cat > "$config/ztheme/themes/bench.toml" <<'EOF'
@@ -624,6 +657,30 @@ symbol = "node"
 symbol = "rust"
 [segments.go]
 symbol = "go"
+EOF
+    cat > "$config/ztheme/themes/realistic.toml" <<'EOF'
+version = 1
+[layout]
+lines = [["python", "node", "rust", "go", "dart", "zig", "julia", "r"]]
+right = []
+separator = " | "
+blank_line_before = false
+[segments.python]
+symbol = "py"
+[segments.node]
+symbol = "node"
+[segments.rust]
+symbol = "rust"
+[segments.go]
+symbol = "go"
+[segments.dart]
+symbol = "dart"
+[segments.zig]
+symbol = "zig"
+[segments.julia]
+symbol = "julia"
+[segments.r]
+symbol = "r"
 EOF
 
     export HOME="$home"
@@ -836,14 +893,13 @@ GEOF
 
     local realistic_bin="$fixture/realistic-bin"
     mkdir -p "$realistic_bin"
-    for runtime_name in python node rustc go; do
+    for runtime_name in python node rustc go dart zig julia R; do
         cp "$fixture/bin/$runtime_name" "$realistic_bin/$runtime_name"
         chmod 700 "$realistic_bin/$runtime_name"
     done
-    warm_executable "$realistic_bin/python"
-    warm_executable "$realistic_bin/node"
-    warm_executable "$realistic_bin/rustc"
-    warm_executable "$realistic_bin/go"
+    for runtime_name in python node rustc go dart zig julia R; do
+        warm_executable "$realistic_bin/$runtime_name"
+    done
 
     realistic_dirs=()
     realistic_groups=()
@@ -852,7 +908,7 @@ GEOF
         local realistic_directory="$fixture/realistic/project-$i"
         mkdir -p "$realistic_directory"
         realistic_dirs[$i]="$realistic_directory"
-        case $(( i % 4 )) in
+        case $(( i % 8 )) in
             0)
                 : > "$realistic_directory/pyproject.toml"
                 : > "$realistic_directory/package.json"
@@ -874,6 +930,41 @@ GEOF
             3)
                 : > "$realistic_directory/Cargo.toml"
                 realistic_groups[$i]=rust
+                realistic_opportunities[$i]=1
+                ;;
+            4)
+                # Flutter app: Dart is the only detected runtime.
+                print -r -- "name: app" > "$realistic_directory/pubspec.yaml"
+                mkdir -p "$realistic_directory/lib"
+                : > "$realistic_directory/lib/main.dart"
+                : > "$realistic_directory/analysis_options.yaml"
+                realistic_groups[$i]=dart
+                realistic_opportunities[$i]=1
+                ;;
+            5)
+                # Zig project with a source tree.
+                print -r -- "const std = @import(\"std\");" > "$realistic_directory/build.zig"
+                mkdir -p "$realistic_directory/src"
+                : > "$realistic_directory/src/main.zig"
+                realistic_groups[$i]=zig
+                realistic_opportunities[$i]=1
+                ;;
+            6)
+                # Julia package with a project manifest.
+                print -r -- "name = \"Pkg\"" > "$realistic_directory/Project.toml"
+                : > "$realistic_directory/Manifest.toml"
+                mkdir -p "$realistic_directory/src"
+                : > "$realistic_directory/src/Pkg.jl"
+                realistic_groups[$i]=julia
+                realistic_opportunities[$i]=1
+                ;;
+            7)
+                # R package layout.
+                print -r -- "Package: pkg" > "$realistic_directory/DESCRIPTION"
+                : > "$realistic_directory/NAMESPACE"
+                mkdir -p "$realistic_directory/R"
+                : > "$realistic_directory/R/pkg.R"
+                realistic_groups[$i]=r
                 realistic_opportunities[$i]=1
                 ;;
         esac
@@ -904,9 +995,12 @@ EOF
     realistic_opportunities[40]=4
 
     compile_runtime replacement "Python 3.13.0" 0
+    compile_runtime julia-replacement "julia version 1.12.0" 0
     warm_executable "$fixture/bin/replacement"
+    warm_executable "$fixture/bin/julia-replacement"
     print -r -- 0 > "$counter_file"
-    (( skip_realistic )) || run_realistic_workload "$realistic_bin" "$pyenv_root" "$fixture/bin/replacement"
+    (( skip_realistic )) || run_realistic_workload "$realistic_bin" "$pyenv_root" \
+        "$fixture/bin/replacement" "$fixture/bin/julia-replacement"
 }
 
 check_latency_regressions() {

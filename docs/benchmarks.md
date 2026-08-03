@@ -144,21 +144,23 @@ second.
   exactly **1** runtime execution.
 - **Daemon restart**: a daemon restart reuses persisted cache entries — the
   runtime-execution counter is unchanged across the restart (26 → 26).
-- **Realistic workload**: 5000 prompts across 40 project directories (mixed,
-  python, node, rust; a pyenv shim group; PATH noise; a mid-run daemon
-  restart; an executable replacement; a `.python-version` selector switch):
+- **Realistic workload**: 5000 prompts across 40 project directories (mixed
+  monorepos, python, node, rust, plus the later cacheable runtimes dart, zig,
+  julia, and r as single-language projects; a pyenv shim group; PATH noise; a
+  mid-run daemon restart; a python and a julia executable replacement; a
+  `.python-version` selector switch):
 
   | Metric | Value |
   | --- | ---: |
-  | cache hit rate | 99.77% (20 executions / 8753 opportunities) |
-  | p50 latency | 716 µs |
-  | p95 latency | 971 µs |
-  | maximum latency | 33.5 ms |
+  | cache hit rate | 99.64% (25 executions / 6878 opportunities) |
+  | p50 latency | 853 µs |
+  | p95 latency | 1216 µs |
+  | maximum latency | 31.0 ms |
   | stale results | 0 |
 
-  The executable replacement and selector switch both invalidate exactly the
-  affected entry: the immediately following prompt is current, and no stale
-  fragment was observed for the rest of the run.
+  The executable replacements (python and julia) and the selector switch each
+  invalidate exactly the affected entry: the immediately following prompt is
+  current, and no stale fragment was observed for the rest of the run.
 
 ## Synchronous segment path
 
