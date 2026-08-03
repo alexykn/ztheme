@@ -106,22 +106,25 @@ request_payload() {
     local generation=$2
     local request_line="ZTREQ"$'\0'"$wire_version"$'\0'"$generation"$'\0'"$project"$'\0'
     request_line+="$path"$'\0'"$home"$'\0'
-    if (( wire_version == 1 )); then
-        request_line+=$'\0'$'\0'$'\0'
-        request_line+=$'\0'$'\0'"$conda_default_env"$'\0'
-        request_line+=$'\0'$'\0'
-        request_line+="$rustup_toolchain"$'\0'
-        request_line+=$'\0'$'\0'
-    else
-        request_line+=$'\0'$'\0'$'\0'
-        request_line+=$'\0'$'\0'"$conda_default_env"$'\0'
-        request_line+=$'\0'$'\0'
-        request_line+=$'\0'$'\0'
-        request_line+="$rustup_toolchain"$'\0'$'\0'
-        request_line+=$'\0'$'\0'
-        request_line+=$'\0'$'\0'
-        request_line+=$'\0'$'\0'
-        request_line+=$'\0'"$gotoolchain"$'\0'$'\0'
+    # Protocol v2 fields: GIT_DIR GIT_WORK_TREE GIT_CEILING_DIRECTORIES
+    request_line+=$'\0'$'\0'$'\0'
+    # VIRTUAL_ENV CONDA_PREFIX CONDA_DEFAULT_ENV
+    request_line+=$'\0'$'\0'"$conda_default_env"$'\0'
+    # PERLBREW_PERL PLENV_VERSION PYENV_VERSION PYENV_DIR
+    request_line+=$'\0'$'\0'
+    request_line+=$'\0'$'\0'
+    # RUSTUP_TOOLCHAIN RUSTUP_HOME RBENV_DIR RBENV_VERSION
+    request_line+="$rustup_toolchain"$'\0'$'\0'
+    request_line+=$'\0'$'\0'
+    # NODENV_VERSION NODENV_DIR PLENV_DIR RUBY_VERSION JAVA_HOME
+    request_line+=$'\0'$'\0'
+    request_line+=$'\0'$'\0'
+    # GOTOOLCHAIN DOTNET_ROOT
+    request_line+=$'\0'"$gotoolchain"$'\0'$'\0'
+    if (( wire_version >= 3 )); then
+        # Protocol v3 fields: JULIAUP_CHANNEL JULIAUP_DEPOT_PATH JULIA_PROJECT
+        # JULIA_LOAD_PATH JULIA_DEPOT_PATH R_ARCH
+        request_line+=$'\0'$'\0'$'\0'$'\0'$'\0'$'\0'
     fi
     print -rn -- "$request_line"
 }
@@ -933,10 +936,10 @@ check_latency_regressions() {
 }
 
 if (( skip_baseline )); then
-    measure_build candidate 2 "$candidate_binary"
+    measure_build candidate 3 "$candidate_binary"
 else
-    measure_build baseline 1 "$baseline_binary"
-    measure_build candidate 2 "$candidate_binary"
+    measure_build baseline 2 "$baseline_binary"
+    measure_build candidate 3 "$candidate_binary"
     check_latency_regressions
 
     if (( realistic_execution_counts[candidate] >= realistic_execution_counts[baseline] )); then
