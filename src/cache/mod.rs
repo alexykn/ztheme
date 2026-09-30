@@ -4,9 +4,11 @@ use std::collections::HashMap;
 use std::env;
 use std::io;
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use tokio::sync::futures::OwnedNotified;
 use tokio::sync::{Mutex, Notify};
 use tokio::time::{Instant, sleep};
 
@@ -163,12 +165,12 @@ impl RuntimeCache {
         Ok(())
     }
 
-    pub(crate) async fn acquire(&self, key: CacheKey) -> Acquire {
+    pub(crate) async fn acquire(&self, key: CacheKey) -> io::Result<Acquire> {
         enum Decision {
             Hit(Arc<[u8]>, bool),
             Owner(u64),
             Wait {
-                notify: Arc<Notify>,
+                notified: Pin<Box<OwnedNotified>>,
                 deadline: Instant,
             },
         }
@@ -182,20 +184,23 @@ impl RuntimeCache {
                     Decision::Hit(value, persist_use)
                 } else {
                     let now = Instant::now();
-                    if state
-                        .in_flight
-                        .get(&key)
-                        .is_some_and(|lease| lease.expires_at <= now)
-                        && let Some(lease) = state.in_flight.remove(&key)
-                    {
-                        lease.notify.notify_waiters();
-                    }
+                    reclaim_expired_leases(&mut state.in_flight, now);
                     if let Some(lease) = state.in_flight.get(&key) {
+                        // Register under the state lock so completion or
+                        // reclamation cannot notify before the waiter exists.
+                        let mut notified = Box::pin(Arc::clone(&lease.notify).notified_owned());
+                        notified.as_mut().enable();
                         Decision::Wait {
-                            notify: Arc::clone(&lease.notify),
+                            notified,
                             deadline: lease.expires_at,
                         }
                     } else {
+                        if state.in_flight.len() >= MAX_ENTRIES {
+                            return Err(io::Error::new(
+                                io::ErrorKind::WouldBlock,
+                                "runtime cache owner lease capacity exhausted",
+                            ));
+                        }
                         state.next_token = state.next_token.wrapping_add(1);
                         let token = state.next_token;
                         state.in_flight.insert(
@@ -216,11 +221,10 @@ impl RuntimeCache {
                     if persist_use {
                         self.changed.notify_one();
                     }
-                    return Acquire::Hit(value);
+                    return Ok(Acquire::Hit(value));
                 }
-                Decision::Owner(token) => return Acquire::Owner(token),
-                Decision::Wait { notify, deadline } => {
-                    let notified = notify.notified();
+                Decision::Owner(token) => return Ok(Acquire::Owner(token)),
+                Decision::Wait { notified, deadline } => {
                     let _ = tokio::time::timeout_at(deadline, notified).await;
                 }
             }
@@ -240,6 +244,12 @@ impl RuntimeCache {
                 return Ok(false);
             };
             if lease.token != token {
+                return Ok(false);
+            }
+            if lease.expires_at <= Instant::now() {
+                let notify = Arc::clone(&lease.notify);
+                state.in_flight.remove(&key);
+                notify.notify_waiters();
                 return Ok(false);
             }
             let notify = Arc::clone(&lease.notify);
@@ -357,6 +367,16 @@ impl RuntimeCache {
     }
 }
 
+fn reclaim_expired_leases(leases: &mut HashMap<CacheKey, Lease>, now: Instant) {
+    leases.retain(|_, lease| {
+        if lease.expires_at > now {
+            return true;
+        }
+        lease.notify.notify_waiters();
+        false
+    });
+}
+
 fn touch_entry(state: &mut State, key: CacheKey, now: u64) -> Option<(Arc<[u8]>, bool)> {
     state.lru_order = state.lru_order.saturating_add(1);
     let lru_order = state.lru_order;
@@ -432,15 +452,20 @@ fn now_epoch_seconds() -> u64 {
 mod tests {
     use std::collections::HashMap;
     use std::fs;
+    use std::future::Future as _;
+    use std::io;
     use std::os::unix::fs::PermissionsExt as _;
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::task::Poll;
     use std::time::Duration;
 
     use tokio::sync::Notify;
 
-    use super::{Acquire, CacheKey, Entry, MAX_VALUE_BYTES, RuntimeCache, State, disk, trim_lru};
+    use super::{
+        Acquire, CacheKey, Entry, MAX_ENTRIES, MAX_VALUE_BYTES, RuntimeCache, State, disk, trim_lru,
+    };
 
     static SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
@@ -619,7 +644,7 @@ mod tests {
     async fn concurrent_acquires_have_one_owner() {
         let cache = Arc::new(RuntimeCache::new());
         let key = CacheKey::from_value(9);
-        let owner = cache.acquire(key).await;
+        let owner = cache.acquire(key).await.unwrap();
         let token = match owner {
             Acquire::Owner(token) => token,
             Acquire::Hit(_) => panic!("unexpected cache hit"),
@@ -637,7 +662,7 @@ mod tests {
                 .unwrap()
         );
         for waiter in waiters {
-            assert!(matches!(waiter.await.unwrap(), Acquire::Hit(_)));
+            assert!(matches!(waiter.await.unwrap().unwrap(), Acquire::Hit(_)));
         }
     }
 
@@ -645,12 +670,12 @@ mod tests {
     async fn expired_owner_cannot_overwrite_a_replacement() {
         let cache = Arc::new(RuntimeCache::new());
         let key = CacheKey::from_value(10);
-        let first = match cache.acquire(key).await {
+        let first = match cache.acquire(key).await.unwrap() {
             Acquire::Owner(token) => token,
             Acquire::Hit(_) => panic!("unexpected cache hit"),
         };
         tokio::time::sleep(Duration::from_millis(425)).await;
-        let second = match cache.acquire(key).await {
+        let second = match cache.acquire(key).await.unwrap() {
             Acquire::Owner(token) => token,
             Acquire::Hit(_) => panic!("unexpected cache hit"),
         };
@@ -671,21 +696,200 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn expired_owner_can_put_when_lease_was_not_reclaimed() {
-        let cache = RuntimeCache::new();
+    async fn expired_owner_cannot_put_even_before_reclamation_and_wakes_waiters() {
+        let cache = RuntimeCache::new_with_path(None);
         let key = CacheKey::from_value(11);
-        let token = match cache.acquire(key).await {
+        let token = match cache.acquire(key).await.unwrap() {
             Acquire::Owner(token) => token,
             Acquire::Hit(_) => panic!("unexpected cache hit"),
         };
-        tokio::time::sleep(Duration::from_millis(425)).await;
+        let mut waiter = Box::pin(cache.acquire(key));
+        assert!(
+            std::future::poll_fn(|cx| Poll::Ready(waiter.as_mut().poll(cx)))
+                .await
+                .is_pending()
+        );
+        cache
+            .state
+            .lock()
+            .await
+            .in_flight
+            .get_mut(&key)
+            .unwrap()
+            .expires_at = tokio::time::Instant::now();
 
         assert!(
-            cache
+            !cache
                 .put_owned(key, token, b"value".to_vec())
                 .await
                 .unwrap()
         );
-        assert_eq!(cache.get(key).await.as_deref(), Some(b"value".as_slice()));
+        assert!(cache.get(key).await.is_none());
+        assert!(cache.state.lock().await.in_flight.is_empty());
+        let replacement = tokio::time::timeout(Duration::from_millis(50), waiter)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(replacement, Acquire::Owner(next) if next != token));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn unique_misses_reclaim_all_expired_leases_and_notify_waiters() {
+        let cache = RuntimeCache::new_with_path(None);
+        let mut owners = Vec::new();
+        for value in 0..u64::try_from(MAX_ENTRIES).unwrap() {
+            let key = CacheKey::from_value(value);
+            let Acquire::Owner(token) = cache.acquire(key).await.unwrap() else {
+                panic!("unexpected cache hit");
+            };
+            owners.push((key, token));
+        }
+        let notifications = {
+            let mut state = cache.state.lock().await;
+            assert_eq!(state.in_flight.len(), MAX_ENTRIES);
+            state
+                .in_flight
+                .values_mut()
+                .map(|lease| {
+                    let mut notified = Box::pin(Arc::clone(&lease.notify).notified_owned());
+                    notified.as_mut().enable();
+                    lease.expires_at = tokio::time::Instant::now();
+                    notified
+                })
+                .collect::<Vec<_>>()
+        };
+
+        let unrelated = CacheKey::from_value(u64::try_from(MAX_ENTRIES).unwrap());
+        assert!(matches!(
+            cache.acquire(unrelated).await.unwrap(),
+            Acquire::Owner(_)
+        ));
+        assert_eq!(cache.state.lock().await.in_flight.len(), 1);
+        for notified in notifications {
+            tokio::time::timeout(Duration::ZERO, notified)
+                .await
+                .unwrap();
+        }
+        for (key, token) in owners {
+            assert!(!cache.put_owned(key, token, b"late".to_vec()).await.unwrap());
+            assert!(!cache.release_owned(key, token).await);
+            assert!(cache.get(key).await.is_none());
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn lease_capacity_failure_preserves_hits_and_existing_waiters_and_recovers() {
+        let cache = RuntimeCache::new_with_path(None);
+        let mut owners = Vec::new();
+        for value in 0..u64::try_from(MAX_ENTRIES).unwrap() {
+            let key = CacheKey::from_value(value);
+            let Acquire::Owner(token) = cache.acquire(key).await.unwrap() else {
+                panic!("unexpected cache hit");
+            };
+            owners.push((key, token));
+        }
+        let missing = CacheKey::from_value(1000);
+        let error = cache.acquire(missing).await.err().unwrap();
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+        assert!(error.to_string().contains("lease capacity exhausted"));
+        assert_eq!(cache.state.lock().await.in_flight.len(), MAX_ENTRIES);
+
+        let warm = CacheKey::from_value(1001);
+        cache.put(warm, b"warm".to_vec()).await.unwrap();
+        assert!(
+            matches!(cache.acquire(warm).await.unwrap(), Acquire::Hit(value) if &*value == b"warm")
+        );
+
+        let (key, token) = owners[0];
+        let mut waiter = Box::pin(cache.acquire(key));
+        assert!(
+            std::future::poll_fn(|cx| Poll::Ready(waiter.as_mut().poll(cx)))
+                .await
+                .is_pending()
+        );
+        assert!(
+            cache
+                .put_owned(key, token, b"fresh".to_vec())
+                .await
+                .unwrap()
+        );
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_millis(50), waiter).await.unwrap().unwrap(),
+            Acquire::Hit(value) if &*value == b"fresh"
+        ));
+        assert!(matches!(
+            cache.acquire(missing).await.unwrap(),
+            Acquire::Owner(_)
+        ));
+        assert_eq!(cache.state.lock().await.in_flight.len(), MAX_ENTRIES);
+
+        let (key, token) = owners[1];
+        assert!(cache.release_owned(key, token).await);
+        assert!(matches!(cache.acquire(key).await.unwrap(), Acquire::Owner(next) if next != token));
+        assert_eq!(cache.state.lock().await.in_flight.len(), MAX_ENTRIES);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn warm_hits_leave_expired_lease_reclamation_to_misses() {
+        let cache = RuntimeCache::new_with_path(None);
+        let abandoned = CacheKey::from_value(1);
+        assert!(matches!(
+            cache.acquire(abandoned).await.unwrap(),
+            Acquire::Owner(_)
+        ));
+        cache
+            .state
+            .lock()
+            .await
+            .in_flight
+            .get_mut(&abandoned)
+            .unwrap()
+            .expires_at = tokio::time::Instant::now();
+        let warm = CacheKey::from_value(2);
+        cache.put(warm, b"warm".to_vec()).await.unwrap();
+
+        assert!(matches!(
+            cache.acquire(warm).await.unwrap(),
+            Acquire::Hit(_)
+        ));
+        assert_eq!(cache.state.lock().await.in_flight.len(), 1);
+        assert!(matches!(
+            cache.acquire(CacheKey::from_value(3)).await.unwrap(),
+            Acquire::Owner(_)
+        ));
+        assert!(!cache.state.lock().await.in_flight.contains_key(&abandoned));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn release_and_clear_wake_waiters_without_reviving_old_owners() {
+        let cache = RuntimeCache::new_with_path(None);
+        let key = CacheKey::from_value(1);
+        for clear in [false, true] {
+            let Acquire::Owner(token) = cache.acquire(key).await.unwrap() else {
+                panic!("unexpected cache hit");
+            };
+            let mut waiter = Box::pin(cache.acquire(key));
+            assert!(
+                std::future::poll_fn(|cx| Poll::Ready(waiter.as_mut().poll(cx)))
+                    .await
+                    .is_pending()
+            );
+            if clear {
+                cache.clear().await.unwrap();
+            } else {
+                assert!(cache.release_owned(key, token).await);
+            }
+            let Acquire::Owner(next) = tokio::time::timeout(Duration::from_millis(50), waiter)
+                .await
+                .unwrap()
+                .unwrap()
+            else {
+                panic!("unexpected cache hit");
+            };
+            assert_ne!(token, next);
+            assert!(!cache.put_owned(key, token, b"late".to_vec()).await.unwrap());
+            assert!(!cache.release_owned(key, token).await);
+            assert!(cache.release_owned(key, next).await);
+        }
     }
 }

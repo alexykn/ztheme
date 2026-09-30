@@ -8,9 +8,8 @@ use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::io::AsyncReadExt;
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::{Mutex, Notify};
+use tokio::sync::{Mutex, MutexGuard, Notify, Semaphore};
 use tokio::task::JoinSet;
 use tokio::time::timeout;
 
@@ -22,6 +21,10 @@ use crate::utils::HashBuilder;
 
 const IDLE_TIMEOUT: Duration = Duration::from_hours(1);
 const GITSTATUS_TIMEOUT: Duration = Duration::from_secs(30);
+const CONNECTION_LIMIT: usize = 64;
+const FRAME_TIMEOUT: Duration = Duration::from_millis(500);
+const RESPONSE_TIMEOUT: Duration = Duration::from_millis(500);
+const HALF_CLOSED_POLL: Duration = Duration::from_millis(10);
 const START_ATTEMPTS: usize = 10;
 const START_DELAY: Duration = Duration::from_millis(20);
 const REPLACEMENT_ATTEMPTS: usize = 20;
@@ -364,6 +367,7 @@ async fn serve_socket(socket: PathBuf, cache: RuntimeCache) -> io::Result<()> {
     cache.clone().load().await;
     let flush_task = tokio::spawn(Arc::clone(&cache).flush_loop());
     let mut clients = JoinSet::new();
+    let admission = Arc::new(Semaphore::new(CONNECTION_LIMIT));
 
     loop {
         while clients.try_join_next().is_some() {}
@@ -376,12 +380,7 @@ async fn serve_socket(socket: PathBuf, cache: RuntimeCache) -> io::Result<()> {
             break;
         };
         let (stream, _) = accepted?;
-        let state = Arc::clone(&shared);
-        clients.spawn(async move {
-            if let Err(error) = handle_client(stream, state).await {
-                eprintln!("ztheme: daemon client failed: {error}");
-            }
-        });
+        admit_client(stream, Arc::clone(&shared), &admission, &mut clients);
     }
 
     flush_task.abort();
@@ -390,67 +389,83 @@ async fn serve_socket(socket: PathBuf, cache: RuntimeCache) -> io::Result<()> {
     shared.cache.flush_latest().await.map(|_| ())
 }
 
+fn admit_client(
+    stream: UnixStream,
+    shared: Arc<Shared>,
+    admission: &Arc<Semaphore>,
+    clients: &mut JoinSet<()>,
+) {
+    // Admission is synchronous: excess streams are dropped without a
+    // queued permit waiter or another retained task.
+    let Ok(permit) = Arc::clone(admission).try_acquire_owned() else {
+        return;
+    };
+    clients.spawn(async move {
+        let _permit = permit;
+        if let Err(error) = handle_client(stream, shared).await {
+            eprintln!("ztheme: daemon client failed: {error}");
+        }
+    });
+}
+
 async fn handle_client(mut stream: UnixStream, shared: Arc<Shared>) -> io::Result<()> {
-    match protocol::read_header(&mut stream).await? {
-        protocol::RequestHeader::DaemonOutdated => {
-            protocol::write_daemon_outdated(&mut stream).await?;
-            shared.shutdown.notify_one();
-            Ok(())
-        }
-        protocol::RequestHeader::ClientOutdated => {
-            protocol::write_client_outdated(&mut stream).await
-        }
-        protocol::RequestHeader::Operation(protocol::RUNTIME_CACHE_ACQUIRE) => {
-            let key = protocol::read_key(&mut stream).await?;
-            match shared.cache.acquire(key).await {
-                Acquire::Hit(value) => protocol::write_cache_hit(&mut stream, &value).await,
-                Acquire::Owner(token) => protocol::write_cache_owner(&mut stream, token).await,
-            }
-        }
-        protocol::RequestHeader::Operation(protocol::RUNTIME_CACHE_PUT_OWNED) => {
-            let key = protocol::read_key(&mut stream).await?;
-            let token = stream.read_u64().await?;
-            let value = protocol::read_value(&mut stream).await?;
-            if shared.cache.put_owned(key, token, value).await? {
-                protocol::write_ok(&mut stream).await
-            } else {
-                protocol::write_rejected(&mut stream).await
-            }
-        }
-        protocol::RequestHeader::Operation(protocol::RUNTIME_CACHE_RELEASE) => {
-            let key = protocol::read_key(&mut stream).await?;
-            let token = stream.read_u64().await?;
-            if shared.cache.release_owned(key, token).await {
-                protocol::write_ok(&mut stream).await
-            } else {
-                protocol::write_rejected(&mut stream).await
-            }
-        }
-        protocol::RequestHeader::Operation(protocol::RUNTIME_CACHE_REMOVE) => {
-            let key = protocol::read_key(&mut stream).await?;
-            shared.cache.remove(key).await?;
-            protocol::write_ok(&mut stream).await
-        }
-        protocol::RequestHeader::Operation(protocol::RESET) => {
-            shared.cache.clear().await?;
-            // Restart gitstatusd only when it was already started; resetting
-            // an unused Git capability must not spawn a process for it.
-            let mut client = shared.gitstatus.lock().await;
-            if let Some(client) = client.as_mut() {
-                client.restart()?;
-            }
-            protocol::write_ok(&mut stream).await
-        }
-        protocol::RequestHeader::Operation(protocol::GIT_STATUS) => {
-            let query = protocol::read_query(&mut stream).await?;
-            let result = git_query(&shared, &query).await;
-            protocol::write_git_result(&mut stream, result).await
-        }
-        protocol::RequestHeader::Operation(_) => Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "unknown daemon operation",
-        )),
+    let request = timeout(FRAME_TIMEOUT, protocol::read_request(&mut stream))
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "daemon request frame timed out"))??;
+    // Cache acquire keeps its 400 ms waiter budget; Git owns its separate
+    // 30 second protocol deadline. Neither is part of the framing deadline.
+    let response = dispatch(request, &shared, &stream).await?;
+    let shutdown = matches!(response, protocol::Response::DaemonOutdated);
+    timeout(
+        RESPONSE_TIMEOUT,
+        protocol::write_response(&mut stream, response),
+    )
+    .await
+    .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "daemon response timed out"))??;
+    if shutdown {
+        shared.shutdown.notify_one();
     }
+    Ok(())
+}
+
+async fn dispatch(
+    request: protocol::Request,
+    shared: &Shared,
+    stream: &UnixStream,
+) -> io::Result<protocol::Response> {
+    use protocol::{Request, Response};
+
+    let response = match request {
+        Request::DaemonOutdated => Response::DaemonOutdated,
+        Request::ClientOutdated => Response::ClientOutdated,
+        Request::CacheAcquire(key) => Response::CacheAcquire(shared.cache.acquire(key).await?),
+        Request::CachePutOwned(key, token, value) => {
+            Response::Mutation(shared.cache.put_owned(key, token, value).await?)
+        }
+        Request::CacheRelease(key, token) => {
+            Response::Mutation(shared.cache.release_owned(key, token).await)
+        }
+        Request::CacheRemove(key) => {
+            shared.cache.remove(key).await?;
+            Response::Complete
+        }
+        Request::Reset => {
+            reset_state(shared).await?;
+            Response::Complete
+        }
+        Request::GitStatus(query) => Response::GitStatus(git_query(shared, &query, stream).await),
+    };
+    Ok(response)
+}
+
+async fn reset_state(shared: &Shared) -> io::Result<()> {
+    shared.cache.clear().await?;
+    // Reset an already started capability, but never start an unused one.
+    let mut client = shared.gitstatus.lock().await;
+    if let Some(client) = client.as_mut() {
+        client.restart()?;
+    }
+    Ok(())
 }
 
 /// Runs one Git query against the lazily started `gitstatusd` client. The
@@ -461,14 +476,78 @@ async fn handle_client(mut stream: UnixStream, shared: Arc<Shared>) -> io::Resul
 async fn git_query(
     shared: &Shared,
     query: &gitstatus::Query,
+    stream: &UnixStream,
 ) -> io::Result<Option<gitstatus::Snapshot>> {
-    let mut client = shared.gitstatus.lock().await;
-    if client.is_none() {
-        *client = Some(gitstatus::Client::start()?);
+    let mut client = acquire_git_owner(shared, stream).await?;
+    let client = match *client {
+        Some(ref mut client) => client,
+        None => client.insert(gitstatus::Client::start()?),
+    };
+    // After taking ownership, finish/drain the query even if the peer leaves.
+    // Cancelling here would abandon a reply on the shared gitstatusd pipe.
+    run_git_query(client, query).await
+}
+
+async fn acquire_git_owner<'a>(
+    shared: &'a Shared,
+    stream: &UnixStream,
+) -> io::Result<MutexGuard<'a, Option<gitstatus::Client>>> {
+    let client = tokio::select! {
+        biased;
+        error = disconnected(stream) => return Err(error),
+        client = shared.gitstatus.lock() => client,
+    };
+    // Close the race between the disconnect watcher and an available mutex.
+    // No gitstatusd request has started, so releasing this guard is safe.
+    probe_response_peer(stream).await?;
+    Ok(client)
+}
+
+/// A connection has exactly one request. Extra input is invalid. Read EOF
+/// alone may be a write-half-close by a client still awaiting its response.
+async fn disconnected(stream: &UnixStream) -> io::Error {
+    loop {
+        if let Err(error) = stream.readable().await {
+            return error;
+        }
+        match stream.try_read(&mut [0]) {
+            Ok(0) => {
+                if let Err(error) = probe_response_peer(stream).await {
+                    return error;
+                }
+                // EOF stays readable forever. Poll half-closed peers without
+                // spinning, so a later full close can still cancel the queue.
+                tokio::time::sleep(HALF_CLOSED_POLL).await;
+            }
+            Ok(_) => {
+                return io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "unexpected data after daemon request",
+                );
+            }
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+            Err(error) => return error,
+        }
     }
-    let client = client
-        .as_mut()
-        .ok_or_else(|| io::Error::other("gitstatusd client is unavailable"))?;
+}
+
+/// A zero-length Unix socket write detects a closed response peer without
+/// sending protocol bytes, including after its request side was half-closed.
+async fn probe_response_peer(stream: &UnixStream) -> io::Result<()> {
+    loop {
+        stream.writable().await?;
+        match stream.try_write(&[]) {
+            Ok(_) => return Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+async fn run_git_query(
+    client: &mut gitstatus::Client,
+    query: &gitstatus::Query,
+) -> io::Result<Option<gitstatus::Snapshot>> {
     if let Ok(result) = timeout(GITSTATUS_TIMEOUT, client.query(query)).await {
         return result;
     }
@@ -601,6 +680,249 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
         }
+    }
+
+    fn shared() -> std::sync::Arc<super::Shared> {
+        std::sync::Arc::new(super::Shared {
+            cache: std::sync::Arc::new(crate::cache::RuntimeCache::new_with_path(None)),
+            shutdown: tokio::sync::Notify::new(),
+            gitstatus: tokio::sync::Mutex::new(None),
+        })
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn idle_and_partial_frames_expire_without_state_operations() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        use tokio::net::UnixStream;
+        use tokio::task::JoinSet;
+
+        let mut cases = JoinSet::new();
+        let state = shared();
+        let key = crate::cache::CacheKey::from_value(42);
+        let mut put = b"ZT\x00\x02\x02".to_vec();
+        put.extend_from_slice(&key.bytes());
+        put.extend_from_slice(&0_u64.to_be_bytes());
+        put.extend_from_slice(&10_u32.to_be_bytes());
+        put.push(b'x');
+        for frame in [
+            Vec::new(),
+            b"Z".to_vec(),
+            b"ZT\x00\x02\x01x".to_vec(),
+            put,
+            b"ZT\x00\x02\x05\x00\x00\x00\x00\x04x".to_vec(),
+        ] {
+            let state = std::sync::Arc::clone(&state);
+            cases.spawn(async move {
+                let (mut client, server) = UnixStream::pair().unwrap();
+                client.write_all(&frame).await.unwrap();
+                let error = super::handle_client(server, state).await.unwrap_err();
+                assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+                assert_eq!(error.to_string(), "daemon request frame timed out");
+                assert_eq!(
+                    client.read_u8().await.unwrap_err().kind(),
+                    std::io::ErrorKind::UnexpectedEof
+                );
+            });
+        }
+        while let Some(result) = cases.join_next().await {
+            result.unwrap();
+        }
+        assert!(matches!(
+            state.cache.acquire(key).await.unwrap(),
+            crate::cache::Acquire::Owner(_)
+        ));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn admission_rejects_excess_tasks_and_recovers_after_frame_cleanup() {
+        use std::sync::Arc;
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        use tokio::net::UnixStream;
+        use tokio::sync::Semaphore;
+        use tokio::task::JoinSet;
+
+        let admission = Arc::new(Semaphore::new(super::CONNECTION_LIMIT));
+        let state = shared();
+        let mut clients = JoinSet::new();
+        let mut peers = Vec::new();
+        for _ in 0..super::CONNECTION_LIMIT {
+            let (client, server) = UnixStream::pair().unwrap();
+            super::admit_client(server, Arc::clone(&state), &admission, &mut clients);
+            peers.push(client);
+        }
+        assert_eq!(clients.len(), super::CONNECTION_LIMIT);
+        assert_eq!(admission.available_permits(), 0);
+        let (mut excess, server) = UnixStream::pair().unwrap();
+        super::admit_client(server, Arc::clone(&state), &admission, &mut clients);
+        assert_eq!(clients.len(), super::CONNECTION_LIMIT);
+        assert_eq!(
+            excess.read_u8().await.unwrap_err().kind(),
+            std::io::ErrorKind::UnexpectedEof
+        );
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while let Some(result) = clients.join_next().await {
+                result.unwrap();
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(admission.available_permits(), super::CONNECTION_LIMIT);
+        for mut peer in peers {
+            assert_eq!(
+                peer.read_u8().await.unwrap_err().kind(),
+                std::io::ErrorKind::UnexpectedEof
+            );
+        }
+
+        let (mut client, server) = UnixStream::pair().unwrap();
+        client.write_all(b"ZT\x00\x02\x06").await.unwrap();
+        client
+            .write_all(&crate::cache::CacheKey::from_value(42).bytes())
+            .await
+            .unwrap();
+        super::admit_client(server, state, &admission, &mut clients);
+        assert_eq!(client.read_u8().await.unwrap(), 3);
+        clients.join_next().await.unwrap().unwrap();
+        assert_eq!(admission.available_permits(), super::CONNECTION_LIMIT);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn slow_response_reader_is_bounded_separately_from_framing() {
+        use std::os::fd::AsRawFd as _;
+        use tokio::io::AsyncWriteExt as _;
+        use tokio::net::UnixStream;
+
+        let state = shared();
+        let key = crate::cache::CacheKey::from_value(42);
+        state
+            .cache
+            .put(key, vec![b'x'; crate::cache::MAX_VALUE_BYTES])
+            .await
+            .unwrap();
+        let (mut client, server) = UnixStream::pair().unwrap();
+        let size: libc::c_int = 1024;
+        // SAFETY: the socket is live, and size is a correctly sized integer.
+        let result = unsafe {
+            libc::setsockopt(
+                server.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_SNDBUF,
+                std::ptr::from_ref(&size).cast(),
+                libc::socklen_t::try_from(std::mem::size_of_val(&size)).unwrap(),
+            )
+        };
+        assert_eq!(result, 0);
+        client.write_all(b"ZT\x00\x02\x01").await.unwrap();
+        client.write_all(&key.bytes()).await.unwrap();
+        let error = super::handle_client(server, state).await.unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+        assert_eq!(error.to_string(), "daemon response timed out");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn disconnected_queued_git_never_acquires_or_starts_the_process() {
+        use std::sync::Arc;
+        use tokio::net::UnixStream;
+
+        for half_close_first in [false, true] {
+            let state = shared();
+            let owner = state.gitstatus.lock().await;
+            let (client, server) = UnixStream::pair().unwrap();
+            let queued_state = Arc::clone(&state);
+            let queued = tokio::spawn(async move {
+                super::git_query(
+                    &queued_state,
+                    &crate::gitstatus::Query::Directory("/repo".into()),
+                    &server,
+                )
+                .await
+            });
+            if half_close_first {
+                use tokio::io::AsyncWriteExt as _;
+                let mut client = client;
+                client.shutdown().await.unwrap();
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                assert!(
+                    !queued.is_finished(),
+                    "write-half-close still awaits a response"
+                );
+                drop(client);
+            } else {
+                drop(client);
+            }
+            let result = tokio::time::timeout(std::time::Duration::from_millis(200), queued)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(result.is_err());
+            assert!(owner.is_none(), "obsolete Git work started gitstatusd");
+            drop(owner);
+            assert!(state.gitstatus.lock().await.is_none());
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn write_half_closed_git_client_can_acquire_the_owner() {
+        use std::sync::Arc;
+        use tokio::io::AsyncWriteExt as _;
+        use tokio::net::UnixStream;
+
+        let state = shared();
+        let owner = state.gitstatus.lock().await;
+        let (mut client, server) = UnixStream::pair().unwrap();
+        client.shutdown().await.unwrap();
+        let queued_state = Arc::clone(&state);
+        let queued = tokio::spawn(async move {
+            super::acquire_git_owner(&queued_state, &server)
+                .await
+                .is_ok()
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        assert!(!queued.is_finished());
+        drop(owner);
+        assert!(queued.await.unwrap());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn lease_capacity_failure_propagates_and_closes_the_transport() {
+        use std::io;
+        use std::sync::Arc;
+
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        use tokio::net::UnixStream;
+        use tokio::sync::{Mutex, Notify};
+
+        use super::{Shared, handle_client};
+        use crate::cache::{Acquire, CacheKey, RuntimeCache};
+
+        let cache = Arc::new(RuntimeCache::new_with_path(None));
+        for value in 0..500 {
+            assert!(matches!(
+                cache.acquire(CacheKey::from_value(value)).await.unwrap(),
+                Acquire::Owner(_)
+            ));
+        }
+        let shared = Arc::new(Shared {
+            cache,
+            shutdown: Notify::new(),
+            gitstatus: Mutex::new(None),
+        });
+        let (mut client, server) = UnixStream::pair().unwrap();
+        client.write_all(b"ZT\x00\x02\x01").await.unwrap();
+        client
+            .write_all(&CacheKey::from_value(500).bytes())
+            .await
+            .unwrap();
+        let error = handle_client(server, shared).await.unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+        assert!(error.to_string().contains("lease capacity exhausted"));
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).await.unwrap();
+        assert!(
+            response.is_empty(),
+            "capacity exhaustion must not grant ownership"
+        );
     }
 
     #[test]

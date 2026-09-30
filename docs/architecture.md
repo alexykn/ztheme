@@ -18,16 +18,16 @@ before rendering the next prompt. The client starts the Git request first,
 starts runtime detection immediately after that, renders the completed
 fragments with the compiled theme, and finishes each request when the shared
 deadline expires or the last fragment is written; the client itself keeps
-running and serves the shell's next request. The client does not keep
-per-request state between prompts other than its compiled theme and its
-connection to the server daemon.
+running and serves the shell's next request. Each generation owns immutable
+request inputs. The compiled theme and bounded filesystem-planning executor
+survive between prompts; each daemon operation
+opens its own connection rather than retaining a server connection.
 
-The shell stores the incoming fragments but does not redraw the prompt for each
-one. By default it waits for the locked Git group's `complete` record, then
-renders the complete prompt once. While a locked group is pending, Zsh leaves
-the prompt empty; it only appears once every locked async segment has completed
-or the deadline has expired. This makes the update atomic without adding a
-second animation protocol.
+The shell buffers incoming fragments while a locked group is pending. By
+default it waits for the Git group's `complete` record, draws the collected
+fragments, and then redraws each unlocked runtime value as it arrives. The
+prompt is empty until every locked group completes or the shared deadline
+expires. Lock both groups to hold all fragments for a single complete draw.
 
 Each asynchronous group (`git` and `runtime`) can be toggled through
 `[async.lock]`. A lock tells the shell to wait for that group before rendering;
@@ -47,7 +47,7 @@ long-lived capabilities:
   Git tooling for every prompt.
 
 The server daemon is not responsible for rendering. It returns structured Git
-data and opaque encoded runtime snapshots; the client daemon renders those
+data and opaque encoded per-runtime values; the client daemon renders those
 values with the compiled theme.
 
 Keeping a separate client daemon per shell removes the cost of spawning a
@@ -72,35 +72,35 @@ complete contract, allowlist, header format, and examples.
 ```text
 Zsh precmd/chpwd
 ├── send a request to the per-shell client daemon
-│   └── ztheme __client-daemon (one per shell, spawned once at shell init)
+│   └── ztheme __client-daemon (one per shell, reused across prompts)
 │       ├── start Git task first
 │       │   └── daemon::git_status
 │       │       └── persistent gitstatus::Client
 │       │           └── gitstatusd
 │       └── start runtime task immediately after Git begins
-│           ├── fresh project detection and PATH planning
-│           ├── partition cacheable and volatile selections
-│           ├── execute volatile selections on every request
-│           └── acquire/execute/owned-put cacheable selections
+│           ├── bounded fresh detection, PATH, and selector planning
+│           └── one independent task per selected runtime
+│               ├── execute volatile selection on every request
+│               └── acquire/execute/revalidate/owned-put its semantic key
 ├── compute synchronous shell segments while the client works
-└── leave the prompt empty until the snapshot finishes
+└── leave the prompt empty only while a configured group lock is pending
 
 prompt protocol records
-├── Zsh stores current-generation fragments without redrawing
+├── emit each current-generation completion immediately
+├── Zsh buffers while any locked group is pending, otherwise redraws
 └── each group's `complete` marker releases that group's rendering lock
-    (an unlocked group redraws the prompt when its records arrive)
 
 shared 550 ms deadline
 ├── cancel unfinished client tasks
 └── write final done record
 
 done record / all locked groups complete
-└── Zsh renders the collected segments and redraws once
+└── Zsh renders collected segments; unlocked values may redraw independently
 ```
 
-Git and runtime records may still arrive in either order on the prompt
-protocol, but neither one is rendered by itself. Generation IDs prevent a slow
-request for an old working directory from overwriting a newer prompt.
+Git and individual runtime records may arrive in any completion order. Rendering
+follows the group locks, not runtime declaration order. Generation IDs prevent
+a slow request for an old working directory from overwriting a newer prompt.
 
 ## Why a daemon
 
@@ -150,6 +150,8 @@ src/
 ├── main.rs
 ├── cli.rs
 ├── utils.rs
+├── environment.rs
+├── filesystem.rs
 ├── daemon/
 │   ├── mod.rs
 │   └── protocol.rs
@@ -159,11 +161,13 @@ src/
 ├── runtime/
 │   ├── mod.rs
 │   ├── detect.rs
-│   └── cache.rs
+│   ├── cache.rs
+│   └── process.rs
 ├── gitstatus/
 ├── prompt/
 │   ├── mod.rs
 │   ├── client.rs
+│   ├── planning.rs
 │   └── protocol.rs
 ├── setup/
 └── theme/
@@ -266,9 +270,16 @@ runtime cache, loads its persistent entries before accepting requests, and then
 starts the flush loop. `gitstatusd` is started lazily on the first Git request
 rather than during startup, so a daemon that only serves runtime-cache
 operations never requires the managed binary. Each accepted connection is
-handled in its own Tokio task. Runtime-cache requests can proceed concurrently;
+handled in its own Tokio task, with at most 64 admitted connections; excess
+connections are closed. Completed tasks are reaped instead of accumulating
+until shutdown. A complete request frame must arrive within 500 ms, and each
+response write has its own 500 ms deadline. Boundary validation finishes before
+any cache or Git operation starts. Runtime-cache requests proceed concurrently;
 Git queries are serialized by the mutex around the single stateful
-`gitstatusd` client.
+`gitstatusd` client. A fully disconnected peer cancels a queued Git request
+before it acquires that owner; a write-half-closed peer may still receive its
+response. Once started, a Git query is drained despite peer disconnect so the
+shared subprocess protocol remains synchronized.
 
 The daemon stops when:
 
@@ -316,8 +327,12 @@ Git-status, or daemon dependency.
 Runtime selection is fresh for every prompt. A selected runtime is either
 represented by a semantic SHA-256 cache identity or classified as volatile
 and executed without entering the cache. The cache keeps at most 500 entries,
-uses daemon-side singleflight for cold misses, and persists changes
-asynchronously without a wall-clock expiry.
+uses daemon-side singleflight independently per runtime for cold misses, and
+persists changes asynchronously without a value TTL. Owner leases expire after
+400 ms, are rejected after expiry even without a replacement owner, and are
+bounded to 500 live records. Cold misses reclaim all expired leases and wake
+waiters; warm hits do not scan leases. Live capacity fails softly to uncached
+execution, never by evicting another runtime's active owner.
 
 The complete key model, selection boundary, LRU and persistence behavior,
 failure handling, and known limitations are documented in
@@ -328,11 +343,17 @@ failure handling, and known limitations are documented in
 `runtime/mod.rs` owns:
 
 - stable runtime IDs and canonical names;
-- runtime snapshot values and serialization;
+- runtime values and serialization;
 - runtime command specifications and execution;
 - version parsing;
 - compiler and environment labels;
-- snapshot execution;
+- per-runtime execution and incremental completion events;
+
+`runtime/process.rs` owns each runtime command's process group, including
+wrapper descendants retaining output pipes. Commands have a 250 ms execution
+and collection deadline and a 4 KiB accepted output limit. Cancellation,
+timeout, failure, and success all terminate remaining owned group members;
+the leader's PID is retained until cleanup to avoid signaling a reused group.
 
 `runtime/cache.rs` owns fresh selection planning, request-CWD-aware PATH
 resolution, direct executable identity, the bounded pyenv/rbenv/nodenv/plenv
@@ -341,8 +362,11 @@ semantic key. Python virtual/Conda selection is checked before PATH. Java and
 .NET use the first executable selected from request PATH; .NET is currently
 volatile because ztheme does not simulate SDK selection. Scripts, arbitrary
 dispatchers, ambiguous selectors, and unsupported automatic Go toolchain
-selection remain volatile rather than being simulated. The exact cacheability
-boundary is documented in [Runtime cache](cache.md).
+selection remain volatile rather than being simulated. macOS system compiler,
+Swift, and Java launchers are also volatile: native launchers can select
+contextual Xcode/Command Line Tools/JDK targets, including through symlinks.
+Real SDK/JDK executables are distinguished by path, not basename. The exact
+cacheability boundary is documented in [Runtime cache](cache.md).
 
 Runtime identity is declared once by `define_runtimes!`. IDs are explicit
 because they are persisted and must not change when declaration order changes.
@@ -383,6 +407,15 @@ Repository-related environment variables are removed from the child; each
 request carries the intended directory or explicit `GIT_DIR`, rather than
 letting the daemon's own launch environment accidentally select a repository.
 
+Automatic selection discovers the repository on a request-owned filesystem
+worker before contacting the daemon, honoring that request's
+`GIT_CEILING_DIRECTORIES`. If discovery finds no repository below the ceiling,
+no server Git query is sent. Explicit `GIT_DIR` and standalone `GIT_WORK_TREE`
+retain the adapter's existing selection and bypass automatic discovery and its
+ceilings; relative values are resolved against the request CWD. This is not a
+complete simulation of Git's environment: combined explicit `GIT_DIR` and
+`GIT_WORK_TREE` are unsupported and reported as such.
+
 The native `gitstatusd` protocol uses request IDs, unit-separator-delimited
 fields, and a record-separator terminator. ztheme validates matching IDs,
 repository flags, numeric fields, response termination, and a 64 KiB response
@@ -411,10 +444,12 @@ is the per-request engine used by the client daemon:
 - starts the Git task first and lets it begin its daemon request;
 - starts runtime detection immediately afterward;
 - applies one shared 550 ms deadline;
-- writes completed segments to the prompt stream, followed by that group's
-  `complete` marker so the shell can release its rendering lock;
+- writes each completed runtime or Git segment immediately; runtime values
+  are independent events, not a single aggregate snapshot;
+- writes a group's `complete` marker once all its tasks finish so the shell
+  can release that rendering lock;
 - cancels unfinished work;
-- always writes the final `done` record;
+- writes final `done` on normal completion or deadline expiry;
 - sanitizes errors before sending them to Zsh.
 
 `prompt/client.rs` owns the per-shell client daemon: it parses requests from
@@ -443,18 +478,25 @@ It does not manage server sockets, process startup, cache persistence, or the
 
 The 550 ms limit is one deadline shared by both jobs, not 550 ms per operation.
 Once it expires, the engine aborts unfinished Tokio tasks and writes `done`.
-Runtime discovery runs on Tokio's blocking pool, so a slow filesystem walk
-cannot stall the client event loop or the deadline; the walk may outlive the
-expired request, but its result is simply discarded. The shell treats `done`
-as the rendering barrier, so a slow or missing result cannot leave the prompt
-waiting forever. Dropping an in-flight server request closes that request's
+All Git discovery and runtime filesystem planning (detection, PATH resolution,
+selectors, and publication revalidation) run through `prompt/planning.rs` on
+Tokio's blocking pool. Each shell client has two shared permits, acquired before
+launching a worker and held by the worker until it really exits. A canceled
+await cannot release a permit prematurely or build an unbounded worker queue.
+Workers retain immutable request-owned inputs, so later generations cannot
+change the environment they observe. Filesystem calls blocked in the kernel
+can outlive the 550 ms request; their results are discarded, and client runtime
+shutdown waits at most 25 ms for blocking workers after EOF or parent death.
+The shell treats `done` as the final rendering barrier, so a slow or missing
+result cannot leave the prompt waiting forever. Dropping an in-flight server
+request closes that request's
 socket connection; the server daemon remains independent and available to
 later prompts.
 
 Runtime-cache failures are soft on the rendering path. A failed read falls
-back to executing the runtime snapshot, and a failed write does not discard
-the freshly calculated result. Git errors and task failures are written as
-sanitized protocol records so they can be diagnosed without injecting control
+back to executing only the affected runtime, and a failed write does not
+discard the freshly calculated result. Git errors and task failures are written
+as sanitized protocol records so they can be diagnosed without injecting control
 characters or record delimiters into the shell stream.
 
 ### Theme and setup
@@ -494,10 +536,8 @@ daemon
 
 runtime
 ├── cache
-└── utils
-
-cache
-└── utils
+├── environment
+└── filesystem
 
 theme
 └── runtime
@@ -604,9 +644,10 @@ rendering the immediate segments rather than leaving the prompt stuck.
 
 The generation is allocated by the shell integration. Zsh ignores records from
 superseded generations, allowing directory changes to cancel or outlive an
-older request safely. `done` is always emitted, including when there are no
-asynchronous segments or the shared deadline expires, so the shell can finish
-that generation's worker lifecycle.
+older request safely. `done` is emitted on normal completion, including when
+there are no asynchronous segments or the shared deadline expires. Superseded
+requests and broken output pipes need not emit it; generations and transport fallback
+handle those cases.
 
 ### Zsh-to-client request protocol
 
@@ -628,9 +669,17 @@ JULIA_LOAD_PATH<NUL>JULIA_DEPOT_PATH<NUL>R_ARCH<NUL>
 
 `ZTREQ` and version `3` guard against garbage input. The environment subset is
 exactly what runtime detection, command resolution, and the Git query read.
-The field order and count are defined once in `src/prompt/protocol.rs`
-(`REQUEST_FIELDS`); the daemon parser and the generated shell integration
-both derive from that list, so the two sides cannot drift apart.
+The version-3 field order is owned by `EnvironmentField` descriptors in
+`src/environment.rs` (`REQUEST_FIELDS`). Each descriptor owns its shell name,
+decode storage accessors, and volatile child environment policy. The shell
+generator, client decoder, and child-command application use those same
+identities. Independent literal byte fixtures pin the existing order; no new
+fields or version bump are needed. The decoder accepts at most 16 KiB per
+field and 128 KiB per complete request, including NUL terminators. It checks
+budgets before copying from the buffered input, including unterminated fields.
+Magic, version, generation, absolute CWD, and required fields are validated
+at that boundary; legacy version mismatches retain generation-tagged
+diagnostics.
 The client does not apply it to its own process: the values are threaded
 through the request explicitly and applied only to the child commands that
 need them (set when present, removed when empty), because the client outlives

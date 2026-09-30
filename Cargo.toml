@@ -1,6 +1,6 @@
 [package]
 name = "ztheme"
-version = "1.7.1"
+version = "1.8.0"
 edition = "2024"
 rust-version = "1.97"
 description = "Fast asynchronous Zsh prompt"
@@ -12,6 +12,7 @@ categories = ["command-line-interface", "command-line-utilities"]
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
+libc = "0.2"
 serde = { version = "1", features = ["derive"] }
 sha2 = "0.11.0"
 shell-words = "1.1"

@@ -22,9 +22,12 @@ Git and runtime segments exist because their computation (gitstatusd queries,
 version detection, caching) happens in the Rust process; they cannot be
 reimplemented as Zsh segment files. Everything else is a shell function.
 
-Both kinds are rendered in the same atomic final draw: the shell computes its
-segments while the client resolves git/runtime values, and the complete prompt
-is drawn once the fragments arrive or the shared deadline expires.
+The shell computes synchronous segments while the client resolves Git and
+runtime values. By default Git is locked and runtimes are unlocked: the first
+draw waits for Git (or the shared 550 ms deadline), then each runtime can redraw
+independently. Lock both groups via `[async.lock]` for one complete draw, or
+unlock both to display synchronous segments immediately. See
+[Asynchronous rendering](../README.md#asynchronous-rendering).
 
 ## Why custom segments are synchronous
 
@@ -91,7 +94,9 @@ A custom id:
 - matches `[a-z][a-z0-9_]*` (lowercase start; letters, digits, underscores);
 - must not equal a bundled id (`directory`, `clock`, `git`, `character`, `status`);
 - must not equal any supported runtime name (`python`, `perl`, `java`,
-  `kotlin`, `scala`, `rust`, `go`, `node`, `ruby`, `dotnet`, `c`, `cpp`).
+  `kotlin`, `scala`, `rust`, `go`, `bun`, `deno`, `node`, `ruby`, `php`,
+  `dotnet`, `c`, `cpp`, `swift`, `lua`, `r`, `julia`, `elixir`, `dart`,
+  `haskell`, `zig`).
 
 The reserved set is derived from the runtime table; there is no second manual
 list to keep in sync. Invalid ids are rejected, never normalized — hyphens,
@@ -230,6 +235,29 @@ it to the current shell. Newly enabled segments are available immediately;
 segments removed from the layout are no longer dispatched. Previously defined
 segment functions may remain defined after a reload; they are simply never
 called again. No new command was added for this.
+
+Each active file must introduce its declared `ztheme_segment_<id>` function
+anew: ztheme saves current definitions and removes that file's old symbol
+before sourcing it. A missing new definition, a source error, or a nonzero
+source return rejects the reload. Definitions prepared from earlier files in
+the same reload are discarded too. The working theme, prompt state, segment
+definitions, and client are preserved for ordinary preparation failures; the
+client is not stopped and new theme globals are not installed until all custom
+files pass preparation. This limited rollback covers ztheme-owned state, not
+every effect of arbitrary code in an enabled file.
+
+Preparation reserves the `ztheme`, `_ztheme_*`, and `ztheme_segment_*` function
+namespaces. Only each file's declared segment function is installed on success;
+incidental changes to bundled, integration, or unrelated custom functions are
+undone. The `__ZTHEME_*` and `ZTHEME_*` parameters, plus `PROMPT` and `RPROMPT`,
+are restored after sourcing on both success and failure. Top-level custom code
+runs against the current shell state, not the incoming theme; use theme render
+helpers inside the segment function, which runs after installation.
+
+This is not a transaction over arbitrary user code. Changes to other globals,
+hooks, files, or processes are not rolled back, even when sourcing fails.
+Custom files must not exit the shell, make reserved parameters readonly, or
+otherwise prevent ztheme from restoring its reserved state.
 
 ## What this does and does not guarantee
 

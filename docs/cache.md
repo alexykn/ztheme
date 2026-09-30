@@ -3,8 +3,8 @@
 Runtime version commands can dominate an otherwise warm prompt. In
 particular, starting Python through a virtual environment or version-manager
 shim can take several milliseconds or more even when project detection and
-rendering are already optimized. ztheme therefore keeps successful runtime
-snapshots in the shared server daemon and persists them across daemon restarts.
+rendering are already optimized. ztheme therefore keeps successful per-runtime
+values in the shared server daemon and persists them across daemon restarts.
 
 The cache is an optimization, not the source of project identity. Project and
 language detection still runs for every prompt, and runtime selection is
@@ -19,22 +19,25 @@ subsystem ownership, and wire protocols.
 
 For each prompt, the client:
 
-1. runs fresh project detection and base executable planning concurrently;
-2. keeps only runtimes enabled by the theme and detected for the current
-   project;
-3. resolves each selected runtime to either a cacheable plan or a volatile
-   plan;
-4. builds one semantic key from the cacheable plans;
-5. executes volatile plans on every request;
-6. acquires the semantic key from the server daemon;
-7. on a hit, decodes the cached values;
-8. on a cold miss, executes the cacheable plans and stores the result through
-   the owned singleflight token;
-9. combines cached and volatile values and materializes presentation labels
-   from the current request.
+1. performs fresh detection, executable resolution, and selector planning in
+   one bounded filesystem job, considering only detected, theme-enabled runtimes;
+2. classifies each selected runtime as cacheable or volatile;
+3. starts one independent task per selected runtime;
+4. executes volatile plans on every request without cache access;
+5. acquires each cacheable runtime's own semantic key from the server daemon;
+6. on a hit, validates a singleton value with that runtime's stable ID;
+7. on a cold miss, executes that runtime, then refreshes its selection and
+   identity before publishing through its owned singleflight token;
+8. if selection changed during execution, releases ownership and retries once
+   for that runtime only; an unstable second attempt is neither cached nor
+   rendered as current;
+9. materializes presentation labels from the current request and emits each
+   completed runtime immediately, without waiting for slow siblings.
 
-The first rendered prompt uses the result of this flow. ztheme does not render
-a stale snapshot and replace it later.
+The first value rendered for each runtime comes from the current request.
+ztheme does not render a stale snapshot and replace it later. The shell's
+runtime group lock controls whether these independent events are buffered or
+redrawn incrementally; by default runtimes are unlocked.
 
 One volatile runtime does not disable caching for unrelated cacheable runtimes
 in the same prompt.
@@ -65,7 +68,11 @@ the request directory, and relative components are resolved beneath it.
 Java and .NET select the first matching executable from request PATH. `JAVA_HOME`
 and `DOTNET_ROOT` remain available as command context, but they do not replace
 that PATH selection. .NET project and installed-SDK state is intentionally not
-fingerprinted; detected .NET plans execute as volatile.
+fingerprinted; detected .NET plans execute as volatile. macOS system compiler,
+Swift, and Java launchers also stay volatile because they can select Xcode,
+Command Line Tools, or a JDK contextually. Both the requested path and canonical
+routing target are checked, so a symlink cannot make a known launcher cacheable.
+Actual SDK/JDK binaries with the same basename can still be cacheable.
 
 ### Python environments
 
@@ -173,11 +180,13 @@ runtime version.
 
 ## Semantic key
 
-The combined key is SHA-256 over a length-delimited, namespaced serialization
-of the active cacheable plans. It includes:
+Each runtime's key is SHA-256 over a length-delimited, namespaced serialization
+of its own cacheable plan. Adding, removing, failing, or changing a sibling
+runtime does not invalidate that value. It includes:
 
-- a semantic key namespace version;
-- stable runtime IDs;
+- the `ztheme-runtime-value-v3` semantic domain and runtime-value version `3`
+  (independent of disk-format and daemon-protocol version `2`);
+- that runtime's stable ID;
 - command arguments and output mode;
 - the selected executable or supported selection context;
 - only environment values declared for that runtime command.
@@ -201,14 +210,19 @@ eviction.
 ## Singleflight
 
 Cold misses use daemon-side singleflight. The first acquire for a key receives
-an ownership token and executes the runtime commands in its per-shell client.
+an ownership token and executes that runtime command in its per-shell client.
 Later clients wait on the same key and receive the owned value instead of
 starting duplicate commands.
 
-Ownership expires after a short lease so a killed client cannot block the key
-indefinitely. Tokens are ownership-specific: a late owner cannot overwrite a
-value created by a newer owner. A client that cannot complete its execution
-releases the token.
+Ownership expires after 400 ms so a killed client cannot block the key
+indefinitely. An expired token is rejected even if no replacement has yet
+acquired the key. Tokens are ownership-specific: a late owner cannot overwrite
+a newer value. Failed executions release ownership; cancellation may leave a
+lease to expire. Expired leases are reclaimed across all keys on cold misses,
+not just when their original key is revisited, and reclamation wakes waiters.
+Warm hits do not scan leases. At most 500 owner leases coexist; a new miss at
+live capacity fails softly and runs uncached rather than evicting a live owner.
+A waiter on an existing key can still join at capacity.
 
 Waiting occurs on the daemon connection rather than through polling. Runtime
 commands remain outside the shared daemon, so a slow child process does not
@@ -217,7 +231,9 @@ block the daemon's event loop.
 ## LRU and persistence
 
 The cache holds at most 500 entries, each with a maximum encoded value size of
-16 KiB. Reads move entries to the most-recently-used end in memory. Insertion
+16 KiB. Each new semantic entry encodes exactly one successful runtime value;
+aggregate entries from older key namespaces are never mistaken for a current
+singleton. Reads move entries to the most-recently-used end in memory. Insertion
 past the limit removes the least-recently-used entry.
 
 Recency persistence is intentionally approximate. A hit updates memory
@@ -295,6 +311,9 @@ Current limitations are:
 - scripts and nested dispatchers are never treated as stable direct
   executables;
 - .NET SDK selection is not fingerprinted, so `dotnet` is volatile;
+- macOS system compiler/Swift/Java launchers and Juliaup select contextual
+  targets and are volatile; native implementation format alone is not proof
+  of stable selection;
 - Go automatic toolchain selection is volatile unless
   `GOTOOLCHAIN=local` makes it explicit;
 - rustup support is limited to the documented selector precedence and
@@ -320,7 +339,8 @@ Cache changes should preserve these properties:
 
 - the first prompt after a supported selector or executable change is current;
 - repeated warm prompts do not execute runtime commands;
-- concurrent cold requests execute one cacheable snapshot;
+- concurrent cold requests share one execution per stable cacheable runtime
+  within its lease;
 - a daemon restart reuses persisted entries;
 - volatile runtimes never enter persistent state;
 - the realistic workload has no stale results and retains a high hit rate;

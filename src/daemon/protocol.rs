@@ -8,7 +8,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
 use tokio::time::timeout;
 
-use crate::cache::{CacheKey, MAX_VALUE_BYTES, validate_value};
+use crate::cache::{Acquire, CacheKey, MAX_VALUE_BYTES, validate_value};
 use crate::gitstatus::{Query, Snapshot};
 
 pub(super) const VERSION: u16 = 2;
@@ -50,6 +50,28 @@ pub(super) enum RequestHeader {
     Operation(u8),
     DaemonOutdated,
     ClientOutdated,
+}
+
+/// Fully decoded, owned operations. No state operation starts until its entire
+/// frame has passed boundary validation.
+pub(super) enum Request {
+    DaemonOutdated,
+    ClientOutdated,
+    CacheAcquire(CacheKey),
+    CachePutOwned(CacheKey, u64, Vec<u8>),
+    CacheRelease(CacheKey, u64),
+    CacheRemove(CacheKey),
+    Reset,
+    GitStatus(Query),
+}
+
+pub(super) enum Response {
+    DaemonOutdated,
+    ClientOutdated,
+    CacheAcquire(Acquire),
+    Mutation(bool),
+    Complete,
+    GitStatus(io::Result<Option<Snapshot>>),
 }
 
 pub(super) type Result<T> = std::result::Result<T, Error>;
@@ -161,6 +183,45 @@ pub(super) async fn read_header(stream: &mut UnixStream) -> io::Result<RequestHe
         std::cmp::Ordering::Less => Ok(RequestHeader::ClientOutdated),
         std::cmp::Ordering::Equal => stream.read_u8().await.map(RequestHeader::Operation),
         std::cmp::Ordering::Greater => Ok(RequestHeader::DaemonOutdated),
+    }
+}
+
+pub(super) async fn read_request(stream: &mut UnixStream) -> io::Result<Request> {
+    match read_header(stream).await? {
+        RequestHeader::DaemonOutdated => Ok(Request::DaemonOutdated),
+        RequestHeader::ClientOutdated => Ok(Request::ClientOutdated),
+        RequestHeader::Operation(RUNTIME_CACHE_ACQUIRE) => {
+            Ok(Request::CacheAcquire(read_key(stream).await?))
+        }
+        RequestHeader::Operation(RUNTIME_CACHE_PUT_OWNED) => {
+            let key = read_key(stream).await?;
+            let token = stream.read_u64().await?;
+            let value = read_value(stream).await?;
+            Ok(Request::CachePutOwned(key, token, value))
+        }
+        RequestHeader::Operation(RUNTIME_CACHE_RELEASE) => {
+            let key = read_key(stream).await?;
+            let token = stream.read_u64().await?;
+            Ok(Request::CacheRelease(key, token))
+        }
+        RequestHeader::Operation(RUNTIME_CACHE_REMOVE) => {
+            Ok(Request::CacheRemove(read_key(stream).await?))
+        }
+        RequestHeader::Operation(RESET) => Ok(Request::Reset),
+        RequestHeader::Operation(GIT_STATUS) => Ok(Request::GitStatus(read_query(stream).await?)),
+        RequestHeader::Operation(_) => Err(invalid_data("unknown daemon operation")),
+    }
+}
+
+pub(super) async fn write_response(stream: &mut UnixStream, response: Response) -> io::Result<()> {
+    match response {
+        Response::DaemonOutdated => write_daemon_outdated(stream).await,
+        Response::ClientOutdated => write_client_outdated(stream).await,
+        Response::CacheAcquire(Acquire::Hit(value)) => write_cache_hit(stream, &value).await,
+        Response::CacheAcquire(Acquire::Owner(token)) => write_cache_owner(stream, token).await,
+        Response::Mutation(true) | Response::Complete => write_ok(stream).await,
+        Response::Mutation(false) => write_rejected(stream).await,
+        Response::GitStatus(result) => write_git_result(stream, result).await,
     }
 }
 

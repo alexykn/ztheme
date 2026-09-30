@@ -4,18 +4,69 @@
 # user custom segments) are computed in Zsh during `precmd` through the
 # generic `_ztheme_compute_sync_segments` dispatcher and held. Git and runtime
 # values are styled in Rust and arrive as finished fragments from the per-shell
-# `ztheme __client-daemon` process. The complete prompt is assembled and drawn
-# in one atomic redraw once those fragments finish or the shared deadline
-# expires.
+# `ztheme __client-daemon` process. Unlocked runtime values redraw as each
+# independent command or cache hit completes. Locked groups buffer fragments
+# until completion; the shared deadline releases any remaining rendering locks.
+
+# Prepare custom definitions before stopping the working client or installing
+# the new theme. Only the declared segment functions are installed on success.
+# The ztheme function namespace and prefixed parameters (plus prompt strings)
+# are restored after sourcing, on both success and failure. Other user globals,
+# hooks, files, processes, and arbitrary custom-code side effects are not
+# transactional; custom code must not make reserved state readonly or exit.
+_ztheme_prepare_custom_segments() {
+    emulate -L zsh
+    setopt localoptions no_shwordsplit
+
+    local -A ztheme_saved_functions ztheme_custom_definitions
+    local -a ztheme_saved_parameters
+    local ztheme_name ztheme_parameter_definitions
+    local -i ztheme_custom_status=0
+
+    for ztheme_name in ${(k)functions[(I)(_ztheme_*|ztheme|ztheme_segment_*)]}; do
+        ztheme_saved_functions[$ztheme_name]=$functions[$ztheme_name]
+    done
+    ztheme_saved_parameters=(${(k)parameters[(I)(__ZTHEME_*|ZTHEME_*|PROMPT|RPROMPT)]})
+    if (( ${#ztheme_saved_parameters} )); then
+        ztheme_parameter_definitions="$(builtin typeset -p "${ztheme_saved_parameters[@]}")" || return 1
+    fi
+
+    () {
+        emulate -L zsh
+        @ZTHEME_CUSTOM_SEGMENTS@
+        return 0
+    }
+    ztheme_custom_status=$?
+
+    # Restore current functions through the functions table, not eval of user
+    # source. This also removes newly introduced reserved functions and keeps
+    # bundled and unrelated custom definitions intact across preparation.
+    for ztheme_name in ${(k)functions[(I)(_ztheme_*|ztheme|ztheme_segment_*)]}; do
+        if (( ! ${+ztheme_saved_functions[$ztheme_name]} )); then
+            builtin unfunction "$ztheme_name"
+        fi
+    done
+    for ztheme_name in ${(k)ztheme_saved_functions}; do
+        functions[$ztheme_name]=$ztheme_saved_functions[$ztheme_name]
+    done
+    # Redeclarations can change types/attributes. Recreate saved parameters in
+    # a clean namespace rather than applying declarations over altered types.
+    for ztheme_name in ${(k)parameters[(I)(__ZTHEME_*|ZTHEME_*|PROMPT|RPROMPT)]}; do
+        builtin unset "$ztheme_name" || return 1
+    done
+    builtin eval "$ztheme_parameter_definitions" || return 1
+
+    (( ztheme_custom_status == 0 )) || return 1
+    for ztheme_name in ${(k)ztheme_custom_definitions}; do
+        functions[$ztheme_name]=$ztheme_custom_definitions[$ztheme_name]
+    done
+}
 
 _ztheme_initialize() {
 autoload -Uz colors
 autoload -Uz add-zsh-hook
 autoload -Uz add-zle-hook-widget
 autoload -Uz is-at-least
-
-colors
-setopt PROMPT_SUBST
 
 # The client spawn relies on zsh/system's sysopen with close-on-exec so the
 # prompt descriptors cannot leak into external commands or keep the client
@@ -28,6 +79,13 @@ if ! zmodload zsh/system 2>/dev/null; then
     print -u2 -- "ztheme: requires the zsh/system module"
     return 1
 fi
+
+if ! _ztheme_prepare_custom_segments; then
+    return 1
+fi
+
+colors
+setopt PROMPT_SUBST
 
 if (( $+functions[_ztheme_stop_client] )); then
     { _ztheme_stop_client } 2>/dev/null
@@ -43,14 +101,11 @@ fi
 # Synchronous segment implementations
 #
 # Bundled segments are embedded assets shipped inside the binary. Custom
-# segments were validated and allowlisted by the ztheme binary and are sourced
-# here, once, during initialization; nothing in this section runs per prompt.
-#
-# Custom definitions are emitted first and bundled definitions afterward so
-# bundled segment functions win under ordinary redefinition.
+# definitions were prepared above; only each file's declared function survives
+# preparation, so custom sourcing cannot replace bundled implementations.
+# Nothing in this section runs per prompt.
 # ---------------------------------------------------------------------------
 
-@ZTHEME_CUSTOM_SEGMENTS@
 @ZTHEME_BUNDLED_SEGMENTS@
 
 # ---------------------------------------------------------------------------
@@ -692,7 +747,7 @@ typeset -g ZTHEME_SHELL_INITIALIZED=1
 }
 
 if ! _ztheme_initialize; then
-    unfunction _ztheme_initialize
+    unfunction _ztheme_initialize _ztheme_prepare_custom_segments
     return 1
 fi
-unfunction _ztheme_initialize
+unfunction _ztheme_initialize _ztheme_prepare_custom_segments

@@ -741,6 +741,225 @@ _ztheme_render_layout
 }
 
 #[test]
+fn custom_reload_rejects_missing_and_failed_definitions_without_teardown() {
+    for (replacement, expected_error) in [
+        (":\n", "did not define ztheme_segment_time"),
+        (
+            "ztheme_segment_time() { REPLY=FAILED; }\nreturn 7\n",
+            "failed to source custom segment `time`",
+        ),
+        ("if then\n", "failed to source custom segment `time`"),
+    ] {
+        let sandbox = Sandbox::new();
+        sandbox.write_theme("timetheme", &time_theme("old "));
+        install_time_segment(&sandbox, &["time"], "'OLD'");
+        let script = format!(
+            r#"
+eval "$("$ZTHEME_TEST_BIN" init zsh --theme timetheme)" || exit 10
+ztheme_segment_unrelated() {{ REPLY=UNRELATED; }}
+_ztheme_stop_client() {{ print -u2 -- unexpected-teardown; return 1; }}
+ZTHEME_GENERATION=42
+ZTHEME_CLIENT_PID=424242
+ZTHEME_CLIENT_READY=1
+_ztheme_compute_sync_segments 0
+_ztheme_render_layout
+old_prompt=$ZTHEME_PROMPT
+old_directory=$functions[ztheme_segment_directory]
+old_renderer=$functions[_ztheme_render_layout]
+old_theme_state=$(typeset -p __ZTHEME_THEME_SELECTOR __ZTHEME_SYNC_SEGMENTS __ZTHEME_SEGMENT_OPEN __ZTHEME_SEGMENT_CLOSE)
+cat > "$XDG_CONFIG_HOME/ztheme/themes/timetheme.toml" <<'ZTEOF'
+{updated_theme}
+ZTEOF
+cat > "$XDG_CONFIG_HOME/ztheme/segments/time.zsh" <<'ZTEOF'
+# ztheme-segment-v1: time
+# Owned state is restored, but arbitrary user side effects are not.
+CUSTOM_SIDE_EFFECT=retained
+typeset -gi __ZTHEME_THEME_SELECTOR=7
+unset __ZTHEME_SYNC_SEGMENTS
+typeset -gA __ZTHEME_SYNC_SEGMENTS=(corrupt bad)
+__ZTHEME_SEGMENT_OPEN[time:default]=corrupt
+ZTHEME_GENERATION=0
+ZTHEME_CLIENT_PID=corrupt
+ZTHEME_CLIENT_READY=0
+ZTHEME_NEW_PARAMETER=discard
+PROMPT=corrupt
+ztheme_segment_directory() {{ REPLY=corrupt; }}
+ztheme_segment_unrelated() {{ REPLY=corrupt; }}
+_ztheme_render_layout() {{ :; }}
+ztheme_segment_accidental() {{ :; }}
+{replacement}
+ZTEOF
+ztheme theme reload > "$HOME/reload.out" 2> "$HOME/reload.err" && exit 11
+[[ ! -s "$HOME/reload.out" ]] || exit 12
+[[ "$(<"$HOME/reload.err")" != *unexpected-teardown* ]] || exit 13
+[[ "$__ZTHEME_THEME_SELECTOR" == timetheme && "$ZTHEME_GENERATION" == 42 ]] || exit 14
+[[ "$ZTHEME_CLIENT_PID" == 424242 && "$ZTHEME_CLIENT_READY" == 1 ]] || exit 15
+[[ "$functions[ztheme_segment_directory]" == "$old_directory" ]] || exit 16
+[[ "$functions[_ztheme_render_layout]" == "$old_renderer" ]] || exit 17
+[[ "$(typeset -p __ZTHEME_THEME_SELECTOR __ZTHEME_SYNC_SEGMENTS __ZTHEME_SEGMENT_OPEN __ZTHEME_SEGMENT_CLOSE)" == "$old_theme_state" ]] || exit 18
+(( ! $+functions[ztheme_segment_accidental] && ! $+parameters[ZTHEME_NEW_PARAMETER] )) || exit 19
+[[ "$PROMPT" == '${{ZTHEME_PROMPT}}' && "$CUSTOM_SIDE_EFFECT" == retained ]] || exit 20
+ztheme_segment_unrelated
+[[ "$REPLY" == UNRELATED ]] || exit 21
+_ztheme_compute_sync_segments 0
+_ztheme_render_layout
+[[ "$ZTHEME_PROMPT" == "$old_prompt" && "$ZTHEME_SEGMENT_TIME" == *OLD* ]] || exit 22
+print -u2 -r -- "$(<"$HOME/reload.err")"
+"#,
+            updated_theme = time_theme("new "),
+        );
+        let output = sandbox.zsh(&script);
+        assert_success(&output);
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains(expected_error),
+            "stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
+#[test]
+fn custom_reload_installs_valid_replacement_without_stealing_other_functions() {
+    let sandbox = Sandbox::new();
+    sandbox.write_theme("timetheme", &time_theme("old "));
+    install_time_segment(&sandbox, &["time"], "'OLD'");
+    let script = format!(
+        r#"
+eval "$("$ZTHEME_TEST_BIN" init zsh --theme timetheme)" || exit 10
+ztheme_segment_unrelated() {{ REPLY=UNRELATED; }}
+old_directory=$functions[ztheme_segment_directory]
+cat > "$XDG_CONFIG_HOME/ztheme/themes/timetheme.toml" <<'ZTEOF'
+{updated_theme}
+ZTEOF
+cat > "$XDG_CONFIG_HOME/ztheme/segments/time.zsh" <<'ZTEOF'
+# ztheme-segment-v1: time
+CUSTOM_SETUP=retained
+ztheme_segment_time() {{ _ztheme_segment_render time NEW; }}
+ztheme_segment_directory() {{ REPLY=corrupt; }}
+ztheme_segment_unrelated() {{ REPLY=corrupt; }}
+_ztheme_stop_client() {{ print -u2 -- unexpected-teardown; return 1; }}
+ZTEOF
+ztheme theme reload || exit 11
+[[ "$functions[ztheme_segment_directory]" == "$old_directory" ]] || exit 12
+ztheme_segment_unrelated
+[[ "$REPLY" == UNRELATED && "$CUSTOM_SETUP" == retained ]] || exit 13
+_ztheme_compute_sync_segments 0
+_ztheme_render_layout
+[[ "$ZTHEME_SEGMENT_TIME" == *'new '*NEW* && "$ZTHEME_PROMPT" != *OLD* ]] || exit 14
+"#,
+        updated_theme = time_theme("new "),
+    );
+    let output = sandbox.zsh(&script);
+    assert_success(&output);
+    assert!(String::from_utf8_lossy(&output.stdout).contains("Reloaded the current theme."));
+    assert!(!String::from_utf8_lossy(&output.stderr).contains("unexpected-teardown"));
+}
+
+#[test]
+fn custom_reload_rolls_back_an_earlier_prepared_definition_when_a_later_file_fails() {
+    let sandbox = Sandbox::new();
+    sandbox.write_theme("timetheme", &time_theme(""));
+    install_time_segment(&sandbox, &["time", "later"], "'OLD'");
+    fs::write(
+        sandbox.config.join("ztheme/segments/later.zsh"),
+        "# ztheme-segment-v1: later\n:\n",
+    )
+    .unwrap();
+    let updated_theme = time_theme("").replace("[\"time\"]", "[\"time\", \"later\"]");
+    let script = format!(
+        r#"
+eval "$("$ZTHEME_TEST_BIN" init zsh --theme timetheme)" || exit 10
+cat > "$XDG_CONFIG_HOME/ztheme/themes/timetheme.toml" <<'ZTEOF'
+{updated_theme}
+[segments.custom.later]
+style = {{ foreground = "accent" }}
+ZTEOF
+cat > "$XDG_CONFIG_HOME/ztheme/segments/time.zsh" <<'ZTEOF'
+# ztheme-segment-v1: time
+ztheme_segment_time() {{ _ztheme_segment_render time NEW; }}
+ZTEOF
+ztheme theme reload && exit 11
+(( ! $+functions[ztheme_segment_later] )) || exit 12
+_ztheme_compute_sync_segments 0
+_ztheme_render_layout
+[[ "$ZTHEME_SEGMENT_TIME" == *OLD* && "$ZTHEME_PROMPT" != *NEW* ]] || exit 13
+"#,
+    );
+    let output = sandbox.zsh(&script);
+    assert_success(&output);
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("did not define ztheme_segment_later")
+    );
+}
+
+#[test]
+fn theme_apply_rejects_invalid_clock_without_changing_config() {
+    let sandbox = Sandbox::new();
+    let config_path = sandbox.config.join("ztheme/config.toml");
+    fs::create_dir_all(config_path.parent().unwrap()).unwrap();
+    let previous_config = b"# Preserve this file verbatim on validation failure.\n\
+                            version = 1\ntheme = \"vesper\"\n\
+                            [custom_segments]\nenabled = [\"time\"]\n";
+    fs::write(&config_path, previous_config).unwrap();
+
+    for (fields, expected_error) in [
+        (
+            r#"style = { foreground = "missing_color" }"#,
+            "unknown palette color",
+        ),
+        (
+            r#"style = { background = "missing_color" }"#,
+            "unknown palette color",
+        ),
+        (r#"prefix = "bad\n""#, "segments.clock.prefix"),
+        (r#"suffix = "bad\u001b""#, "segments.clock.suffix"),
+        ("spacing = { before = 17 }", "segments.clock.spacing"),
+        ("spacing = { after = 17 }", "segments.clock.spacing"),
+    ] {
+        // Clock is not in this layout, but init still emits its theme entry.
+        let theme = format!(
+            "version = 1\n[layout]\nlines = [[\"directory\"]]\nright = []\n\
+             [segments.clock]\n{fields}\n"
+        );
+        sandbox.write_theme("clock-contract", &theme);
+        let output = sandbox
+            .command()
+            .args(["theme", "apply", "clock-contract"])
+            .output()
+            .unwrap();
+        assert!(!output.status.success(), "accepted {fields}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains(expected_error), "{fields}: {stderr}");
+        assert_eq!(fs::read(&config_path).unwrap(), previous_config);
+    }
+
+    sandbox.write_theme(
+        "clock-contract",
+        r##"version = 1
+[layout]
+lines = [["directory"]]
+right = ["clock"]
+[segments.clock]
+prefix = "time % "
+suffix = " !"
+style = { foreground = "accent", background = "#112233" }
+spacing = { before = 16, after = 16 }
+"##,
+    );
+    let output = sandbox
+        .command()
+        .args(["theme", "apply", "clock-contract"])
+        .output()
+        .unwrap();
+    assert_success(&output);
+    let config = fs::read_to_string(config_path).unwrap();
+    assert!(config.contains("theme = \"clock-contract\""), "{config}");
+    assert!(config.contains("enabled = [\"time\"]"), "{config}");
+    // Plain theme apply validates and persists without installing dependencies.
+    assert_eq!(fs::read_dir(&sandbox.data).unwrap().count(), 0);
+}
+
+#[test]
 fn theme_apply_preserves_the_custom_segment_allowlist() {
     let sandbox = Sandbox::new();
     sandbox.install_fake_gitstatus();
@@ -1633,6 +1852,256 @@ fn client_daemon_round_trips_requests_and_exits_on_eof() {
 }
 
 #[test]
+fn client_rejects_fifo_rustup_settings_and_serves_new_generations_within_deadline() {
+    let sandbox = Sandbox::new();
+    let instance = "fifo-rustup-deadline";
+    write_rust_theme(&sandbox, "fifo-rust");
+    fs::write(sandbox.home.join("Cargo.toml"), "[package]\n").unwrap();
+    let bin = sandbox.home.join("bin");
+    let rustup_home = sandbox.home.join("rustup");
+    fs::create_dir_all(&bin).unwrap();
+    fs::create_dir_all(&rustup_home).unwrap();
+    // Hard-linked rustc/rustup is recognized as a proxy. Keep its fallback
+    // native and warmed so shell startup cannot consume the command budget;
+    // the behavior under test is rejection of the FIFO selector.
+    let rustup = compile_c(
+        &sandbox,
+        "rustup",
+        "#include <stdio.h>\nint main(void) { puts(\"rustc 1.99.0\"); return 0; }\n",
+    );
+    fs::hard_link(rustup, bin.join("rustc")).unwrap();
+    warm_executable(&bin.join("rustc"));
+    assert!(
+        Command::new("mkfifo")
+            .arg(rustup_home.join("settings.toml"))
+            .status()
+            .unwrap()
+            .success()
+    );
+    let hex = theme_hex(&sandbox, instance, "fifo-rust");
+    let (child, mut stdin, mut stdout) = spawn_client_daemon(&sandbox, instance, &hex, &[]);
+    let mut child = ChildGuard::new(child);
+    let (records, received) = std::sync::mpsc::channel();
+    let reader = thread::spawn(move || {
+        for generation in 1..=2 {
+            let response = read_until_done(&mut stdout, generation);
+            if records.send(response).is_err() {
+                return;
+            }
+        }
+    });
+    for generation in 1..=2 {
+        stdin
+            .write_all(&client_request_with_env(
+                generation,
+                sandbox.home.as_os_str().as_bytes(),
+                &[
+                    ("PATH", bin.to_str().unwrap()),
+                    ("RUSTUP_HOME", rustup_home.to_str().unwrap()),
+                ],
+            ))
+            .unwrap();
+        stdin.flush().unwrap();
+        // The previous client hung past 900 ms without emitting any records.
+        // Keep a bounded reader so that regression fails rather than hanging.
+        let response = received
+            .recv_timeout(Duration::from_millis(900))
+            .expect("FIFO selector defeated the prompt deadline");
+        assert!(
+            response.iter().any(|record| record.contains("1.99.0")),
+            "fallback Rust value missing: {response:?}"
+        );
+    }
+    reader.join().unwrap();
+    drop(stdin);
+    assert!(
+        wait_for_exit(child.child(), Duration::from_millis(500))
+            .unwrap()
+            .success()
+    );
+    child.wait().unwrap();
+}
+
+fn install_ceiling_git_fixture(sandbox: &Sandbox) -> (PathBuf, PathBuf, PathBuf) {
+    let repo = sandbox.home.join("repo");
+    let child = repo.join("child");
+    fs::create_dir_all(&child).unwrap();
+    let git = |ceiling: &Path, explicit: bool| {
+        let mut command = Command::new("git");
+        command
+            .env_clear()
+            .env("HOME", &sandbox.home)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CEILING_DIRECTORIES", ceiling)
+            .current_dir(&child);
+        if explicit {
+            command.env("GIT_DIR", "../.git");
+        }
+        command
+    };
+    assert_success(
+        &git(Path::new(""), false)
+            .args(["init", "-q", "-b", "main", repo.to_str().unwrap()])
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(
+        git(&repo, false)
+            .args(["rev-parse", "--show-toplevel"])
+            .output()
+            .unwrap()
+            .status
+            .code(),
+        Some(128)
+    );
+    assert_success(
+        &git(&child, false)
+            .args(["rev-parse", "--show-toplevel"])
+            .output()
+            .unwrap(),
+    );
+    assert_success(
+        &git(&repo, true)
+            .args(["rev-parse", "--git-dir"])
+            .output()
+            .unwrap(),
+    );
+
+    // This deterministic server reports main for every query and records the
+    // exact routing path. A rejected discovery must not reach it at all.
+    let log = sandbox.home.join("git-queries");
+    let fake = compile_c(
+        sandbox,
+        "gitstatusd",
+        &format!(
+            r#"
+#include <stdio.h>
+#include <string.h>
+int main(void) {{
+    char request[8192];
+    size_t length = 0;
+    int byte;
+    while ((byte = getchar()) != EOF) {{
+        if (byte != 30) {{
+            if (length + 1 >= sizeof(request)) return 1;
+            request[length++] = (char)byte;
+            continue;
+        }}
+        request[length] = 0;
+        char *path = strchr(request, 31);
+        if (!path) return 2;
+        *path++ = 0;
+        FILE *log = fopen("{}", "a");
+        if (!log) return 3;
+        fprintf(log, "%s\n", path);
+        fclose(log);
+        printf("%s\0371\037/fixture\037oid\037main\037\037\037\037\0370\0370\0370\0370\0370\0370\0370\0370\0370\0370\0370\0370\036", request);
+        fflush(stdout);
+        length = 0;
+    }}
+    return 0;
+}}
+"#,
+            log.display()
+        ),
+    );
+    let managed = sandbox.install_fake_gitstatus();
+    fs::copy(fake, managed).unwrap();
+    (repo, child, log)
+}
+
+#[test]
+fn client_git_ceilings_skip_server_queries_and_preserve_explicit_routing() {
+    let sandbox = Sandbox::new();
+    let (repo, child, log) = install_ceiling_git_fixture(&sandbox);
+    let instance = format!("git-ceilings-{}", SEQUENCE.fetch_add(1, Ordering::Relaxed));
+    write_git_theme(&sandbox, "gitonly");
+    let (server, socket) = spawn_server(&sandbox, &instance);
+    let hex = theme_hex(&sandbox, &instance, "gitonly");
+    let (client, mut stdin, mut stdout) = spawn_client_daemon(&sandbox, &instance, &hex, &[]);
+    let mut client = ChildGuard::new(client);
+    let cwd = child.as_os_str().as_bytes();
+    let repo_string = repo.to_str().unwrap();
+    let blocked = send_and_read_until_done(
+        &mut stdin,
+        &mut stdout,
+        1,
+        cwd,
+        &[("GIT_CEILING_DIRECTORIES", repo_string)],
+    );
+    assert!(
+        blocked
+            .iter()
+            .any(|record| record == "ZTHEME1\t1\tsegment\tgit\t\n"),
+        "{blocked:?}"
+    );
+    assert!(!log.exists(), "ceiling miss sent a server query");
+    let cases = [
+        (
+            2,
+            vec![("GIT_CEILING_DIRECTORIES", child.to_str().unwrap())],
+        ),
+        (3, vec![]),
+        (
+            4,
+            vec![
+                ("GIT_CEILING_DIRECTORIES", repo_string),
+                ("GIT_DIR", "../.git"),
+            ],
+        ),
+    ];
+    for (generation, environment) in cases {
+        let records =
+            send_and_read_until_done(&mut stdin, &mut stdout, generation, cwd, &environment);
+        assert!(
+            records.iter().any(|record| record.contains("main")),
+            "{records:?}"
+        );
+    }
+    assert_eq!(
+        fs::read_to_string(&log)
+            .unwrap()
+            .lines()
+            .collect::<Vec<_>>(),
+        vec![
+            fs::canonicalize(&repo)
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .to_owned(),
+            fs::canonicalize(&repo)
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .to_owned(),
+            format!(":{}/../.git", child.display()),
+        ]
+    );
+    // A later rejected request cannot reuse or refresh the previous Git result.
+    let blocked_again = send_and_read_until_done(
+        &mut stdin,
+        &mut stdout,
+        5,
+        cwd,
+        &[("GIT_CEILING_DIRECTORIES", repo_string)],
+    );
+    assert!(
+        blocked_again
+            .iter()
+            .any(|record| record == "ZTHEME1\t5\tsegment\tgit\t\n")
+    );
+    assert_eq!(fs::read_to_string(log).unwrap().lines().count(), 3);
+    drop(stdin);
+    assert!(
+        wait_for_exit(client.child(), PROCESS_TIMEOUT)
+            .unwrap()
+            .success()
+    );
+    client.wait().unwrap();
+    shutdown_server(server, &socket);
+}
+
+#[test]
 fn client_daemon_serves_git_requests_with_correct_generation() {
     let sandbox = Sandbox::new();
     sandbox.install_fake_gitstatus();
@@ -1960,6 +2429,89 @@ fn client_daemon_applies_per_request_environment() {
             .success()
     );
     shutdown_server(server, &socket);
+}
+
+#[test]
+fn runtime_cache_transport_failure_falls_back_to_execution() {
+    assert_runtime_cache_failure_falls_back(false);
+}
+
+#[test]
+fn runtime_cache_reacquire_transport_failure_falls_back_to_execution() {
+    assert_runtime_cache_failure_falls_back(true);
+}
+
+fn assert_runtime_cache_failure_falls_back(corrupt_hit: bool) {
+    use std::os::unix::net::UnixListener;
+
+    let sandbox = Sandbox::new();
+    let instance = format!(
+        "cache-fallback-{}",
+        SEQUENCE.fetch_add(1, Ordering::Relaxed)
+    );
+    write_python_env_theme(&sandbox, "counting-python");
+    let counter = sandbox.home.join("python-count");
+    fs::write(&counter, b"0\n").unwrap();
+    let path = install_counting_python(&sandbox, "3.12.0", &counter);
+    warm_executable(&sandbox.home.join("counting-bin/python"));
+    fs::write(&counter, b"0\n").unwrap();
+    fs::write(sandbox.home.join("pyproject.toml"), "[]\n").unwrap();
+    let (server, socket) = spawn_server(&sandbox, &instance);
+    let hex = theme_hex(&sandbox, &instance, "counting-python");
+    shutdown_server(server, &socket);
+
+    // Capacity exhaustion uses the existing error/connection-close path.
+    // A scripted peer isolates that boundary without racing 400ms leases.
+    let listener = UnixListener::bind(&socket).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let peer = thread::spawn(move || {
+        let operations: &[u8] = if corrupt_hit { &[1, 6, 1] } else { &[1] };
+        for (index, operation) in operations.iter().enumerate() {
+            let deadline = Instant::now() + PROCESS_TIMEOUT;
+            let mut stream = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(Instant::now() < deadline, "cache request did not arrive");
+                        thread::sleep(Duration::from_millis(1));
+                    }
+                    Err(error) => panic!("cache peer accept failed: {error}"),
+                }
+            };
+            stream.set_read_timeout(Some(PROCESS_TIMEOUT)).unwrap();
+            let mut request = [0; 37];
+            stream.read_exact(&mut request).unwrap();
+            assert_eq!(&request[..5], &[b'Z', b'T', 0, 2, *operation]);
+            if corrupt_hit && index == 0 {
+                stream.write_all(&[1, 0, 0, 0, 0]).unwrap();
+            } else if *operation == 6 {
+                stream.write_all(&[3]).unwrap();
+            }
+            // Drop the final acquire without a response, as the real daemon
+            // does when its owner lease capacity is exhausted.
+        }
+    });
+    let (mut child, mut stdin, mut stdout) = spawn_client_daemon(&sandbox, &instance, &hex, &[]);
+    let records = send_and_read_until_done(
+        &mut stdin,
+        &mut stdout,
+        1,
+        sandbox.home.to_str().unwrap().as_bytes(),
+        &[("PATH", &path)],
+    );
+    peer.join().unwrap();
+    assert!(python_fragment(&records).contains("3.12.0"), "{records:?}");
+    assert!(
+        !records.iter().any(|record| record.contains("\terror\t")),
+        "{records:?}"
+    );
+    assert_eq!(fs::read_to_string(counter).unwrap().trim(), "1");
+    drop(stdin);
+    assert!(
+        wait_for_exit(&mut child, PROCESS_TIMEOUT)
+            .unwrap()
+            .success()
+    );
 }
 
 #[test]
@@ -2671,6 +3223,535 @@ fn direct_julia_and_r_survive_launcher_selector_switches() {
 }
 
 #[test]
+fn runtime_stream_emits_fast_node_before_delayed_python() {
+    assert_runtime_streaming(false);
+}
+
+#[test]
+fn runtime_stream_emits_warm_cache_hit_before_volatile_sibling() {
+    assert_runtime_streaming(true);
+}
+
+fn assert_runtime_streaming(volatile_python: bool) {
+    let sandbox = Sandbox::new();
+    let instance = format!(
+        "runtime-stream-{}",
+        SEQUENCE.fetch_add(1, Ordering::Relaxed)
+    );
+    sandbox.write_theme(
+        "stream-runtimes",
+        "version = 1\n[layout]\nlines = [[\"python\", \"node\", \"ruby\"]]\nright = []\nblank_line_before = false\n",
+    );
+    fs::write(sandbox.home.join("package.json"), b"{}\n").unwrap();
+    fs::write(sandbox.home.join("pyproject.toml"), b"[project]\n").unwrap();
+    let finished = sandbox.home.join("python-finished");
+    let release_python = sandbox.home.join("python-release");
+    // Warming may complete immediately. Real requests release Python only
+    // after observing Node, so ordering does not depend on a fixed sleep
+    // consuming most of the production command's 250 ms budget.
+    fs::write(&release_python, b"").unwrap();
+    let mut python_path = install_fake_python(
+        &sandbox,
+        &format!(
+            "#include <stdio.h>\n#include <unistd.h>\nint main(void) {{ while (access(\"{}\", F_OK) != 0) usleep(1000); FILE *f = fopen(\"{}\", \"w\"); if (!f || fclose(f) != 0) return 1; puts(\"Python 3.12.0\"); return 0; }}\n",
+            release_python.display(),
+            finished.display(),
+        ),
+    );
+    if volatile_python {
+        // An unrecognized manager's native shim is deliberately volatile.
+        // Keeping both fixtures native avoids shell/sleep startup consuming
+        // the command's 250 ms deadline on a cold system.
+        let shims = sandbox.home.join("unknown/shims");
+        fs::create_dir_all(&shims).unwrap();
+        fs::copy(Path::new(&python_path).join("python"), shims.join("python")).unwrap();
+        warm_executable(&shims.join("python"));
+        shims.to_str().unwrap().clone_into(&mut python_path);
+    }
+    let node_counter = sandbox.home.join("node-count");
+    let node_path = install_counting_native(&sandbox, "node", "v24.5.0", &node_counter);
+    warm_executable(&Path::new(&node_path).join("node"));
+    fs::write(&node_counter, b"0\n").unwrap();
+    let path = format!("{node_path}:{python_path}");
+    let (server, socket) = spawn_server(&sandbox, &instance);
+    let hex = theme_hex(&sandbox, &instance, "stream-runtimes");
+    let (child, mut stdin, mut stdout) = spawn_client_daemon(&sandbox, &instance, &hex, &[]);
+    let mut child = ChildGuard::new(child);
+    let (sender, received) = std::sync::mpsc::channel();
+    let reader_finished = finished.clone();
+    let reader = thread::spawn(move || {
+        let mut record = String::new();
+        while stdout.read_line(&mut record).unwrap() != 0 {
+            if sender
+                .send((record.clone(), reader_finished.exists()))
+                .is_err()
+            {
+                return;
+            }
+            record.clear();
+        }
+    });
+    // The second volatile generation proves Node came from its warm cache,
+    // while Python still runs independently. Native Python is tested cold.
+    for generation in 1..=if volatile_python { 2 } else { 1 } {
+        fs::remove_file(&release_python).unwrap();
+        fs::remove_file(&finished).unwrap();
+        stdin
+            .write_all(&client_request_with_env(
+                generation,
+                sandbox.home.as_os_str().as_bytes(),
+                &[("PATH", &path)],
+            ))
+            .unwrap();
+        stdin.flush().unwrap();
+        let mut records = Vec::new();
+        loop {
+            let (record, python_finished) = received.recv_timeout(PROCESS_TIMEOUT).unwrap();
+            if record.contains("\tsegment\tnode\t") {
+                assert!(!python_finished, "Node waited for Python: {record}");
+                assert!(record.contains("24.5.0"), "{record}");
+                fs::write(&release_python, b"").unwrap();
+            }
+            let done = record.ends_with("\tdone\n");
+            records.push(record);
+            if done {
+                break;
+            }
+        }
+        assert_runtime_stream_records(&records);
+        assert!(finished.exists(), "volatile Python did not execute");
+        assert_eq!(fs::read_to_string(&node_counter).unwrap().trim(), "1");
+    }
+    drop(stdin);
+    assert!(
+        wait_for_exit(child.child(), PROCESS_TIMEOUT)
+            .unwrap()
+            .success()
+    );
+    reader.join().unwrap();
+    shutdown_server(server, &socket);
+}
+
+fn assert_runtime_stream_records(records: &[String]) {
+    let position = |field: &str| {
+        records
+            .iter()
+            .position(|record| record.contains(field))
+            .unwrap()
+    };
+    assert!(
+        position("\tsegment\tnode\t") < position("\tsegment\tpython\t"),
+        "{records:?}"
+    );
+    assert!(
+        position("\tsegment\tpython\t") < position("\tcomplete\truntime"),
+        "{records:?}"
+    );
+    assert!(
+        position("\tcomplete\truntime") < position("\tdone"),
+        "{records:?}"
+    );
+    assert!(python_fragment(records).contains("3.12.0"), "{records:?}");
+    assert_eq!(
+        records
+            .iter()
+            .filter(|record| record.contains("\tsegment\truby\t"))
+            .count(),
+        1
+    );
+    assert!(
+        records
+            .iter()
+            .any(|record| record.ends_with("\tsegment\truby\t\n")),
+        "{records:?}"
+    );
+}
+
+#[test]
+fn shell_runtime_stream_buffers_locked_groups_and_redraws_unlocked_changes() {
+    let sandbox = Sandbox::new();
+    sandbox.write_theme(
+        "stream-runtimes",
+        "version = 1\n[layout]\nlines = [[\"python\", \"node\"]]\nright = []\nblank_line_before = false\n",
+    );
+    let script = r#"
+eval "$("$ZTHEME_TEST_BIN" init zsh --theme stream-runtimes)" || exit 10
+functions[_ztheme_test_render_layout]=$functions[_ztheme_render_layout]
+typeset -gi renders=0
+_ztheme_render_layout() { (( ++renders )); _ztheme_test_render_layout; }
+record() {
+    local fd
+    exec {fd}< <(print -r -- "$1")
+    _ztheme_async_callback "$fd" 2>/dev/null
+    exec {fd}<&-
+}
+ZTHEME_GENERATION=7
+__ZTHEME_LOCK_RUNTIME=0
+record $'ZTHEME1\t7\tsegment\tnode\tNODE'
+[[ $renders == 1 && $ZTHEME_PROMPT == *NODE* ]] || exit 11
+record $'ZTHEME1\t7\tsegment\tnode\tNODE'
+record $'ZTHEME1\t7\tsegment\tpython\t'
+[[ $renders == 1 ]] || exit 12
+record $'ZTHEME1\t6\tsegment\tpython\tSTALE'
+record $'ZTHEME1\t6\tcomplete\truntime'
+record $'ZTHEME1\t6\tdone'
+[[ $renders == 1 && -z $ZTHEME_SEGMENT_PYTHON ]] || exit 13
+record $'ZTHEME1\t7\tsegment\tpython\tPYTHON'
+[[ $renders == 2 && $ZTHEME_PROMPT == *NODE* && $ZTHEME_PROMPT == *PYTHON* ]] || exit 14
+record $'ZTHEME1\t7\tcomplete\truntime'
+record $'ZTHEME1\t7\tdone'
+[[ $renders == 2 ]] || exit 15
+
+ZTHEME_GENERATION=8
+_ztheme_clear_async_segments
+__ZTHEME_LOCK_RUNTIME=1
+ZTHEME_LOCKED_PENDING=1
+renders=0
+record $'ZTHEME1\t8\tsegment\tnode\tLOCKED-NODE'
+record $'ZTHEME1\t7\tcomplete\truntime'
+record $'ZTHEME1\t7\tdone'
+[[ $renders == 0 && $ZTHEME_LOCKED_PENDING == 1 ]] || exit 16
+record $'ZTHEME1\t8\tsegment\tpython\tLOCKED-PYTHON'
+[[ $renders == 0 ]] || exit 17
+record $'ZTHEME1\t8\tcomplete\truntime'
+[[ $renders == 1 && $ZTHEME_LOCKED_PENDING == 0 && $ZTHEME_PROMPT == *LOCKED-NODE* && $ZTHEME_PROMPT == *LOCKED-PYTHON* ]] || exit 18
+record $'ZTHEME1\t8\tdone'
+[[ $renders == 1 ]] || exit 19
+
+# Deadline done releases a group even when its completion never arrived.
+ZTHEME_GENERATION=9
+_ztheme_clear_async_segments
+ZTHEME_LOCKED_PENDING=1
+renders=0
+record $'ZTHEME1\t9\tsegment\tnode\tPARTIAL'
+record $'ZTHEME1\t9\tdone'
+[[ $renders == 1 && $ZTHEME_LOCKED_PENDING == 0 && $ZTHEME_PROMPT == *PARTIAL* ]] || exit 20
+record $'ZTHEME1\t9\tdone'
+[[ $renders == 1 ]] || exit 21
+"#;
+    assert_success(&sandbox.zsh(script));
+}
+
+#[test]
+fn shell_context_key_tracks_home_and_git_ceilings_without_gating_requests() {
+    let sandbox = Sandbox::new();
+    sandbox.write_theme(
+        "context-key",
+        "version = 1\n[layout]\nlines = [[\"directory\"]]\nright = []\n",
+    );
+    let script = r#"
+eval "$("$ZTHEME_TEST_BIN" init zsh --theme context-key)" || exit 10
+# Isolate the real precmd/key logic without starting transport or rendering.
+typeset -gi starts=0 clears=0
+_ztheme_start_worker() { (( ++starts )); }
+_ztheme_compute_sync_segments() { :; }
+_ztheme_render_layout() { :; }
+_ztheme_clear_async_segments() { ZTHEME_SEGMENT_NODE=''; (( ++clears )); }
+HOME=/home-one
+GIT_CEILING_DIRECTORIES=/ceiling-one
+_ztheme_precmd
+[[ $starts == 1 && $clears == 1 ]] || exit 11
+initial_key=$ZTHEME_CONTEXT_KEY
+
+ZTHEME_SEGMENT_NODE=old-node
+ZTHEME_LAST_ERROR=old-error
+_ztheme_precmd
+[[ $starts == 2 && $clears == 1 && $ZTHEME_CONTEXT_KEY == "$initial_key" ]] || exit 12
+[[ $ZTHEME_SEGMENT_NODE == old-node && $ZTHEME_LAST_ERROR == old-error ]] || exit 13
+
+HOME=/home-two
+_ztheme_precmd
+[[ $starts == 3 && $clears == 2 && $ZTHEME_CONTEXT_KEY != "$initial_key" ]] || exit 14
+[[ -z $ZTHEME_SEGMENT_NODE && -z $ZTHEME_LAST_ERROR ]] || exit 15
+home_key=$ZTHEME_CONTEXT_KEY
+
+ZTHEME_SEGMENT_NODE=old-node
+ZTHEME_LAST_ERROR=old-error
+GIT_CEILING_DIRECTORIES=/ceiling-two
+_ztheme_precmd
+[[ $starts == 4 && $clears == 3 && $ZTHEME_CONTEXT_KEY != "$home_key" ]] || exit 16
+[[ -z $ZTHEME_SEGMENT_NODE && -z $ZTHEME_LAST_ERROR ]] || exit 17
+"#;
+    assert_success(&sandbox.zsh(script));
+}
+
+#[test]
+fn failing_runtime_does_not_prevent_sibling_values_from_being_persisted() {
+    let sandbox = Sandbox::new();
+    let instance = format!(
+        "runtime-cache-partial-{}",
+        SEQUENCE.fetch_add(1, Ordering::Relaxed)
+    );
+    sandbox.write_theme(
+        "partial-runtimes",
+        "version = 1\n[layout]\nlines = [[\"node\", \"python\"]]\nright = []\nseparator = \" | \"\nblank_line_before = false\n",
+    );
+    fs::write(sandbox.home.join("package.json"), b"{}\n").unwrap();
+    fs::write(sandbox.home.join("pyproject.toml"), b"[project]\n").unwrap();
+    let node_counter = sandbox.home.join("node-count");
+    let python_counter = sandbox.home.join("python-count");
+    let node_path = install_counting_native(&sandbox, "node", "v24.5.0", &node_counter);
+    let python_path =
+        install_counting_native(&sandbox, "python", "invalid version", &python_counter);
+    for (path, program, counter) in [
+        (&node_path, "node", &node_counter),
+        (&python_path, "python", &python_counter),
+    ] {
+        warm_executable(&Path::new(path).join(program));
+        fs::write(counter, b"0\n").unwrap();
+    }
+    let path = format!("{node_path}:{python_path}");
+    let (server, socket) = spawn_server(&sandbox, &instance);
+    let hex = theme_hex(&sandbox, &instance, "partial-runtimes");
+    let cwd = sandbox.home.to_str().unwrap().as_bytes().to_vec();
+    let (mut child, mut stdin, mut stdout) = spawn_client_daemon(&sandbox, &instance, &hex, &[]);
+    for generation in 1..=3 {
+        let records = send_and_read_until_done(
+            &mut stdin,
+            &mut stdout,
+            generation,
+            &cwd,
+            &[("PATH", &path)],
+        );
+        assert!(
+            records
+                .iter()
+                .any(|record| record.contains("\tsegment\tnode\t") && record.contains("24.5.0")),
+            "{records:?}"
+        );
+        assert!(python_fragment(&records).is_empty(), "{records:?}");
+        assert!(
+            records
+                .iter()
+                .any(|record| record.ends_with("\tsegment\tpython\t\n")),
+            "failed selection lacked its empty record: {records:?}"
+        );
+    }
+    assert_eq!(fs::read_to_string(&node_counter).unwrap().trim(), "1");
+    assert_eq!(fs::read_to_string(&python_counter).unwrap().trim(), "3");
+    drop(stdin);
+    assert!(
+        wait_for_exit(&mut child, PROCESS_TIMEOUT)
+            .unwrap()
+            .success()
+    );
+    shutdown_server(server, &socket);
+
+    // Independent successes survive a disk-cache reload too, while the failing
+    // singleton is still retried rather than becoming a cache entry.
+    let (server, socket) = spawn_server(&sandbox, &instance);
+    let (mut child, mut stdin, mut stdout) = spawn_client_daemon(&sandbox, &instance, &hex, &[]);
+    let records = send_and_read_until_done(&mut stdin, &mut stdout, 4, &cwd, &[("PATH", &path)]);
+    assert!(
+        records
+            .iter()
+            .any(|record| record.contains("\tsegment\tnode\t") && record.contains("24.5.0")),
+        "{records:?}"
+    );
+    assert!(python_fragment(&records).is_empty(), "{records:?}");
+    assert_eq!(fs::read_to_string(&node_counter).unwrap().trim(), "1");
+    assert_eq!(fs::read_to_string(&python_counter).unwrap().trim(), "4");
+    drop(stdin);
+    assert!(
+        wait_for_exit(&mut child, PROCESS_TIMEOUT)
+            .unwrap()
+            .success()
+    );
+    shutdown_server(server, &socket);
+}
+
+#[test]
+fn independent_runtime_cache_acquires_are_in_flight_together() {
+    use std::os::unix::net::UnixListener;
+
+    let sandbox = Sandbox::new();
+    let instance = format!(
+        "cache-concurrent-acquire-{}",
+        SEQUENCE.fetch_add(1, Ordering::Relaxed)
+    );
+    sandbox.write_theme(
+        "concurrent-runtimes",
+        "version = 1\n[layout]\nlines = [[\"node\", \"python\"]]\nright = []\nseparator = \" | \"\nblank_line_before = false\n",
+    );
+    fs::write(sandbox.home.join("package.json"), b"{}\n").unwrap();
+    fs::write(sandbox.home.join("pyproject.toml"), b"[project]\n").unwrap();
+    // Simple native identities let the peer test acquire ordering; after the
+    // corrupt replies these commands can execute through uncached fallback.
+    let bin = sandbox.home.join("native-bin");
+    fs::create_dir(&bin).unwrap();
+    for program in ["node", "python"] {
+        fs::copy("/bin/echo", bin.join(program)).unwrap();
+    }
+    let (server, socket) = spawn_server(&sandbox, &instance);
+    let hex = theme_hex(&sandbox, &instance, "concurrent-runtimes");
+    shutdown_server(server, &socket);
+    let listener = UnixListener::bind(&socket).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let peer = thread::spawn(move || {
+        let mut streams = Vec::new();
+        let deadline = Instant::now() + PROCESS_TIMEOUT;
+        // Neither response is sent until both requests have arrived. Serial
+        // socket roundtrips cannot satisfy this barrier within a prompt.
+        while streams.len() < 2 {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    // macOS may inherit the listener's nonblocking mode;
+                    // read_exact must wait for the client's request bytes.
+                    stream.set_nonblocking(false).unwrap();
+                    stream.set_read_timeout(Some(PROCESS_TIMEOUT)).unwrap();
+                    let mut request = [0; 37];
+                    stream.read_exact(&mut request).unwrap();
+                    assert_eq!(&request[..5], &[b'Z', b'T', 0, 2, 1]);
+                    streams.push((stream, request));
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    assert!(
+                        Instant::now() < deadline,
+                        "independent acquires were serialized"
+                    );
+                    thread::sleep(Duration::from_millis(1));
+                }
+                Err(error) => panic!("cache accept failed: {error}"),
+            }
+        }
+        assert_ne!(
+            streams[0].1[5..],
+            streams[1].1[5..],
+            "identities were aggregated"
+        );
+        // The peer need not infer hashed IDs: give each key an invalid value,
+        // close the listener, and let each runtime independently fall back.
+        for (mut stream, _) in streams {
+            stream.write_all(&[1, 0, 0, 0, 0]).unwrap();
+        }
+    });
+    let path = bin.to_str().unwrap();
+    let (mut child, mut stdin, mut stdout) = spawn_client_daemon(&sandbox, &instance, &hex, &[]);
+    let records = send_and_read_until_done(
+        &mut stdin,
+        &mut stdout,
+        1,
+        sandbox.home.to_str().unwrap().as_bytes(),
+        &[("PATH", path)],
+    );
+    peer.join().unwrap();
+    assert!(
+        records
+            .iter()
+            .any(|record| record.contains("\tcomplete\truntime")),
+        "{records:?}"
+    );
+    drop(stdin);
+    assert!(
+        wait_for_exit(&mut child, PROCESS_TIMEOUT)
+            .unwrap()
+            .success()
+    );
+}
+
+#[test]
+fn runtime_selection_change_during_execution_retries_only_that_runtime() {
+    assert_runtime_selection_retry(false);
+}
+
+#[test]
+fn repeatedly_unstable_runtime_selection_does_not_render_or_cache_old_values() {
+    assert_runtime_selection_retry(true);
+}
+
+fn assert_runtime_selection_retry(unstable: bool) {
+    let sandbox = Sandbox::new();
+    let instance = format!(
+        "cache-selection-retry-{}",
+        SEQUENCE.fetch_add(1, Ordering::Relaxed)
+    );
+    sandbox.write_theme(
+        "retry-runtimes",
+        "version = 1\n[layout]\nlines = [[\"node\", \"python\"]]\nright = []\nseparator = \" | \"\nblank_line_before = false\n",
+    );
+    let counter = sandbox.home.join("python-count");
+    let (root, project) = install_pyenv_fixture(&sandbox, &counter);
+    fs::create_dir_all(&project).unwrap();
+    fs::write(project.join("package.json"), b"{}\n").unwrap();
+    fs::write(project.join("pyproject.toml"), b"[project]\n").unwrap();
+    let selector = project.join(".python-version");
+    for (version, next) in [("3.11", "3.12"), ("3.12", "3.11")] {
+        if version == "3.12" && !unstable {
+            continue;
+        }
+        let binary = compile_c(
+            &sandbox,
+            &format!("switch-{version}"),
+            &format!(
+                "#include <stdio.h>\nint main(void) {{ FILE *f = fopen(\"{}\", \"w\"); if (!f) return 1; fputs(\"{next}\\n\", f); fclose(f); puts(\"Python {version}.0\"); return 0; }}\n",
+                selector.display(),
+            ),
+        );
+        let target = root.join(format!("versions/{version}/bin/python"));
+        // Replace the inode instead of overwriting a warmed Mach-O executable:
+        // macOS may retain code-signature pages for the old inode.
+        fs::remove_file(&target).unwrap();
+        fs::copy(binary, &target).unwrap();
+        warm_executable(&target);
+    }
+    fs::write(&selector, b"3.11\n").unwrap();
+    fs::write(&counter, b"0\n").unwrap();
+    let node_counter = sandbox.home.join("node-count");
+    let node_path = install_counting_native(&sandbox, "node", "v24.5.0", &node_counter);
+    warm_executable(&Path::new(&node_path).join("node"));
+    fs::write(&node_counter, b"0\n").unwrap();
+    let path = format!("{}:{node_path}", root.join("shims").display());
+    let (server, socket) = spawn_server(&sandbox, &instance);
+    let hex = theme_hex(&sandbox, &instance, "retry-runtimes");
+    let (mut child, mut stdin, mut stdout) = spawn_client_daemon(&sandbox, &instance, &hex, &[]);
+    for generation in 1..=2 {
+        let records = send_and_read_until_done(
+            &mut stdin,
+            &mut stdout,
+            generation,
+            project.to_str().unwrap().as_bytes(),
+            &[("PATH", &path)],
+        );
+        let python = python_fragment(&records);
+        if unstable {
+            assert!(
+                python.is_empty(),
+                "unstable selection rendered a stale value: {records:?}"
+            );
+            assert_eq!(fs::read_to_string(&selector).unwrap(), "3.11\n");
+        } else {
+            assert!(
+                python.contains("3.12.0"),
+                "selection was not retried: {records:?}"
+            );
+            assert_eq!(
+                fs::read_to_string(&counter).unwrap().trim(),
+                "1",
+                "retry was not cached"
+            );
+        }
+        assert!(
+            records
+                .iter()
+                .any(|record| record.contains("\tsegment\tnode\t") && record.contains("24.5.0")),
+            "{records:?}"
+        );
+        assert_eq!(
+            fs::read_to_string(&node_counter).unwrap().trim(),
+            "1",
+            "sibling was retried"
+        );
+    }
+    drop(stdin);
+    assert!(
+        wait_for_exit(&mut child, PROCESS_TIMEOUT)
+            .unwrap()
+            .success()
+    );
+    shutdown_server(server, &socket);
+}
+
+#[test]
 fn concurrent_cold_prompts_execute_one_runtime_command() {
     let sandbox = Sandbox::new();
     let instance = format!(
@@ -2797,6 +3878,18 @@ fn persisted_runtime_entries_survive_a_daemon_restart() {
 #[test]
 fn client_daemon_cancels_in_flight_work_without_emitting_stale_records() {
     let sandbox = Sandbox::new();
+    // Discovery now skips Git queries outside repositories. This test needs
+    // a real repository so its delayed fake server still exercises in-flight
+    // cancellation rather than an immediately completed empty Git segment.
+    assert_success(
+        &Command::new("git")
+            .env_clear()
+            .env("HOME", &sandbox.home)
+            .args(["init", "-q"])
+            .arg(&sandbox.home)
+            .output()
+            .unwrap(),
+    );
     let instance = format!("client-cancel-{}", SEQUENCE.fetch_add(1, Ordering::Relaxed));
     write_git_theme(&sandbox, "gitonly");
     install_delayed_gitstatusd(&sandbox);
@@ -2835,6 +3928,222 @@ fn client_daemon_cancels_in_flight_work_without_emitting_stale_records() {
             .success()
     );
     shutdown_server(server, &socket);
+}
+
+/// Records exact fixture identities and cleans them up even if an assertion
+/// fails and the client guard has to kill the client rather than send EOF.
+struct RuntimeGroupFixture {
+    executable: PathBuf,
+    marker: PathBuf,
+}
+
+impl RuntimeGroupFixture {
+    fn new(sandbox: &Sandbox, mode: &str) -> Self {
+        let marker = sandbox.home.join("runtime-group-pids");
+        let source = format!(
+            r#"
+#include <stdio.h>
+#include <string.h>
+#include <sys/wait.h>
+#include <unistd.h>
+int main(int argc, char **argv) {{
+    if (argc == 1) return 0; /* warm the loader without spawning descendants */
+    pid_t descendant = fork();
+    if (descendant < 0) return 1;
+    if (descendant == 0) {{
+        if (strcmp("{mode}", "success") == 0) {{
+            close(STDOUT_FILENO);
+            close(STDERR_FILENO);
+        }}
+        for (;;) pause();
+    }}
+    FILE *marker = fopen("{}.tmp", "w");
+    if (!marker) return 2;
+    fprintf(marker, "%d %d\n", getpid(), descendant);
+    fclose(marker);
+    if (rename("{}.tmp", "{}") != 0) return 3;
+    if (strcmp("{mode}", "waiting") == 0) waitpid(descendant, NULL, 0);
+    printf("Python 3.12.0\n");
+    return 0;
+}}
+"#,
+            marker.display(),
+            marker.display(),
+            marker.display(),
+        );
+        let executable = compile_c(sandbox, "python", &source);
+        warm_executable(&executable);
+        fs::write(sandbox.home.join("pyproject.toml"), "[]\n").unwrap();
+        Self { executable, marker }
+    }
+
+    fn path(&self) -> &str {
+        self.executable.parent().unwrap().to_str().unwrap()
+    }
+
+    fn pids(&self) -> Vec<u32> {
+        let deadline = Instant::now() + PROCESS_TIMEOUT;
+        loop {
+            if let Ok(marker) = fs::read_to_string(&self.marker) {
+                let pids: Vec<u32> = marker
+                    .split_whitespace()
+                    .map(|pid| pid.parse().unwrap())
+                    .collect();
+                assert_eq!(pids.len(), 2);
+                return pids;
+            }
+            assert!(Instant::now() < deadline, "runtime fixture did not start");
+            thread::sleep(Duration::from_millis(1));
+        }
+    }
+}
+
+impl Drop for RuntimeGroupFixture {
+    fn drop(&mut self) {
+        let Ok(marker) = fs::read_to_string(&self.marker) else {
+            return;
+        };
+        for pid in marker
+            .split_whitespace()
+            .filter_map(|pid| pid.parse::<i32>().ok())
+        {
+            let Ok(output) = Command::new("ps")
+                .args(["-p", &pid.to_string(), "-o", "command="])
+                .output()
+            else {
+                continue;
+            };
+            // Never signal a reused PID or any process outside this sandbox's
+            // exact executable fixture. No broad process-name/group cleanup.
+            if String::from_utf8_lossy(&output.stdout).trim()
+                == format!("{} --version", self.executable.display())
+            {
+                // SAFETY: pid is the positive, identity-checked fixture PID.
+                unsafe { libc::kill(pid, libc::SIGKILL) };
+            }
+        }
+    }
+}
+
+fn assert_runtime_group_removed(pids: &[u32], deadline: Duration) {
+    let start = Instant::now();
+    for pid in pids {
+        assert!(
+            wait_for_pid_exit(*pid, deadline.saturating_sub(start.elapsed())),
+            "runtime process {pid} survived group cleanup"
+        );
+    }
+}
+
+fn check_runtime_group_completion(mode: &str, successful: bool) {
+    let sandbox = Sandbox::new();
+    let instance = format!("runtime-group-{}", SEQUENCE.fetch_add(1, Ordering::Relaxed));
+    write_python_env_theme(&sandbox, "group-python");
+    let fixture = RuntimeGroupFixture::new(&sandbox, mode);
+    let (server, socket) = spawn_server(&sandbox, &instance);
+    let hex = theme_hex(&sandbox, &instance, "group-python");
+    let (child, mut stdin, mut stdout) = spawn_client_daemon(&sandbox, &instance, &hex, &[]);
+    let mut child = ChildGuard::new(child);
+    let started = Instant::now();
+    let fragment = send_python_request(
+        &mut stdin,
+        &mut stdout,
+        1,
+        sandbox.home.as_os_str().as_bytes(),
+        &[("PATH", fixture.path())],
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "runtime exceeded its deadline"
+    );
+    assert_eq!(fragment.contains("3.12.0"), successful, "{fragment}");
+    assert_runtime_group_removed(&fixture.pids(), Duration::from_secs(1));
+    drop(stdin);
+    assert!(
+        wait_for_exit(child.child(), PROCESS_TIMEOUT)
+            .unwrap()
+            .success()
+    );
+    shutdown_server(server, &socket);
+}
+
+#[test]
+fn runtime_process_group_timeout_removes_wrapper_and_descendant() {
+    check_runtime_group_completion("waiting", false);
+}
+
+#[test]
+fn runtime_process_group_timeout_removes_descendant_after_wrapper_exit() {
+    check_runtime_group_completion("exited-with-pipes", false);
+}
+
+#[test]
+fn runtime_process_group_success_reaps_wrapper_and_removes_background_descendant() {
+    check_runtime_group_completion("success", true);
+}
+
+fn check_runtime_group_cancellation(supersede: bool) {
+    let sandbox = Sandbox::new();
+    let instance = format!(
+        "runtime-group-cancel-{}",
+        SEQUENCE.fetch_add(1, Ordering::Relaxed)
+    );
+    write_python_env_theme(&sandbox, "group-python");
+    let fixture = RuntimeGroupFixture::new(&sandbox, "waiting");
+    let (server, socket) = spawn_server(&sandbox, &instance);
+    let hex = theme_hex(&sandbox, &instance, "group-python");
+    let (child, mut stdin, mut stdout) = spawn_client_daemon(&sandbox, &instance, &hex, &[]);
+    let mut child = ChildGuard::new(child);
+    let request_started = Instant::now();
+    stdin
+        .write_all(&client_request_with_env(
+            1,
+            sandbox.home.as_os_str().as_bytes(),
+            &[("PATH", fixture.path())],
+        ))
+        .unwrap();
+    let pids = fixture.pids();
+    if supersede {
+        let empty_project = sandbox.home.join("empty-project");
+        fs::create_dir(&empty_project).unwrap();
+        let records = send_and_read_until_done(
+            &mut stdin,
+            &mut stdout,
+            2,
+            empty_project.as_os_str().as_bytes(),
+            &[],
+        );
+        assert!(!records.is_empty());
+        assert_runtime_group_removed(
+            &pids,
+            Duration::from_millis(200).saturating_sub(request_started.elapsed()),
+        );
+        drop(stdin);
+    } else {
+        drop(stdin);
+        // This deadline is shorter than COMMAND_TIMEOUT: the descendant must
+        // be terminated by EOF cancellation, not merely the command timeout.
+        assert_runtime_group_removed(
+            &pids,
+            Duration::from_millis(200).saturating_sub(request_started.elapsed()),
+        );
+    }
+    assert!(
+        wait_for_exit(child.child(), PROCESS_TIMEOUT)
+            .unwrap()
+            .success()
+    );
+    shutdown_server(server, &socket);
+}
+
+#[test]
+fn runtime_process_group_superseding_request_removes_descendant() {
+    check_runtime_group_cancellation(true);
+}
+
+#[test]
+fn runtime_process_group_client_exit_removes_descendant() {
+    check_runtime_group_cancellation(false);
 }
 
 fn stale_fifo_count() -> usize {
@@ -3509,6 +4818,116 @@ fn daemon_without_gitstatusd_starts_and_serves_the_runtime_cache() {
     let length = u32::from_be_bytes(get[1..5].try_into().unwrap()) as usize;
     assert_eq!(&get[5..5 + length], value);
 
+    shutdown_server(server, &socket);
+}
+
+#[test]
+fn daemon_reclaims_idle_and_partial_connections_and_continues_serving() {
+    let sandbox = Sandbox::new();
+    let instance = format!("frame-bounds-{}", SEQUENCE.fetch_add(1, Ordering::Relaxed));
+    let (server, socket) = spawn_server(&sandbox, &instance);
+    let mut peers = Vec::new();
+    for index in 0..80 {
+        let mut stream = UnixStream::connect(&socket).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        if index == 0 {
+            stream.write_all(b"Z").unwrap();
+        } else if index == 1 {
+            stream.write_all(b"ZT\x00\x02\x01partial-key").unwrap();
+        }
+        peers.push(stream);
+    }
+    // More than the admission budget must neither retain excess tasks nor
+    // prevent all admitted idle/partial frames from being reclaimed.
+    for mut peer in peers {
+        let mut response = Vec::new();
+        peer.read_to_end(&mut response).unwrap();
+        assert!(response.is_empty());
+    }
+    let key = [0_u8; 32];
+    assert_eq!(protocol_exchange(&socket, &[b"ZT\x00\x02\x06", &key]), [3]);
+    shutdown_server(server, &socket);
+}
+
+#[test]
+fn daemon_cancels_disconnected_git_queue_but_drains_the_in_flight_owner() {
+    let sandbox = Sandbox::new();
+    let fake = compile_c(
+        &sandbox,
+        "gated-gitstatusd",
+        r#"#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+int main(void) {
+    char log[4096], gate[4096], starts[4096], request[4096];
+    snprintf(log, sizeof log, "%s/git-requests", getenv("HOME"));
+    snprintf(gate, sizeof gate, "%s/release-git", getenv("HOME"));
+    snprintf(starts, sizeof starts, "%s/git-starts", getenv("HOME"));
+    FILE *file = fopen(starts, "a"); fputs("start\n", file); fclose(file);
+    int byte; size_t length = 0;
+    while ((byte = getchar()) != EOF) {
+        if (byte != 30) { if (length + 1 < sizeof request) request[length++] = (char)byte; continue; }
+        request[length] = 0;
+        char *path = strchr(request, 31); if (!path) return 1; *path++ = 0;
+        file = fopen(log, "a"); fprintf(file, "%s\n", path); fclose(file);
+        if (!strcmp(path, "/first")) { while (access(gate, F_OK)) usleep(1000); }
+        printf("%s\0370\036", request); fflush(stdout); length = 0;
+    }
+    return 0;
+}
+"#,
+    );
+    let managed = sandbox.data.join("ztheme/gitstatus/v1.5/gitstatusd");
+    fs::create_dir_all(managed.parent().unwrap()).unwrap();
+    fs::copy(fake, managed).unwrap();
+    let instance = format!("git-queue-{}", SEQUENCE.fetch_add(1, Ordering::Relaxed));
+    let (server, socket) = spawn_server(&sandbox, &instance);
+    let send = |path: &[u8]| {
+        let mut stream = UnixStream::connect(&socket).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        stream.write_all(b"ZT\x00\x02\x05\x00").unwrap();
+        stream
+            .write_all(&u32::try_from(path.len()).unwrap().to_be_bytes())
+            .unwrap();
+        stream.write_all(path).unwrap();
+        stream
+    };
+    let first = send(b"/first");
+    let log = sandbox.home.join("git-requests");
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while !log.exists() {
+        assert!(Instant::now() < deadline, "first Git query never started");
+        thread::sleep(Duration::from_millis(5));
+    }
+    let obsolete = send(b"/obsolete");
+    let mut live = send(b"/live");
+    thread::sleep(Duration::from_millis(20));
+    drop(obsolete);
+    // Going past the 500 ms frame budget must not abandon an already
+    // in-flight Git exchange or prevent unrelated cache service.
+    thread::sleep(Duration::from_millis(600));
+    assert_eq!(fs::read_to_string(&log).unwrap(), "/first\n");
+    let key = [0_u8; 32];
+    assert_eq!(protocol_exchange(&socket, &[b"ZT\x00\x02\x06", &key]), [3]);
+    drop(first);
+    fs::write(sandbox.home.join("release-git"), b"ready").unwrap();
+    let mut response = Vec::new();
+    live.read_to_end(&mut response).unwrap();
+    assert_eq!(
+        response,
+        [0],
+        "live successor must receive its own Git reply"
+    );
+    assert_eq!(fs::read_to_string(log).unwrap(), "/first\n/live\n");
+    assert_eq!(
+        fs::read_to_string(sandbox.home.join("git-starts")).unwrap(),
+        "start\n"
+    );
     shutdown_server(server, &socket);
 }
 

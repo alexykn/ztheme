@@ -3,9 +3,10 @@
 A Zsh prompt for Git and runtime context, customizable themes, syntax
 highlighting, and autosuggestions.
 
-Git state and language versions are resolved asynchronously. ztheme then
-displays the complete prompt in one update, avoiding partial or visually
-jumping prompt redraws.
+Git state and language versions are resolved asynchronously. By default the
+prompt waits for Git, then runtime values appear incrementally as each command
+or cache lookup finishes. Group locks can instead hold the prompt for all
+asynchronous results when you prefer a single complete redraw.
 
 <p align="center">
   <img src="img/image-two.png" alt="Catppuccin Mocha ztheme prompt with Git status, Rust version, and syntax highlighting">
@@ -187,8 +188,9 @@ runtime_segment = false # don't wait for language/runtime versions (default: fal
   (don't wait).
 
 Setting a group to `true` makes the prompt wait for it (holding the whole
-prompt blank until it resolves, then rendering once); `false` renders as soon
-as every locked group is done and redraws that group in when it is ready. If
+prompt blank until every locked group resolves or the deadline expires);
+`false` lets each of that group's completed values redraw independently once
+the locked groups are done. Lock both groups for one complete redraw. If
 you unlock a group, be aware the prompt's width can change when that segment
 later appears.
 
@@ -307,6 +309,11 @@ below `${XDG_CACHE_HOME:-$HOME/.cache}/ztheme`, and themes below
 A per-shell client daemon renders prompts and talks to a per-user server
 daemon that hosts runtime caching and the persistent `gitstatusd` client.
 Keeping the client alive avoids spawning a process for every prompt.
+Runtime selection is refreshed on every request; successful values are cached
+independently by selected executable and declared command inputs, not by an
+aggregate project snapshot. Unsupported contextual launchers stay uncached.
+Prompt work, runtime commands, filesystem-planning concurrency, daemon
+connections, and cache-owner leases all have explicit bounds.
 See [Architecture](docs/architecture.md) for subsystem ownership, protocols,
 and the runtime-extension workflow. See [Runtime cache](docs/cache.md) for
 cache identities, persistence, and limitations. See [Segments](docs/segments.md)

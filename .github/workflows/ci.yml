@@ -27,7 +27,11 @@ jobs:
       - run: cargo fmt --check
       - run: cargo clippy --all-targets --all-features -- -D warnings -W clippy::pedantic
       - run: cargo package --locked
-      - run: zsh -n shell/ztheme.zsh shell/defaults.zsh
+      - name: Check every Zsh script
+        run: |
+          for script in shell/*.zsh shell/segments/*.zsh tools/*.zsh; do
+            zsh -n "$script" || exit
+          done
 
   test:
     name: Test (${{ matrix.os }})
