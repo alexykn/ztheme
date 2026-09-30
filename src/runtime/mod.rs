@@ -2,16 +2,15 @@ use std::ffi::OsString;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::io::AsyncReadExt;
 use tokio::process::Command;
-use tokio::task::JoinSet;
 use tokio::time::timeout;
 
 pub(crate) mod cache;
 pub(crate) mod detect;
+mod process;
 
 use crate::environment::PromptEnvironment;
 
@@ -144,29 +143,6 @@ fn runtime_environment(runtime: Runtime, environment: &PromptEnvironment) -> Opt
     }
 }
 
-pub(crate) async fn execute_plans(
-    plans: Vec<cache::RuntimePlan>,
-    cwd: PathBuf,
-    environment: Arc<PromptEnvironment>,
-) -> Vec<RuntimeExecution> {
-    let mut tasks = JoinSet::new();
-
-    for plan in plans {
-        let cwd = cwd.clone();
-        let environment = Arc::clone(&environment);
-        tasks.spawn(async move { execute_plan(plan, &cwd, &environment).await });
-    }
-
-    let mut executions = Vec::new();
-    while let Some(result) = tasks.join_next().await {
-        if let Ok(execution) = result {
-            executions.push(execution);
-        }
-    }
-    executions.sort_unstable_by_key(|execution| execution.runtime);
-    executions
-}
-
 pub(crate) fn encode(values: &[CachedRuntimeValue]) -> io::Result<Vec<u8>> {
     let count = u8::try_from(values.len()).map_err(|_| invalid_data("too many runtime values"))?;
     let mut output = Vec::with_capacity(128);
@@ -297,7 +273,7 @@ pub(super) fn compiler_spec(cpp: bool, clang: bool) -> RuntimeSpec {
     }
 }
 
-async fn execute_plan(
+pub(crate) async fn execute_plan(
     plan: cache::RuntimePlan,
     cwd: &Path,
     environment: &PromptEnvironment,
@@ -345,21 +321,20 @@ async fn capture(
             Stdio::piped()
         } else {
             Stdio::null()
-        })
-        .kill_on_drop(true);
+        });
 
-    let mut child = command.spawn().map_err(|error| {
+    let mut child = process::CommandGroup::spawn(&mut command).map_err(|error| {
         if error.kind() == io::ErrorKind::NotFound {
             CaptureError::MissingExecutable
         } else {
             CaptureError::TransientFailure
         }
     })?;
-    let stdout = child.stdout.take().ok_or(CaptureError::TransientFailure)?;
-    let mut stderr = child.stderr.take();
+    let stdout = child.take_stdout().ok_or(CaptureError::TransientFailure)?;
+    let mut stderr = child.take_stderr();
     let merge_stderr = plan.spec.merge_stderr;
 
-    let collected = timeout(COMMAND_TIMEOUT, async move {
+    let collected = timeout(COMMAND_TIMEOUT, async {
         let stdout_task = async {
             let mut bytes = Vec::new();
             stdout
@@ -380,15 +355,24 @@ async fn capture(
             }
             Ok(bytes)
         };
-        let (stdout, stderr, status) = tokio::join!(stdout_task, stderr_task, child.wait());
-        let status = status.map_err(|_| CaptureError::TransientFailure)?;
-        if !status.success() {
-            return Err(CaptureError::TransientFailure);
-        }
+        let (stdout, stderr, exited) = tokio::join!(stdout_task, stderr_task, child.exited());
+        exited.map_err(|_| CaptureError::TransientFailure)?;
         Ok((stdout?, stderr?))
     })
-    .await
-    .map_err(|_| CaptureError::TransientFailure)??;
+    .await;
+
+    // Timeout/I/O failures drop the guard: kill the group immediately and
+    // arrange reaping without extending the command deadline to await exit.
+    let collected = collected.map_err(|_| CaptureError::TransientFailure)??;
+    // On success the leader is already exited but unreaped. Clean up its group
+    // before releasing the PGID; cancellation during this wait uses the guard.
+    let status = child
+        .finish()
+        .await
+        .map_err(|_| CaptureError::TransientFailure)?;
+    if !status.success() {
+        return Err(CaptureError::TransientFailure);
+    }
 
     let mut bytes = collected.0;
     if merge_stderr {

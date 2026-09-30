@@ -4,10 +4,10 @@ use std::io;
 use crate::runtime::Runtime;
 
 use super::{
-    LayoutSegment, MAX_LAYOUT_LINES, MAX_LAYOUT_SEGMENTS, MAX_SEGMENT_SPACING, SegmentId, Spacing,
-    Theme, ValidatedLayout, contains_control, git_symbol_values, highlight_style, invalid,
-    palette_color, segments::valid_custom_identifier, style_open, valid_color, valid_identifier,
-    valid_syntax_style_name,
+    CustomSegmentTheme, LayoutSegment, MAX_LAYOUT_LINES, MAX_LAYOUT_SEGMENTS, MAX_SEGMENT_SPACING,
+    SegmentId, Spacing, Theme, ValidatedLayout, contains_control, git_symbol_values,
+    highlight_style, invalid, palette_color, segments::valid_custom_identifier, style_open,
+    valid_color, valid_identifier, valid_syntax_style_name,
 };
 
 pub(super) fn validate(theme: &Theme) -> io::Result<ValidatedLayout> {
@@ -21,7 +21,6 @@ pub(super) fn validate(theme: &Theme) -> io::Result<ValidatedLayout> {
             return Err(invalid(format!("missing segments.{}", runtime.name())));
         }
     }
-    validate_custom_segments(theme)?;
     for (name, color) in &theme.palette {
         if !valid_identifier(name) {
             return Err(invalid(format!("invalid palette name `{name}`")));
@@ -36,6 +35,7 @@ pub(super) fn validate(theme: &Theme) -> io::Result<ValidatedLayout> {
         palette_color(theme, required)?;
     }
 
+    validate_custom_segment_themes(theme)?;
     validate_theme_literals(theme)?;
     validate_styles(theme)?;
     validate_spacing(theme)?;
@@ -129,25 +129,36 @@ fn parse_layout_segment(name: &str, theme: &Theme) -> io::Result<LayoutSegment> 
     Err(invalid(format!("unknown segment `{name}`")))
 }
 
-fn validate_custom_segments(theme: &Theme) -> io::Result<()> {
+fn validate_custom_segment_themes(theme: &Theme) -> io::Result<()> {
+    // Clock and custom entries share the same contract, even when unused in
+    // the layout: their styles are emitted during shell initialization.
+    validate_custom_segment_theme("clock", &theme.segments.clock, theme)?;
     for (name, custom) in &theme.segments.custom {
         if !valid_custom_identifier(name) {
             return Err(invalid(format!("invalid custom segment id `{name}`")));
         }
-        for (field, value) in [
-            ("prefix", custom.prefix.as_str()),
-            ("suffix", custom.suffix.as_str()),
-        ] {
-            if contains_control(value) {
-                return Err(invalid(format!(
-                    "segments.custom.{name}.{field} contains a control character"
-                )));
-            }
-        }
-        style_open(&custom.style, theme)?;
-        validate_segment_spacing(name, custom.spacing)?;
+        validate_custom_segment_theme(&format!("custom.{name}"), custom, theme)?;
     }
     Ok(())
+}
+
+fn validate_custom_segment_theme(
+    name: &str,
+    segment: &CustomSegmentTheme,
+    theme: &Theme,
+) -> io::Result<()> {
+    for (field, value) in [
+        ("prefix", segment.prefix.as_str()),
+        ("suffix", segment.suffix.as_str()),
+    ] {
+        if contains_control(value) {
+            return Err(invalid(format!(
+                "segments.{name}.{field} contains a control character"
+            )));
+        }
+    }
+    style_open(&segment.style, theme)?;
+    validate_segment_spacing(name, segment.spacing)
 }
 
 fn find_segment(

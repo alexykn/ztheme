@@ -11,7 +11,7 @@ use tokio::task::JoinHandle;
 use tokio::time::{Instant, MissedTickBehavior, interval_at};
 
 use crate::daemon;
-use crate::environment::PromptEnvironment;
+use crate::environment::{PromptEnvironment, REQUEST_FIELDS};
 use crate::prompt::protocol::{REQUEST_MAGIC, REQUEST_VERSION};
 use crate::prompt::snapshot;
 use crate::theme::AsyncTheme;
@@ -22,6 +22,11 @@ use crate::theme::AsyncTheme;
 /// be masked, such as descriptor leakage, transport changes, or an
 /// unexpected wrapper process.
 const PARENT_CHECK_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Includes arbitrary path/selector bytes, but never permits unbounded input
+/// allocation. The frame budget includes every NUL terminator.
+const MAX_REQUEST_FIELD_BYTES: usize = 16 * 1024;
+const MAX_REQUEST_BYTES: usize = 128 * 1024;
 
 /// Serves one shell's prompt requests for the shell's lifetime.
 ///
@@ -47,6 +52,7 @@ pub async fn serve_client(
     let (sender, mut receiver) = mpsc::channel(4);
     spawn_request_reader(sender);
 
+    let executor = super::planning::PlanningExecutor::new();
     let mut current: Option<JoinHandle<io::Result<()>>> = None;
     let mut parent_check = interval_at(
         Instant::now() + PARENT_CHECK_INTERVAL,
@@ -63,19 +69,11 @@ pub async fn serve_client(
                             // A new request supersedes any in-flight work: the
                             // records of an older generation would be ignored by
                             // the shell, and letting the work run on would waste
-                            // time and read the new request's environment. The
-                            // superseded task is aborted and awaited before the
-                            // environment is touched: its JoinSet drops only when
-                            // the task is actually destroyed, and the request
-                            // tasks read environment values after awaits, so
-                            // without the await they could resume after the
-                            // mutation below with the new request's environment.
-                            // This ordering (destroy the request task and its
-                            // JoinSet, then mutate the environment) is the
-                            // correctness invariant; the integration tests can
-                            // only observe its black-box consequences (no stale
-                            // records, clean per-request environment), so this
-                            // comment carries the stronger guarantee.
+                            // time. Await destruction before starting the next
+                            // snapshot so no stale records can be emitted.
+                            // Blocking planning workers may outlive cancellation;
+                            // they retain immutable request-owned inputs and
+                            // their executor permits until they really finish.
                             if let Some(handle) = current.take() {
                                 handle.abort();
                                 if let Ok(Err(error)) = handle.await {
@@ -89,6 +87,7 @@ pub async fn serve_client(
                             let instance = instance.clone();
                             let theme = Arc::clone(&theme);
                             let environment = Arc::new(request.environment);
+                            let executor = executor.clone();
                             current = Some(tokio::spawn(async move {
                                 snapshot(
                                     request.generation,
@@ -96,6 +95,7 @@ pub async fn serve_client(
                                     instance,
                                     environment,
                                     &theme,
+                                    executor,
                                 )
                                 .await
                             }));
@@ -117,9 +117,9 @@ pub async fn serve_client(
                         }
                     }
                 } else {
-                    // EOF only arrives after the writer closes, so finish any
-                    // in-flight request first: its records still have a reader,
-                    // or its writes fail with EPIPE if the shell is really gone.
+                    // EOF means the request writer is gone: stop async work.
+                    // Client runtime shutdown also bounds the wait for any
+                    // uncancelable filesystem planning worker.
                     cancel_current(&mut current).await;
                     break;
                 }
@@ -130,8 +130,8 @@ pub async fn serve_client(
                     // stop the current request and exit rather than waiting on
                     // the primary signal. The shell integration respawns a
                     // fresh client on the next prompt. The request reader is a
-                    // plain OS thread, so returning drops the runtime without
-                    // waiting on its blocked stdin read.
+                    // plain OS thread, so runtime shutdown does not wait on its
+                    // blocked stdin read; planning workers have a bounded wait.
                     cancel_current(&mut current).await;
                     return Ok(());
                 }
@@ -247,16 +247,17 @@ fn read_request<R>(reader: &mut R) -> io::Result<Option<Request>>
 where
     R: std::io::BufRead,
 {
-    let magic = read_field(reader)?;
+    let mut remaining = MAX_REQUEST_BYTES;
+    let magic = read_field(reader, &mut remaining)?;
     let Some(magic) = magic else {
         return Ok(None);
     };
     if magic != REQUEST_MAGIC {
         return Err(invalid_data("client request magic is invalid"));
     }
-    let version = read_field(reader)?.ok_or_else(truncated)?;
+    let version = read_field(reader, &mut remaining)?.ok_or_else(truncated)?;
 
-    let generation = read_field(reader)?.ok_or_else(truncated)?;
+    let generation = read_field(reader, &mut remaining)?.ok_or_else(truncated)?;
     let generation = std::str::from_utf8(&generation)
         .ok()
         .and_then(|value| value.parse().ok())
@@ -269,43 +270,19 @@ where
         return Err(request_version_mismatch(generation));
     }
 
-    let cwd = read_field(reader)?.ok_or_else(truncated)?;
+    let cwd = read_field(reader, &mut remaining)?.ok_or_else(truncated)?;
     let cwd = PathBuf::from(OsString::from_vec(cwd));
     if !cwd.is_absolute() {
         return Err(invalid_data("client request cwd is not absolute"));
     }
 
-    let environment = PromptEnvironment {
-        path: env_field(read_field(reader)?)?,
-        home: env_field(read_field(reader)?)?,
-        git_dir: env_field(read_field(reader)?)?,
-        git_work_tree: env_field(read_field(reader)?)?,
-        git_ceilings: env_field(read_field(reader)?)?,
-        virtual_env: env_field(read_field(reader)?)?,
-        conda_prefix: env_field(read_field(reader)?)?,
-        conda_default_env: env_field(read_field(reader)?)?,
-        perlbrew_perl: env_field(read_field(reader)?)?,
-        plenv_version: env_field(read_field(reader)?)?,
-        pyenv_version: env_field(read_field(reader)?)?,
-        pyenv_dir: env_field(read_field(reader)?)?,
-        rustup_toolchain: env_field(read_field(reader)?)?,
-        rustup_home: env_field(read_field(reader)?)?,
-        rbenv_dir: env_field(read_field(reader)?)?,
-        rbenv_version: env_field(read_field(reader)?)?,
-        nodenv_version: env_field(read_field(reader)?)?,
-        nodenv_dir: env_field(read_field(reader)?)?,
-        plenv_dir: env_field(read_field(reader)?)?,
-        ruby_version: env_field(read_field(reader)?)?,
-        java_home: env_field(read_field(reader)?)?,
-        gotoolchain: env_field(read_field(reader)?)?,
-        dotnet_root: env_field(read_field(reader)?)?,
-        juliaup_channel: env_field(read_field(reader)?)?,
-        juliaup_depot_path: env_field(read_field(reader)?)?,
-        julia_project: env_field(read_field(reader)?)?,
-        julia_load_path: env_field(read_field(reader)?)?,
-        julia_depot_path: env_field(read_field(reader)?)?,
-        r_arch: env_field(read_field(reader)?)?,
-    };
+    let mut environment = PromptEnvironment::default();
+    for field in REQUEST_FIELDS {
+        field.set(
+            &mut environment,
+            env_field(read_field(reader, &mut remaining)?)?,
+        );
+    }
 
     Ok(Some(Request {
         generation,
@@ -314,20 +291,37 @@ where
     }))
 }
 
-fn read_field<R>(reader: &mut R) -> io::Result<Option<Vec<u8>>>
+fn read_field<R>(reader: &mut R, remaining: &mut usize) -> io::Result<Option<Vec<u8>>>
 where
     R: std::io::BufRead,
 {
     let mut field = Vec::with_capacity(64);
-    if reader.read_until(0, &mut field)? == 0 {
-        return Ok(None);
+    loop {
+        let buffer = reader.fill_buf()?;
+        if buffer.is_empty() {
+            return if field.is_empty() {
+                Ok(None)
+            } else {
+                Err(invalid_data("client request field is not NUL-terminated"))
+            };
+        }
+        let terminator = buffer.iter().position(|&byte| byte == 0);
+        let length = terminator.unwrap_or(buffer.len());
+        let consumed = length + usize::from(terminator.is_some());
+        if consumed > *remaining {
+            return Err(invalid_data("client request exceeds frame size limit"));
+        }
+        if length > MAX_REQUEST_FIELD_BYTES - field.len() {
+            return Err(invalid_data("client request field exceeds size limit"));
+        }
+        field.extend_from_slice(&buffer[..length]);
+        reader.consume(consumed);
+        *remaining -= consumed;
+        if terminator.is_some() {
+            return Ok(Some(field));
+        }
     }
-    if field.pop() != Some(0) {
-        return Err(invalid_data("client request field is not NUL-terminated"));
-    }
-    Ok(Some(field))
 }
-
 /// An environment field is always present on the wire; an empty value means
 /// the variable is unset in the shell.
 fn env_field(field: Option<Vec<u8>>) -> io::Result<Option<OsString>> {
@@ -354,8 +348,11 @@ mod tests {
 
     use std::io::BufReader;
 
-    use super::{REQUEST_MAGIC, REQUEST_VERSION, RequestVersionMismatch, read_request};
-    use crate::prompt::protocol::REQUEST_FIELDS;
+    use super::{
+        MAX_REQUEST_BYTES, MAX_REQUEST_FIELD_BYTES, REQUEST_MAGIC, REQUEST_VERSION,
+        RequestVersionMismatch, read_field, read_request,
+    };
+    use crate::environment::REQUEST_FIELDS;
 
     const ENV_FIELD_COUNT: usize = REQUEST_FIELDS.len();
 
@@ -371,7 +368,7 @@ mod tests {
         // The wire layout comes from the shared definition, so a field added
         // to REQUEST_FIELDS appears here without a manual step.
         for field in REQUEST_FIELDS {
-            let value = match values.iter().find(|&&(name, _)| name == *field) {
+            let value = match values.iter().find(|&&(name, _)| name == field.name) {
                 Some(&(_, value)) => value,
                 None => &[],
             };
@@ -379,6 +376,163 @@ mod tests {
             bytes.push(0);
         }
         bytes
+    }
+
+    /// Literal version-3 bytes are intentionally independent of the descriptor
+    /// list. Assert storage and child routing as well as the generated layout.
+    #[test]
+    fn version_three_wire_order_storage_and_child_policy_are_pinned() {
+        let wire = b"ZTREQ\x003\x0042\x00/work\x00PATH\x00HOME\x00GIT_DIR\x00GIT_WORK_TREE\x00\
+            GIT_CEILING_DIRECTORIES\x00VIRTUAL_ENV\x00CONDA_PREFIX\x00CONDA_DEFAULT_ENV\x00\
+            PERLBREW_PERL\x00PLENV_VERSION\x00PYENV_VERSION\x00PYENV_DIR\x00RUSTUP_TOOLCHAIN\x00\
+            RUSTUP_HOME\x00RBENV_DIR\x00RBENV_VERSION\x00NODENV_VERSION\x00NODENV_DIR\x00PLENV_DIR\x00\
+            RUBY_VERSION\x00JAVA_HOME\x00GOTOOLCHAIN\x00DOTNET_ROOT\x00JULIAUP_CHANNEL\x00\
+            JULIAUP_DEPOT_PATH\x00JULIA_PROJECT\x00JULIA_LOAD_PATH\x00JULIA_DEPOT_PATH\x00R_ARCH\x00";
+        let request = read_request(&mut BufReader::with_capacity(3, &wire[..]))
+            .unwrap()
+            .unwrap();
+        let environment = request.environment;
+        let storage = [
+            environment.path.as_deref(),
+            environment.home.as_deref(),
+            environment.git_dir.as_deref(),
+            environment.git_work_tree.as_deref(),
+            environment.git_ceilings.as_deref(),
+            environment.virtual_env.as_deref(),
+            environment.conda_prefix.as_deref(),
+            environment.conda_default_env.as_deref(),
+            environment.perlbrew_perl.as_deref(),
+            environment.plenv_version.as_deref(),
+            environment.pyenv_version.as_deref(),
+            environment.pyenv_dir.as_deref(),
+            environment.rustup_toolchain.as_deref(),
+            environment.rustup_home.as_deref(),
+            environment.rbenv_dir.as_deref(),
+            environment.rbenv_version.as_deref(),
+            environment.nodenv_version.as_deref(),
+            environment.nodenv_dir.as_deref(),
+            environment.plenv_dir.as_deref(),
+            environment.ruby_version.as_deref(),
+            environment.java_home.as_deref(),
+            environment.gotoolchain.as_deref(),
+            environment.dotnet_root.as_deref(),
+            environment.juliaup_channel.as_deref(),
+            environment.juliaup_depot_path.as_deref(),
+            environment.julia_project.as_deref(),
+            environment.julia_load_path.as_deref(),
+            environment.julia_depot_path.as_deref(),
+            environment.r_arch.as_deref(),
+        ];
+        let mut command = tokio::process::Command::new("true");
+        environment.apply_to_command(&mut command);
+        let envs: std::collections::HashMap<_, _> = command.as_std().get_envs().collect();
+        let expected_names = [
+            "PATH",
+            "HOME",
+            "GIT_DIR",
+            "GIT_WORK_TREE",
+            "GIT_CEILING_DIRECTORIES",
+            "VIRTUAL_ENV",
+            "CONDA_PREFIX",
+            "CONDA_DEFAULT_ENV",
+            "PERLBREW_PERL",
+            "PLENV_VERSION",
+            "PYENV_VERSION",
+            "PYENV_DIR",
+            "RUSTUP_TOOLCHAIN",
+            "RUSTUP_HOME",
+            "RBENV_DIR",
+            "RBENV_VERSION",
+            "NODENV_VERSION",
+            "NODENV_DIR",
+            "PLENV_DIR",
+            "RUBY_VERSION",
+            "JAVA_HOME",
+            "GOTOOLCHAIN",
+            "DOTNET_ROOT",
+            "JULIAUP_CHANNEL",
+            "JULIAUP_DEPOT_PATH",
+            "JULIA_PROJECT",
+            "JULIA_LOAD_PATH",
+            "JULIA_DEPOT_PATH",
+            "R_ARCH",
+        ];
+        assert_eq!(storage, expected_names.map(|name| Some(OsStr::new(name))));
+        assert_eq!(
+            REQUEST_FIELDS
+                .iter()
+                .map(|field| field.name)
+                .collect::<Vec<_>>(),
+            expected_names
+        );
+        let expected_shell = expected_names
+            .iter()
+            .map(|name| format!("    request_line+=\"${{{name}:-}}\"$'\\0'"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(
+            crate::prompt::protocol::request_field_lines(),
+            expected_shell
+        );
+        for name in expected_names {
+            if ["GIT_DIR", "GIT_WORK_TREE", "GIT_CEILING_DIRECTORIES"].contains(&name) {
+                assert!(!envs.contains_key(OsStr::new(name)));
+            } else {
+                assert_eq!(envs[OsStr::new(name)], Some(OsStr::new(name)));
+            }
+        }
+    }
+
+    #[test]
+    fn request_field_limit_accepts_exact_size_and_rejects_excess_without_a_nul() {
+        let value = vec![b'x'; MAX_REQUEST_FIELD_BYTES];
+        let exact = request(b"/work", &[("PATH", &value)]);
+        assert!(
+            read_request(&mut BufReader::with_capacity(7, &exact[..]))
+                .unwrap()
+                .is_some()
+        );
+        let oversized = vec![b'x'; MAX_REQUEST_FIELD_BYTES + 1];
+        for suffix in [&b""[..], &b"\0"[..]] {
+            let mut bytes = oversized.clone();
+            bytes.extend_from_slice(suffix);
+            let mut reader = BufReader::with_capacity(7, &bytes[..]);
+            let mut remaining = MAX_REQUEST_BYTES;
+            let error = read_field(&mut reader, &mut remaining).unwrap_err();
+            assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+            assert_eq!(error.to_string(), "client request field exceeds size limit");
+        }
+    }
+
+    #[test]
+    fn request_frame_budget_includes_terminators_and_resets_for_each_request() {
+        let mut exact = request(b"/work", &[]);
+        // Fill eight fields without exceeding any individual field limit.
+        let header_len = b"ZTREQ\x003\x0042\x00/work\x00".len();
+        let padding = MAX_REQUEST_BYTES - exact.len();
+        let mut remaining = padding;
+        for index in (0..8).rev() {
+            let length = remaining.min(MAX_REQUEST_FIELD_BYTES);
+            exact.splice(
+                header_len + index..header_len + index,
+                std::iter::repeat_n(b'x', length),
+            );
+            remaining -= length;
+        }
+        assert_eq!(remaining, 0);
+        assert_eq!(exact.len(), MAX_REQUEST_BYTES);
+        let mut two_frames = exact.clone();
+        two_frames.extend_from_slice(&exact);
+        let mut reader = BufReader::with_capacity(7, &two_frames[..]);
+        assert!(read_request(&mut reader).unwrap().is_some());
+        assert!(read_request(&mut reader).unwrap().is_some());
+        assert!(read_request(&mut reader).unwrap().is_none());
+        exact.insert(header_len + 1, b'x');
+        let error = read_request(&mut BufReader::with_capacity(7, &exact[..]))
+            .err()
+            .unwrap();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert_eq!(error.to_string(), "client request exceeds frame size limit");
     }
 
     #[test]
@@ -559,5 +713,14 @@ mod tests {
         );
         let partial = b"ZTREQ\0";
         assert!(read_request(&mut BufReader::new(&partial[..])).is_err());
+        for partial in [&b"ZTREQ"[..], &b"ZTREQ\x003"[..], &b"ZTREQ\x003\x0042"[..]] {
+            let error = read_request(&mut BufReader::with_capacity(2, partial))
+                .err()
+                .unwrap();
+            assert_eq!(
+                error.to_string(),
+                "client request field is not NUL-terminated"
+            );
+        }
     }
 }

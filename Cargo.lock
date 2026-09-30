@@ -767,6 +767,7 @@ name = "ztheme"
 version = "1.7.1"
 dependencies = [
  "clap",
+ "libc",
  "serde",
  "sha2",
  "shell-words",

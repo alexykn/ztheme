@@ -4,9 +4,9 @@ use tokio::process::Command;
 
 /// The per-request prompt environment parsed from the shell's request.
 ///
-/// The client no longer mutates its process environment; this value is the
-/// single source of truth for one shell request. The wire order is mirrored in
-/// `prompt::client` and `shell/ztheme.zsh`.
+/// The client never mutates its process environment; this value is the
+/// single source of truth for one shell request. `REQUEST_FIELDS` owns the
+/// wire order, decoding accessors, and volatile child environment policy.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct PromptEnvironment {
     pub(crate) path: Option<OsString>,
@@ -40,6 +40,206 @@ pub(crate) struct PromptEnvironment {
     pub(crate) r_arch: Option<OsString>,
 }
 
+/// One request variable: its wire identity, storage accessors, and whether
+/// volatile runtime children may observe it. Git routing is request-only.
+pub(crate) struct EnvironmentField {
+    pub(crate) name: &'static str,
+    get: fn(&PromptEnvironment) -> Option<&OsStr>,
+    set: fn(&mut PromptEnvironment, Option<OsString>),
+    runtime: bool,
+}
+
+impl EnvironmentField {
+    pub(crate) fn set(&self, environment: &mut PromptEnvironment, value: Option<OsString>) {
+        (self.set)(environment, value);
+    }
+
+    fn apply(&self, environment: &PromptEnvironment, command: &mut Command) {
+        if self.runtime {
+            apply(command, self.name, (self.get)(environment));
+        }
+    }
+}
+
+/// Version 3 wire order. Generate shell fields and decode requests from this
+/// same owner; changing the order requires a request protocol version change.
+pub(crate) const REQUEST_FIELDS: &[EnvironmentField] = &[
+    EnvironmentField {
+        name: "PATH",
+        get: |environment| environment.path.as_deref(),
+        set: |environment, value| environment.path = value,
+        runtime: true,
+    },
+    EnvironmentField {
+        name: "HOME",
+        get: |environment| environment.home.as_deref(),
+        set: |environment, value| environment.home = value,
+        runtime: true,
+    },
+    EnvironmentField {
+        name: "GIT_DIR",
+        get: |environment| environment.git_dir.as_deref(),
+        set: |environment, value| environment.git_dir = value,
+        runtime: false,
+    },
+    EnvironmentField {
+        name: "GIT_WORK_TREE",
+        get: |environment| environment.git_work_tree.as_deref(),
+        set: |environment, value| environment.git_work_tree = value,
+        runtime: false,
+    },
+    EnvironmentField {
+        name: "GIT_CEILING_DIRECTORIES",
+        get: |environment| environment.git_ceilings.as_deref(),
+        set: |environment, value| environment.git_ceilings = value,
+        runtime: false,
+    },
+    EnvironmentField {
+        name: "VIRTUAL_ENV",
+        get: |environment| environment.virtual_env.as_deref(),
+        set: |environment, value| environment.virtual_env = value,
+        runtime: true,
+    },
+    EnvironmentField {
+        name: "CONDA_PREFIX",
+        get: |environment| environment.conda_prefix.as_deref(),
+        set: |environment, value| environment.conda_prefix = value,
+        runtime: true,
+    },
+    EnvironmentField {
+        name: "CONDA_DEFAULT_ENV",
+        get: |environment| environment.conda_default_env.as_deref(),
+        set: |environment, value| environment.conda_default_env = value,
+        runtime: true,
+    },
+    EnvironmentField {
+        name: "PERLBREW_PERL",
+        get: |environment| environment.perlbrew_perl.as_deref(),
+        set: |environment, value| environment.perlbrew_perl = value,
+        runtime: true,
+    },
+    EnvironmentField {
+        name: "PLENV_VERSION",
+        get: |environment| environment.plenv_version.as_deref(),
+        set: |environment, value| environment.plenv_version = value,
+        runtime: true,
+    },
+    EnvironmentField {
+        name: "PYENV_VERSION",
+        get: |environment| environment.pyenv_version.as_deref(),
+        set: |environment, value| environment.pyenv_version = value,
+        runtime: true,
+    },
+    EnvironmentField {
+        name: "PYENV_DIR",
+        get: |environment| environment.pyenv_dir.as_deref(),
+        set: |environment, value| environment.pyenv_dir = value,
+        runtime: true,
+    },
+    EnvironmentField {
+        name: "RUSTUP_TOOLCHAIN",
+        get: |environment| environment.rustup_toolchain.as_deref(),
+        set: |environment, value| environment.rustup_toolchain = value,
+        runtime: true,
+    },
+    EnvironmentField {
+        name: "RUSTUP_HOME",
+        get: |environment| environment.rustup_home.as_deref(),
+        set: |environment, value| environment.rustup_home = value,
+        runtime: true,
+    },
+    EnvironmentField {
+        name: "RBENV_DIR",
+        get: |environment| environment.rbenv_dir.as_deref(),
+        set: |environment, value| environment.rbenv_dir = value,
+        runtime: true,
+    },
+    EnvironmentField {
+        name: "RBENV_VERSION",
+        get: |environment| environment.rbenv_version.as_deref(),
+        set: |environment, value| environment.rbenv_version = value,
+        runtime: true,
+    },
+    EnvironmentField {
+        name: "NODENV_VERSION",
+        get: |environment| environment.nodenv_version.as_deref(),
+        set: |environment, value| environment.nodenv_version = value,
+        runtime: true,
+    },
+    EnvironmentField {
+        name: "NODENV_DIR",
+        get: |environment| environment.nodenv_dir.as_deref(),
+        set: |environment, value| environment.nodenv_dir = value,
+        runtime: true,
+    },
+    EnvironmentField {
+        name: "PLENV_DIR",
+        get: |environment| environment.plenv_dir.as_deref(),
+        set: |environment, value| environment.plenv_dir = value,
+        runtime: true,
+    },
+    EnvironmentField {
+        name: "RUBY_VERSION",
+        get: |environment| environment.ruby_version.as_deref(),
+        set: |environment, value| environment.ruby_version = value,
+        runtime: true,
+    },
+    EnvironmentField {
+        name: "JAVA_HOME",
+        get: |environment| environment.java_home.as_deref(),
+        set: |environment, value| environment.java_home = value,
+        runtime: true,
+    },
+    EnvironmentField {
+        name: "GOTOOLCHAIN",
+        get: |environment| environment.gotoolchain.as_deref(),
+        set: |environment, value| environment.gotoolchain = value,
+        runtime: true,
+    },
+    EnvironmentField {
+        name: "DOTNET_ROOT",
+        get: |environment| environment.dotnet_root.as_deref(),
+        set: |environment, value| environment.dotnet_root = value,
+        runtime: true,
+    },
+    EnvironmentField {
+        name: "JULIAUP_CHANNEL",
+        get: |environment| environment.juliaup_channel.as_deref(),
+        set: |environment, value| environment.juliaup_channel = value,
+        runtime: true,
+    },
+    EnvironmentField {
+        name: "JULIAUP_DEPOT_PATH",
+        get: |environment| environment.juliaup_depot_path.as_deref(),
+        set: |environment, value| environment.juliaup_depot_path = value,
+        runtime: true,
+    },
+    EnvironmentField {
+        name: "JULIA_PROJECT",
+        get: |environment| environment.julia_project.as_deref(),
+        set: |environment, value| environment.julia_project = value,
+        runtime: true,
+    },
+    EnvironmentField {
+        name: "JULIA_LOAD_PATH",
+        get: |environment| environment.julia_load_path.as_deref(),
+        set: |environment, value| environment.julia_load_path = value,
+        runtime: true,
+    },
+    EnvironmentField {
+        name: "JULIA_DEPOT_PATH",
+        get: |environment| environment.julia_depot_path.as_deref(),
+        set: |environment, value| environment.julia_depot_path = value,
+        runtime: true,
+    },
+    EnvironmentField {
+        name: "R_ARCH",
+        get: |environment| environment.r_arch.as_deref(),
+        set: |environment, value| environment.r_arch = value,
+        runtime: true,
+    },
+];
+
 impl PromptEnvironment {
     /// Starts every runtime command from a small deterministic baseline.
     pub(crate) fn prepare_command(command: &mut Command) {
@@ -59,51 +259,9 @@ impl PromptEnvironment {
     /// selection machinery. They are never put in the semantic cache.
     pub(crate) fn apply_to_command(&self, command: &mut Command) {
         Self::prepare_command(command);
-        apply(command, "PATH", self.path.as_deref());
-        apply(command, "HOME", self.home.as_deref());
-        apply(command, "GIT_DIR", None);
-        apply(command, "GIT_WORK_TREE", None);
-        apply(command, "GIT_CEILING_DIRECTORIES", None);
-        apply(command, "VIRTUAL_ENV", self.virtual_env.as_deref());
-        apply(command, "CONDA_PREFIX", self.conda_prefix.as_deref());
-        apply(
-            command,
-            "CONDA_DEFAULT_ENV",
-            self.conda_default_env.as_deref(),
-        );
-        apply(command, "PERLBREW_PERL", self.perlbrew_perl.as_deref());
-        apply(command, "PLENV_VERSION", self.plenv_version.as_deref());
-        apply(command, "PYENV_VERSION", self.pyenv_version.as_deref());
-        apply(command, "PYENV_DIR", self.pyenv_dir.as_deref());
-        apply(
-            command,
-            "RUSTUP_TOOLCHAIN",
-            self.rustup_toolchain.as_deref(),
-        );
-        apply(command, "RUSTUP_HOME", self.rustup_home.as_deref());
-        apply(command, "RBENV_DIR", self.rbenv_dir.as_deref());
-        apply(command, "RBENV_VERSION", self.rbenv_version.as_deref());
-        apply(command, "NODENV_VERSION", self.nodenv_version.as_deref());
-        apply(command, "NODENV_DIR", self.nodenv_dir.as_deref());
-        apply(command, "PLENV_DIR", self.plenv_dir.as_deref());
-        apply(command, "RUBY_VERSION", self.ruby_version.as_deref());
-        apply(command, "JAVA_HOME", self.java_home.as_deref());
-        apply(command, "GOTOOLCHAIN", self.gotoolchain.as_deref());
-        apply(command, "DOTNET_ROOT", self.dotnet_root.as_deref());
-        apply(command, "JULIAUP_CHANNEL", self.juliaup_channel.as_deref());
-        apply(
-            command,
-            "JULIAUP_DEPOT_PATH",
-            self.juliaup_depot_path.as_deref(),
-        );
-        apply(command, "JULIA_PROJECT", self.julia_project.as_deref());
-        apply(command, "JULIA_LOAD_PATH", self.julia_load_path.as_deref());
-        apply(
-            command,
-            "JULIA_DEPOT_PATH",
-            self.julia_depot_path.as_deref(),
-        );
-        apply(command, "R_ARCH", self.r_arch.as_deref());
+        for field in REQUEST_FIELDS {
+            field.apply(self, command);
+        }
     }
 }
 

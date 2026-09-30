@@ -1,6 +1,6 @@
 use std::env;
 use std::ffi::{OsStr, OsString};
-use std::fs::{self, File};
+use std::fs;
 use std::io::{self, Read};
 use std::os::unix::ffi::OsStrExt as _;
 use std::os::unix::fs::MetadataExt as _;
@@ -13,6 +13,7 @@ use super::detect::Project;
 use super::{Runtime, RuntimeSpec};
 use crate::cache::CacheKey;
 use crate::environment::PromptEnvironment;
+use crate::filesystem::open_regular_file;
 
 const MAX_SELECTOR_BYTES: usize = 64 * 1024;
 const MAX_RUSTUP_DIRECTORY_ENTRIES: usize = 256;
@@ -152,6 +153,18 @@ pub(crate) fn finalize_plans(
         .collect::<Vec<_>>();
     plans.sort_unstable_by_key(|plan| plan.runtime);
     plans
+}
+
+/// Re-resolve one already detected runtime without repeating project detection.
+pub(crate) fn refresh_plan(
+    runtime: Runtime,
+    cwd: &Path,
+    environment: &PromptEnvironment,
+) -> RuntimePlan {
+    let base = resolve_base_plans(&[runtime], cwd, environment)
+        .pop()
+        .expect("one requested runtime produces one base plan");
+    finalize_plan(cwd, base, environment)
 }
 
 fn finalize_plan(cwd: &Path, plan: BasePlan, environment: &PromptEnvironment) -> RuntimePlan {
@@ -300,19 +313,6 @@ pub(crate) fn resolve_on_path(program: &OsStr, path: &OsStr, cwd: &Path) -> Opti
         .find(|candidate| is_executable_file(candidate))
 }
 
-fn direct(runtime: Runtime, spec: RuntimeSpec, program: PathBuf) -> RuntimePlan {
-    let cache = executable_identity(&program).map_or_else(
-        |_| Cacheability::Volatile(VolatileReason::UnreadableDependency),
-        Cacheability::Cacheable,
-    );
-    RuntimePlan {
-        runtime,
-        spec,
-        program,
-        cache,
-    }
-}
-
 fn volatile(
     runtime: Runtime,
     spec: RuntimeSpec,
@@ -380,7 +380,7 @@ impl From<&fs::Metadata> for MetadataIdentity {
 }
 
 fn has_shebang(path: &Path) -> io::Result<bool> {
-    let mut file = File::open(path)?;
+    let mut file = open_regular_file(path)?;
     let mut prefix = [0; 2];
     let length = file.read(&mut prefix)?;
     Ok(length == prefix.len() && prefix == *b"#!")
@@ -412,21 +412,26 @@ fn classify_resolved_target(
         }
     }
 
-    match canonical_name_is_dispatcher(&selected_program) {
-        Ok(true) => volatile(runtime, spec, original_program, VolatileReason::UnknownShim),
-        Ok(false) => direct(runtime, spec, selected_program),
-        Err(_) => volatile(
+    let Ok(identity) = executable_identity(&selected_program) else {
+        return volatile(
             runtime,
             spec,
             original_program,
             VolatileReason::UnreadableDependency,
-        ),
+        );
+    };
+    if cfg!(target_os = "macos")
+        && is_macos_contextual_launcher(&selected_program, &identity.canonical_path)
+    {
+        return volatile(
+            runtime,
+            spec,
+            original_program,
+            VolatileReason::UnsupportedContextualSelection,
+        );
     }
-}
-
-fn canonical_name_is_dispatcher(path: &Path) -> io::Result<bool> {
-    let canonical = fs::canonicalize(path)?;
-    Ok(canonical
+    if identity
+        .canonical_path
         .file_name()
         .and_then(OsStr::to_str)
         .is_some_and(|name| {
@@ -434,7 +439,40 @@ fn canonical_name_is_dispatcher(path: &Path) -> io::Result<bool> {
                 name,
                 "asdf" | "mise" | "pyenv" | "rbenv" | "nodenv" | "plenv" | "rustup"
             )
-        }))
+        })
+    {
+        return volatile(runtime, spec, original_program, VolatileReason::UnknownShim);
+    }
+    RuntimePlan {
+        runtime,
+        spec,
+        program: selected_program,
+        cache: Cacheability::Cacheable(identity),
+    }
+}
+
+/// Apple's system tools select Xcode/Command Line Tools or a managed JDK at
+/// execution time. Check both the requested path and canonical routing target
+/// so aliases cannot make these launchers cacheable. SDK/JDK binaries with the
+/// same basename are direct executables, not platform launchers.
+fn is_macos_contextual_launcher(requested: &Path, canonical: &Path) -> bool {
+    const LAUNCHERS: &[&str] = &[
+        "/usr/bin/clang",
+        "/usr/bin/clang++",
+        "/usr/bin/cc",
+        "/usr/bin/c++",
+        "/usr/bin/gcc",
+        "/usr/bin/g++",
+        "/usr/bin/swift",
+        "/usr/bin/swiftc",
+        "/usr/bin/java",
+        "/System/Library/Frameworks/JavaVM.framework/Commands/java",
+        "/System/Library/Frameworks/JavaVM.framework/Versions/Current/Commands/java",
+        "/System/Library/Frameworks/JavaVM.framework/Versions/A/Commands/java",
+    ];
+    LAUNCHERS
+        .iter()
+        .any(|launcher| requested == Path::new(launcher) || canonical == Path::new(launcher))
 }
 
 /// True when the resolved Julia executable is Juliaup's native `julialauncher`.
@@ -581,7 +619,7 @@ fn find_up_bounded(start: &Path, file_name: &str) -> Result<Option<PathBuf>, Vol
     let mut directory = start.to_path_buf();
     for depth in 0..32 {
         let candidate = directory.join(file_name);
-        if candidate.is_file() {
+        if selector_file_exists(&candidate)? {
             return Ok(Some(candidate));
         }
         let Some(parent) = directory.parent() else {
@@ -599,16 +637,7 @@ fn find_up_bounded(start: &Path, file_name: &str) -> Result<Option<PathBuf>, Vol
 }
 
 fn read_single_token(path: &Path) -> io::Result<OsString> {
-    let file = File::open(path)?;
-    let mut bytes = Vec::new();
-    file.take(u64::try_from(MAX_SELECTOR_BYTES).unwrap_or(u64::MAX) + 1)
-        .read_to_end(&mut bytes)?;
-    if bytes.len() > MAX_SELECTOR_BYTES {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "selector file is too large",
-        ));
-    }
+    let bytes = read_file_limited(path)?;
     let text = String::from_utf8(bytes)
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "selector is not UTF-8"))?;
     let mut tokens = text.split_whitespace();
@@ -900,7 +929,7 @@ fn host_triple() -> String {
 }
 
 fn read_file_limited(path: &Path) -> io::Result<Vec<u8>> {
-    let file = File::open(path)?;
+    let file = open_regular_file(path)?;
     let mut bytes = Vec::new();
     file.take(u64::try_from(MAX_SELECTOR_BYTES).unwrap_or(u64::MAX) + 1)
         .read_to_end(&mut bytes)?;
@@ -925,46 +954,39 @@ fn explicit_local_go(environment: &PromptEnvironment) -> bool {
         .is_some_and(|value| value == OsStr::new("local"))
 }
 
-pub(crate) fn cache_key(plans: &[RuntimePlan], environment: &PromptEnvironment) -> CacheKey {
+/// A value belongs to one selected executable and its declared command inputs,
+/// never to the project, active sibling set, or presentation environment.
+pub(crate) fn cache_key(plan: &RuntimePlan, environment: &PromptEnvironment) -> Option<CacheKey> {
+    let identity = match &plan.cache {
+        Cacheability::Cacheable(identity) => identity,
+        Cacheability::Volatile(_reason) => return None,
+    };
     let mut digest = Sha256::new();
-    add_field(&mut digest, b"domain", b"ztheme-runtime-snapshot-v2");
-    add_u64(&mut digest, b"runtime-snapshot-version", 2);
-    let cacheable_count = plans.iter().filter(|plan| plan.is_cacheable()).count();
+    add_field(&mut digest, b"domain", b"ztheme-runtime-value-v3");
+    add_u64(&mut digest, b"runtime-value-version", 3);
+    add_u64(&mut digest, b"runtime", u64::from(plan.runtime.id()));
+    add_os(&mut digest, b"program-request", &plan.spec.program);
     add_u64(
         &mut digest,
-        b"cacheable-count",
-        u64::try_from(cacheable_count).unwrap_or(u64::MAX),
+        b"argument-count",
+        u64::try_from(plan.spec.arguments.len()).unwrap_or(u64::MAX),
     );
-    for plan in plans.iter().filter(|plan| plan.is_cacheable()) {
-        add_u64(&mut digest, b"runtime", u64::from(plan.runtime.id()));
-        add_os(&mut digest, b"program-request", &plan.spec.program);
-        add_u64(
-            &mut digest,
-            b"argument-count",
-            u64::try_from(plan.spec.arguments.len()).unwrap_or(u64::MAX),
-        );
-        for argument in plan.spec.arguments {
-            add_field(&mut digest, b"argument", argument.as_bytes());
-        }
-        add_optional_str(&mut digest, b"command-label", plan.spec.label);
-        add_u64(
-            &mut digest,
-            b"merge-stderr",
-            u64::from(plan.spec.merge_stderr),
-        );
-        match &plan.cache {
-            Cacheability::Cacheable(identity) => {
-                add_field(&mut digest, b"context", b"direct");
-                add_identity(&mut digest, identity);
-            }
-            Cacheability::Volatile(_) => {}
-        }
-        for_declared_command_environment(plan.runtime, environment, |name, value| {
-            add_field(&mut digest, b"declared-environment-name", name.as_bytes());
-            add_optional_os(&mut digest, b"declared-environment-value", value);
-        });
+    for argument in plan.spec.arguments {
+        add_field(&mut digest, b"argument", argument.as_bytes());
     }
-    CacheKey::from_digest(digest.finalize().into())
+    add_optional_str(&mut digest, b"command-label", plan.spec.label);
+    add_u64(
+        &mut digest,
+        b"merge-stderr",
+        u64::from(plan.spec.merge_stderr),
+    );
+    add_field(&mut digest, b"context", b"direct");
+    add_identity(&mut digest, identity);
+    for_declared_command_environment(plan.runtime, environment, |name, value| {
+        add_field(&mut digest, b"declared-environment-name", name.as_bytes());
+        add_optional_os(&mut digest, b"declared-environment-value", value);
+    });
+    Some(CacheKey::from_digest(digest.finalize().into()))
 }
 
 pub(crate) fn apply_cacheable_environment(
@@ -1153,6 +1175,186 @@ mod tests {
     }
 
     #[test]
+    fn macos_platform_launcher_paths_are_contextual_not_basename_based() {
+        // Coherent requested/canonical pairs, including aliases into the
+        // system routing locations and directly selected SDK/JDK binaries.
+        for (requested, canonical, contextual) in [
+            ("/usr/bin/clang", "/usr/bin/clang", true),
+            ("/usr/bin/clang++", "/usr/bin/clang++", true),
+            ("/usr/bin/cc", "/usr/bin/cc", true),
+            ("/usr/bin/c++", "/usr/bin/c++", true),
+            ("/usr/bin/gcc", "/usr/bin/gcc", true),
+            ("/usr/bin/g++", "/usr/bin/g++", true),
+            ("/usr/bin/swift", "/usr/bin/swift", true),
+            ("/usr/bin/swiftc", "/usr/bin/swiftc", true),
+            ("/usr/bin/java", "/usr/bin/java", true),
+            ("/opt/bin/clang", "/usr/bin/clang", true),
+            ("/opt/bin/swift", "/usr/bin/swift", true),
+            (
+                "/usr/bin/java",
+                "/System/Library/Frameworks/JavaVM.framework/Versions/A/Commands/java",
+                true,
+            ),
+            (
+                "/opt/bin/java",
+                "/System/Library/Frameworks/JavaVM.framework/Versions/A/Commands/java",
+                true,
+            ),
+            (
+                "/System/Library/Frameworks/JavaVM.framework/Commands/java",
+                "/System/Library/Frameworks/JavaVM.framework/Versions/A/Commands/java",
+                true,
+            ),
+            (
+                "/System/Library/Frameworks/JavaVM.framework/Versions/Current/Commands/java",
+                "/System/Library/Frameworks/JavaVM.framework/Versions/A/Commands/java",
+                true,
+            ),
+            (
+                "/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/clang",
+                "/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/clang",
+                false,
+            ),
+            (
+                "/Library/Developer/CommandLineTools/usr/bin/clang++",
+                "/Library/Developer/CommandLineTools/usr/bin/clang++",
+                false,
+            ),
+            (
+                "/Library/Developer/Toolchains/swift.xctoolchain/usr/bin/swift",
+                "/Library/Developer/Toolchains/swift.xctoolchain/usr/bin/swift",
+                false,
+            ),
+            (
+                "/Library/Java/JavaVirtualMachines/jdk.jdk/Contents/Home/bin/java",
+                "/Library/Java/JavaVirtualMachines/jdk.jdk/Contents/Home/bin/java",
+                false,
+            ),
+            ("/opt/bin/java", "/opt/jdk/bin/java", false),
+        ] {
+            assert_eq!(
+                super::is_macos_contextual_launcher(Path::new(requested), Path::new(canonical)),
+                contextual,
+                "{requested} -> {canonical}"
+            );
+        }
+    }
+
+    #[test]
+    fn direct_native_platform_tool_names_remain_cacheable() {
+        let directory = TestDirectory::new();
+        // Use a real native executable, not fake bytes or a script wrapper.
+        // Both its requested and canonical basenames match the platform tool.
+        for (runtime, name) in [
+            (Runtime::C, "clang"),
+            (Runtime::Cpp, "clang++"),
+            (Runtime::Swift, "swift"),
+            (Runtime::Java, "java"),
+        ] {
+            let program = directory.path().join(name);
+            fs::copy("/bin/echo", &program).unwrap();
+            let plan = super::classify_resolved_target(
+                runtime,
+                super::super::spec(runtime),
+                program.clone(),
+                program.clone(),
+            );
+            assert!(plan.is_cacheable(), "unexpected plan: {plan:?}");
+            assert_eq!(plan.program, program);
+            assert_ne!(cache_key(&plan, &PromptEnvironment::default()), None);
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_platform_launchers_and_aliases_cannot_reuse_direct_cache_keys() {
+        let directory = TestDirectory::new();
+        for (runtime, name) in [
+            (Runtime::C, "clang"),
+            (Runtime::Cpp, "clang++"),
+            (Runtime::C, "gcc"),
+            (Runtime::Cpp, "g++"),
+            (Runtime::Swift, "swift"),
+            (Runtime::Java, "java"),
+        ] {
+            let system_program = Path::new("/usr/bin").join(name);
+            if !super::is_executable_file(&system_program) {
+                continue;
+            }
+            let alias = directory.path().join(name);
+            std::os::unix::fs::symlink(&system_program, &alias).unwrap();
+            for program in [system_program, alias] {
+                let spec = super::super::spec(runtime);
+                // Model the stale identity stored by the old direct classifier.
+                let previous = super::RuntimePlan {
+                    runtime,
+                    spec: spec.clone(),
+                    program: program.clone(),
+                    cache: Cacheability::Cacheable(super::executable_identity(&program).unwrap()),
+                };
+                let plan = super::finalize_plan(
+                    directory.path(),
+                    super::BasePlan {
+                        runtime,
+                        spec,
+                        program: program.clone(),
+                        available: true,
+                    },
+                    &PromptEnvironment::default(),
+                );
+                assert!(
+                    matches!(
+                        plan.cache,
+                        Cacheability::Volatile(VolatileReason::UnsupportedContextualSelection)
+                    ),
+                    "unexpected plan: {plan:?}"
+                );
+                assert_eq!(plan.program, program);
+                let environment = PromptEnvironment::default();
+                let key = cache_key(&plan, &environment);
+                assert_eq!(key, None);
+                assert_ne!(key, cache_key(&previous, &environment));
+            }
+        }
+    }
+
+    #[test]
+    fn dependency_reads_reject_special_files_and_allow_regular_symlinks() {
+        let directory = TestDirectory::new();
+        let fifo = directory.path().join("selector-fifo");
+        assert!(
+            std::process::Command::new("mkfifo")
+                .arg(&fifo)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let link = directory.path().join("selector-link");
+        std::os::unix::fs::symlink(&fifo, &link).unwrap();
+        for path in [&fifo, &link, directory.path(), Path::new("/dev/null")] {
+            assert_eq!(
+                super::read_file_limited(path).unwrap_err().kind(),
+                std::io::ErrorKind::InvalidData
+            );
+            assert_eq!(
+                super::read_single_token(path).unwrap_err().kind(),
+                std::io::ErrorKind::InvalidData
+            );
+            assert_eq!(
+                super::has_shebang(path).unwrap_err().kind(),
+                std::io::ErrorKind::InvalidData
+            );
+        }
+        assert!(super::find_up_bounded(directory.path(), "selector-fifo").is_err());
+        fs::remove_file(&fifo).unwrap();
+        fs::write(&fifo, b"stable\n").unwrap();
+        assert_eq!(
+            super::read_single_token(&link).unwrap(),
+            OsStr::new("stable")
+        );
+    }
+
+    #[test]
     fn path_resolution_uses_shell_empty_and_relative_entries() {
         let directory = TestDirectory::new();
         let cwd = directory.path().join("project");
@@ -1324,8 +1526,8 @@ mod tests {
         let suffixed_path = std::env::join_paths([bin.as_path(), unused.as_path()]).unwrap();
         let second = python_plan(directory.path(), suffixed_path.to_str().unwrap());
         let environment = PromptEnvironment::default();
-        let first_key = cache_key(&[first], &environment);
-        let second_key = cache_key(&[second], &environment);
+        let first_key = cache_key(&first, &environment);
+        let second_key = cache_key(&second, &environment);
         assert_eq!(first_key, second_key);
     }
 
@@ -1343,8 +1545,8 @@ mod tests {
         let first = python_plan(directory.path(), first_bin.to_str().unwrap());
         let second = python_plan(directory.path(), second_bin.to_str().unwrap());
         assert_ne!(
-            cache_key(&[first], &PromptEnvironment::default()),
-            cache_key(&[second], &PromptEnvironment::default())
+            cache_key(&first, &PromptEnvironment::default()),
+            cache_key(&second, &PromptEnvironment::default())
         );
     }
 
@@ -1356,11 +1558,11 @@ mod tests {
         let program = bin.join("python");
         executable(&program);
         let first = python_plan(directory.path(), bin.to_str().unwrap());
-        let first_key = cache_key(&[first], &PromptEnvironment::default());
+        let first_key = cache_key(&first, &PromptEnvironment::default());
 
         fs::write(&program, b"replacement-with-a-different-size").unwrap();
         let second = python_plan(directory.path(), bin.to_str().unwrap());
-        let second_key = cache_key(&[second], &PromptEnvironment::default());
+        let second_key = cache_key(&second, &PromptEnvironment::default());
         assert_ne!(first_key, second_key);
     }
 
@@ -1380,8 +1582,8 @@ mod tests {
             ..PromptEnvironment::default()
         };
         assert_eq!(
-            cache_key(std::slice::from_ref(&first), &first_environment),
-            cache_key(std::slice::from_ref(&first), &second_environment)
+            cache_key(&first, &first_environment),
+            cache_key(&first, &second_environment)
         );
     }
 
@@ -1821,8 +2023,8 @@ mod tests {
             ..PromptEnvironment::default()
         };
         assert_eq!(
-            cache_key(std::slice::from_ref(&julia), &PromptEnvironment::default()),
-            cache_key(std::slice::from_ref(&julia), &julia_selectors)
+            cache_key(&julia, &PromptEnvironment::default()),
+            cache_key(&julia, &julia_selectors)
         );
 
         let r_selectors = PromptEnvironment {
@@ -1831,8 +2033,8 @@ mod tests {
             ..PromptEnvironment::default()
         };
         assert_eq!(
-            cache_key(std::slice::from_ref(&r), &PromptEnvironment::default()),
-            cache_key(std::slice::from_ref(&r), &r_selectors)
+            cache_key(&r, &PromptEnvironment::default()),
+            cache_key(&r, &r_selectors)
         );
     }
 

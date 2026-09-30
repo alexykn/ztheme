@@ -942,16 +942,63 @@ style = { foreground = "accent" }
     }
 
     #[test]
-    fn custom_segment_theme_contracts_are_validated() {
-        for overlay in [
-            // Control character in prefix.
-            "version = 1\n[layout]\nlines = [[\"time\"]]\n[segments.custom.time]\nprefix = \"bad\\n\"\nstyle = { foreground = \"accent\" }\n",
-            // Unknown palette color in style.
-            "version = 1\n[layout]\nlines = [[\"time\"]]\n[segments.custom.time]\nstyle = { foreground = \"nope\" }\n",
-            // Excessive spacing.
-            "version = 1\n[layout]\nlines = [[\"time\"]]\n[segments.custom.time]\nstyle = { foreground = \"accent\" }\nspacing = { after = 17 }\n",
-        ] {
-            assert!(validate_overlay(overlay).is_err(), "accepted {overlay}");
+    fn custom_and_clock_segment_theme_contracts_are_validated() {
+        for segment in ["clock", "custom.time"] {
+            for fields in [
+                r#"prefix = "bad\n""#,
+                r#"suffix = "bad\u001b""#,
+                r#"style = { foreground = "missing_color" }"#,
+                r#"style = { background = "missing_color" }"#,
+                r##"style = { foreground = "#gg1122" }"##,
+                r##"style = { background = "#123" }"##,
+                "spacing = { before = 17 }",
+                "spacing = { after = 17 }",
+            ] {
+                // Unused entries are still emitted by shell initialization.
+                let overlay = format!(
+                    "version = 1\n[layout]\nlines = [[\"directory\"]]\nright = []\n\
+                     [segments.{segment}]\n{fields}\n"
+                );
+                // Custom entries have no inherited style, unlike clock.
+                let overlay = if segment == "custom.time" && !fields.starts_with("style") {
+                    format!("{overlay}style = {{ foreground = \"accent\" }}\n")
+                } else {
+                    overlay
+                };
+                let theme = merged_theme(&overlay).unwrap();
+                assert!(validate(&theme).is_err(), "accepted {overlay}");
+            }
+        }
+    }
+
+    #[test]
+    fn valid_clock_theme_compiles_with_or_without_a_clock_layout_entry() {
+        for right in ["[]", "[\"clock\"]"] {
+            let overlay = format!(
+                r##"
+version = 1
+[layout]
+lines = [["directory"]]
+right = {right}
+[segments.clock]
+prefix = "time % "
+suffix = " !"
+style = {{ foreground = "accent", background = "#112233", bold = true }}
+spacing = {{ before = 16, after = 16 }}
+"##
+            );
+            let theme = merged_theme(&overlay).unwrap();
+            let layout = validate(&theme).unwrap();
+            let zsh = CompiledTheme {
+                theme,
+                layout,
+                selector: "clock-test".to_owned(),
+            }
+            .zsh()
+            .unwrap();
+            assert!(zsh.contains("clock:default"));
+            assert!(zsh.contains("%F{#f9e2af}%K{#112233}%B"));
+            assert!(zsh.contains("time %% "));
         }
     }
 

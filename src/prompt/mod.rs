@@ -1,16 +1,18 @@
 mod client;
+mod planning;
 mod protocol;
 
 pub(crate) use client::serve_client;
 
+use std::collections::HashMap;
 use std::env;
 use std::fmt::Write as _;
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::sync::oneshot;
+use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinSet;
 use tokio::time::{Instant, timeout_at};
 
@@ -29,34 +31,37 @@ const ZSH_CLOCK_SEGMENT: &str = include_str!("../../shell/segments/clock.zsh");
 const ZSH_STATUS_SEGMENT: &str = include_str!("../../shell/segments/status.zsh");
 const ZSH_CHARACTER_SEGMENT: &str = include_str!("../../shell/segments/character.zsh");
 
-pub async fn snapshot(
+async fn snapshot(
     generation: u64,
     cwd: PathBuf,
     instance: daemon::Instance,
     environment: Arc<PromptEnvironment>,
     theme: &theme::AsyncTheme,
+    executor: planning::PlanningExecutor,
 ) -> io::Result<()> {
     let git_enabled = theme.git_enabled();
     let active_runtimes = theme.runtimes();
     let deadline = Instant::now() + REQUEST_TIMEOUT;
     let mut tasks = JoinSet::new();
+    // The coordinator owns the only receiver. At most one completion per
+    // selected runtime plus group markers can be buffered for this generation.
+    let (events, mut completions) = mpsc::channel(Runtime::ALL.len() + 3);
 
     let git_started = if git_enabled {
         let (started_tx, started_rx) = oneshot::channel();
         let git_instance = instance.clone();
         let git_cwd = cwd.clone();
         let git_environment = Arc::clone(&environment);
+        let git_executor = executor.clone();
+        let git_events = events.clone();
         tasks.spawn(async move {
             let _ = started_tx.send(());
-            let result = match gitstatus::Query::from_values(
-                &git_cwd,
-                git_environment.git_dir.as_deref(),
-                git_environment.git_work_tree.as_deref(),
-            ) {
-                Ok(query) => daemon::git_status(&git_instance, &query).await,
+            let result = match git_executor.git_query(git_cwd, git_environment).await {
+                Ok(Some(query)) => daemon::git_status(&git_instance, &query).await,
+                Ok(None) => Ok(None),
                 Err(error) => Err(error),
             };
-            SnapshotResult::Git(result)
+            let _ = git_events.send(SnapshotResult::Git(result)).await;
         });
         Some(started_rx)
     } else {
@@ -72,42 +77,60 @@ pub async fn snapshot(
         let runtime_cwd = cwd.clone();
         let requested = active_runtimes.clone();
         let runtime_environment = Arc::clone(&environment);
+        let runtime_events = events.clone();
         tasks.spawn(async move {
-            SnapshotResult::Runtimes(
-                runtime_values(
-                    &runtime_instance,
-                    runtime_cwd,
-                    requested,
-                    runtime_environment,
-                )
-                .await,
+            stream_runtimes(
+                &runtime_instance,
+                planning::PlanningRequest {
+                    cwd: runtime_cwd,
+                    active: requested,
+                    environment: runtime_environment,
+                    executor,
+                },
+                runtime_events,
             )
+            .await;
         });
     }
+    drop(events);
 
-    while !tasks.is_empty() {
-        let Ok(Some(result)) = timeout_at(deadline, tasks.join_next()).await else {
-            break;
-        };
-        write_result(result, generation, &active_runtimes, theme)?;
+    let mut receiving = true;
+    while receiving || !tasks.is_empty() {
+        tokio::select! {
+            () = tokio::time::sleep_until(deadline) => break,
+            event = completions.recv(), if receiving => {
+                if let Some(event) = event {
+                    write_result(event, generation, &active_runtimes, theme)?;
+                } else {
+                    receiving = false;
+                }
+            }
+            result = tasks.join_next(), if !tasks.is_empty() => {
+                if let Some(Err(error)) = result {
+                    protocol::write_error(
+                        &mut io::stdout().lock(), generation, "snapshot",
+                        &record_error(&io::Error::other(error)),
+                    )?;
+                }
+            }
+        }
     }
 
     tasks.abort_all();
     protocol::write_done(&mut io::stdout().lock(), generation)
 }
 
-/// Renders one completed task result as protocol records: a Git snapshot or
-/// error segment, then the runtime segments that have values. `done` is
-/// written separately once every task has finished or the deadline passed.
+/// Renders one typed completion immediately. Runtime group completion is a
+/// separate event, sent only after every independent runtime owner has finished.
 fn write_result(
-    result: Result<SnapshotResult, tokio::task::JoinError>,
+    result: SnapshotResult,
     generation: u64,
     active_runtimes: &[Runtime],
     theme: &theme::AsyncTheme,
 ) -> io::Result<()> {
     let mut output = io::stdout().lock();
     match result {
-        Ok(SnapshotResult::Git(Ok(snapshot))) => {
+        SnapshotResult::Git(Ok(snapshot)) => {
             protocol::write_segment(
                 &mut output,
                 generation,
@@ -119,31 +142,40 @@ fn write_result(
             // instead of holding the prompt blank until the final `done`.
             protocol::write_complete(&mut output, generation, "git")
         }
-        Ok(SnapshotResult::Git(Err(error))) => {
+        SnapshotResult::Git(Err(error)) => {
             protocol::write_error(&mut output, generation, "git", &record_error(&error))?;
             protocol::write_complete(&mut output, generation, "git")
         }
-        Ok(SnapshotResult::Runtimes(Ok(values))) => {
+        SnapshotResult::Runtime { runtime, value } => {
+            let value = match value {
+                Ok(value) => value,
+                Err(error) => {
+                    // A per-runtime failure must not clear completed siblings.
+                    protocol::write_error(
+                        &mut output,
+                        generation,
+                        runtime.name(),
+                        &record_error(&error),
+                    )?;
+                    None
+                }
+            };
+            let fragment = value
+                .as_ref()
+                .and_then(|value| theme.render_runtime(value))
+                .unwrap_or_default();
+            protocol::write_segment(&mut output, generation, runtime.name(), &fragment)
+        }
+        SnapshotResult::RuntimeComplete => {
+            protocol::write_complete(&mut output, generation, "runtime")
+        }
+        SnapshotResult::RuntimePlanningFailed(error) => {
+            protocol::write_error(&mut output, generation, "runtime", &record_error(&error))?;
             for runtime in active_runtimes {
-                let fragment = values
-                    .iter()
-                    .find(|value| value.runtime == *runtime)
-                    .and_then(|value| theme.render_runtime(value))
-                    .unwrap_or_default();
-                protocol::write_segment(&mut output, generation, runtime.name(), &fragment)?;
+                protocol::write_segment(&mut output, generation, runtime.name(), "")?;
             }
             protocol::write_complete(&mut output, generation, "runtime")
         }
-        Ok(SnapshotResult::Runtimes(Err(error))) => {
-            protocol::write_error(&mut output, generation, "runtime", &record_error(&error))?;
-            protocol::write_complete(&mut output, generation, "runtime")
-        }
-        Err(error) => protocol::write_error(
-            &mut output,
-            generation,
-            "snapshot",
-            &record_error(&io::Error::other(error)),
-        ),
     }
 }
 
@@ -207,18 +239,35 @@ fn lock_flag(enabled: bool) -> String {
     if enabled { "1" } else { "0" }.to_owned()
 }
 
-/// Emits one `source` line and a declared-function check per resolved custom
-/// segment. Paths are single-quoted with the shared shell quoting; ids are
-/// validated identifiers, safe to interpolate into generated function names.
+/// Sources each custom file with its old symbol absent, then stages only the
+/// freshly declared function. The shell preparation wrapper restores current
+/// functions and owned state before installing any staged definitions. Paths
+/// use shared shell quoting; ids are validated identifiers.
 fn custom_segment_block(sources: &[theme::ResolvedCustomSegment]) -> String {
     let mut output = String::new();
     for source in sources {
         writeln!(
             output,
-            "builtin source -- {} || return 1",
+            "builtin unfunction ztheme_segment_{} 2>/dev/null",
+            source.id
+        )
+        .expect("writing to a String cannot fail");
+        writeln!(
+            output,
+            "if ! builtin source -- {}; then",
             shell_quote(&source.path.to_string_lossy())
         )
         .expect("writing to a String cannot fail");
+        writeln!(
+            output,
+            "    builtin print -u2 -r -- {}",
+            shell_quote(&format!(
+                "ztheme: failed to source custom segment `{}`",
+                source.id
+            ))
+        )
+        .expect("writing to a String cannot fail");
+        writeln!(output, "    return 1\nfi").expect("writing to a String cannot fail");
         writeln!(
             output,
             "if (( ! $+functions[ztheme_segment_{}] )); then",
@@ -236,6 +285,12 @@ fn custom_segment_block(sources: &[theme::ResolvedCustomSegment]) -> String {
         .expect("writing to a String cannot fail");
         writeln!(output, "    return 1").expect("writing to a String cannot fail");
         writeln!(output, "fi").expect("writing to a String cannot fail");
+        writeln!(
+            output,
+            "ztheme_custom_definitions[ztheme_segment_{}]=$functions[ztheme_segment_{}]",
+            source.id, source.id
+        )
+        .expect("writing to a String cannot fail");
     }
     output
 }
@@ -250,282 +305,192 @@ pub fn theme_zsh(instance: &daemon::Instance, selector: &str, persist: bool) -> 
 
 enum SnapshotResult {
     Git(io::Result<Option<gitstatus::Snapshot>>),
-    Runtimes(io::Result<Vec<RuntimeValue>>),
+    Runtime {
+        runtime: Runtime,
+        value: io::Result<Option<RuntimeValue>>,
+    },
+    RuntimeComplete,
+    RuntimePlanningFailed(io::Error),
 }
 
-async fn runtime_values(
+async fn stream_runtimes(
     instance: &daemon::Instance,
-    cwd: PathBuf,
-    active: Vec<Runtime>,
-    environment: Arc<PromptEnvironment>,
-) -> io::Result<Vec<RuntimeValue>> {
-    let plans = build_plans(&cwd, &active, Arc::clone(&environment)).await?;
-    let (cacheable, volatile) = partition_plans(plans);
-    let cached = cached_runtime_values(
-        instance,
-        cwd.clone(),
-        active.clone(),
-        Arc::clone(&environment),
-        cacheable,
-        true,
-    );
-    let volatile_count = volatile.len();
-    let volatile = runtime::execute_plans(volatile, cwd, Arc::clone(&environment));
-    let (cached, volatile) = tokio::join!(cached, volatile);
-    let mut values = cached?;
-    values.extend(materialize_executions(
-        volatile,
-        volatile_count,
-        &environment,
-    ));
-    Ok(merge_runtime_values(values))
-}
-
-async fn build_plans(
-    cwd: &Path,
-    active: &[Runtime],
-    environment: Arc<PromptEnvironment>,
-) -> io::Result<Vec<runtime::cache::RuntimePlan>> {
-    let detection_cwd = cwd.to_path_buf();
-    let detection_active = active.to_vec();
-    let detection_environment = Arc::clone(&environment);
-    let detection = tokio::task::spawn_blocking(move || {
-        let git_root = runtime::detect::worktree_root(&detection_cwd, &detection_environment);
-        runtime::detect::detect(
-            &detection_cwd,
-            git_root.as_deref(),
-            &detection_active,
-            &detection_environment,
-        )
-    });
-
-    let base_active = active.to_vec();
-    let base_cwd = cwd.to_path_buf();
-    let base_environment = Arc::clone(&environment);
-    let base_plans = tokio::task::spawn_blocking(move || {
-        runtime::cache::resolve_base_plans(&base_active, &base_cwd, &base_environment)
-    });
-
-    let (project, base_plans) = tokio::try_join!(detection, base_plans)
-        .map_err(|error| io::Error::other(format!("runtime planning task failed: {error}")))?;
-    Ok(runtime::cache::finalize_plans(
-        cwd,
-        &project,
-        base_plans,
-        &environment,
-    ))
-}
-
-fn partition_plans(
-    plans: Vec<runtime::cache::RuntimePlan>,
-) -> (
-    Vec<runtime::cache::RuntimePlan>,
-    Vec<runtime::cache::RuntimePlan>,
+    request: planning::PlanningRequest,
+    events: mpsc::Sender<SnapshotResult>,
 ) {
-    plans.into_iter().partition(|plan| match &plan.cache {
-        runtime::cache::Cacheability::Cacheable(_) => true,
-        runtime::cache::Cacheability::Volatile(reason) => {
-            let _ = reason;
-            false
-        }
-    })
-}
-
-async fn cached_runtime_values(
-    instance: &daemon::Instance,
-    cwd: PathBuf,
-    active: Vec<Runtime>,
-    environment: Arc<PromptEnvironment>,
-    plans: Vec<runtime::cache::RuntimePlan>,
-    retry_selection: bool,
-) -> io::Result<Vec<RuntimeValue>> {
-    if plans.is_empty() {
-        return Ok(Vec::new());
-    }
-    let key = runtime::cache::cache_key(&plans, &environment);
-    let acquire = daemon::runtime_cache_acquire(instance, key).await;
-    let mut acquire = match acquire {
-        Ok(value) => value,
+    // Detect the project once. Every selected runtime then owns its acquire,
+    // command, retry, and persistence independently of its siblings.
+    let plans = match request.build().await {
+        Ok(plans) => plans,
         Err(error) => {
-            eprintln!("ztheme: runtime cache unavailable: {error}");
-            let expected = plans.len();
-            let executions = runtime::execute_plans(plans, cwd, Arc::clone(&environment)).await;
-            return Ok(materialize_executions(executions, expected, &environment));
+            let _ = events
+                .send(SnapshotResult::RuntimePlanningFailed(error))
+                .await;
+            return;
         }
     };
-
-    let mut corrupt_retried = false;
-    loop {
-        match acquire {
-            Acquire::Hit(value) => match runtime::decode(&value) {
-                Ok(values) if same_runtime_set(&plans, &values) => {
-                    return Ok(values
-                        .into_iter()
-                        .map(|value| runtime::materialize(value, &environment))
-                        .collect());
-                }
-                Ok(_) | Err(_) if !corrupt_retried => {
-                    corrupt_retried = true;
-                    let _ = daemon::runtime_cache_remove(instance, key).await;
-                    acquire =
-                        daemon::runtime_cache_acquire(instance, key)
-                            .await
-                            .map_err(|error| {
-                                io::Error::other(format!(
-                                    "runtime cache reacquire failed: {error:?}"
-                                ))
-                            })?;
-                }
-                Ok(_) | Err(_) => {
-                    let expected = plans.len();
-                    let executions =
-                        runtime::execute_plans(plans, cwd, Arc::clone(&environment)).await;
-                    return Ok(materialize_executions(executions, expected, &environment));
-                }
-            },
-            Acquire::Owner(token) => {
-                let before = key;
-                let executions =
-                    runtime::execute_plans(plans.clone(), cwd.clone(), Arc::clone(&environment))
-                        .await;
-                let (values, complete) = execution_values(executions, plans.len(), &environment);
-                if !complete {
-                    let _ = daemon::runtime_cache_release(instance, key, token).await;
-                    return Ok(values);
-                }
-
-                let refreshed = build_plans(&cwd, &active, Arc::clone(&environment)).await?;
-                let (refreshed_cacheable, _) = partition_plans(refreshed);
-                let after = runtime::cache::cache_key(&refreshed_cacheable, &environment);
-                if before != after {
-                    let _ = daemon::runtime_cache_release(instance, key, token).await;
-                    if retry_selection {
-                        return Box::pin(refreshed_runtime_values(
-                            instance,
-                            cwd,
-                            active,
-                            environment,
-                        ))
-                        .await;
-                    }
-                    return Ok(values);
-                }
-
-                // A completed execution must produce a version for every value.
-                // Enforce that invariant explicitly instead of silently
-                // dropping missing versions: a cacheable runtime that executed
-                // without a parseable version is an internal error, and caching
-                // a versionless value would poison the semantic cache.
-                for value in &values {
-                    if value.version.is_none() {
-                        let _ = daemon::runtime_cache_release(instance, key, token).await;
-                        return Err(io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            format!(
-                                "runtime {} completed without a version while caching was required",
-                                value.runtime.name()
-                            ),
-                        ));
-                    }
-                }
-                let cached_values = values
-                    .iter()
-                    .map(|value| runtime::CachedRuntimeValue {
-                        runtime: value.runtime,
-                        version: value
-                            .version
-                            .clone()
-                            .expect("version presence verified above"),
-                        label: value.label.clone(),
-                    })
-                    .collect::<Vec<_>>();
-                let encoded = runtime::encode(&cached_values)?;
-                let _ = daemon::runtime_cache_put_owned(instance, key, token, &encoded).await;
-                return Ok(values);
-            }
+    for runtime in &request.active {
+        if !plans.iter().any(|plan| plan.runtime == *runtime)
+            && events
+                .send(SnapshotResult::Runtime {
+                    runtime: *runtime,
+                    value: Ok(None),
+                })
+                .await
+                .is_err()
+        {
+            return;
         }
     }
+    let mut tasks = JoinSet::new();
+    let mut owners = HashMap::new();
+    for plan in plans {
+        let runtime = plan.runtime;
+        let instance = instance.clone();
+        let request = request.clone();
+        let owner = tasks.spawn(async move {
+            runtime_execution(&instance, &request, plan)
+                .await
+                .map(|execution| execution_value(execution, &request.environment))
+        });
+        owners.insert(owner.id(), runtime);
+    }
+
+    while let Some(result) = tasks.join_next_with_id().await {
+        let (id, value) = match result {
+            Ok(result) => result,
+            Err(error) => (error.id(), Err(io::Error::other(error))),
+        };
+        let runtime = owners.remove(&id).expect("every runtime task has an owner");
+        if events
+            .send(SnapshotResult::Runtime { runtime, value })
+            .await
+            .is_err()
+        {
+            return;
+        }
+    }
+    let _ = events.send(SnapshotResult::RuntimeComplete).await;
 }
 
-async fn refreshed_runtime_values(
+async fn runtime_execution(
     instance: &daemon::Instance,
-    cwd: PathBuf,
-    active: Vec<Runtime>,
-    environment: Arc<PromptEnvironment>,
-) -> io::Result<Vec<RuntimeValue>> {
-    let plans = build_plans(&cwd, &active, Arc::clone(&environment)).await?;
-    let (cacheable, volatile) = partition_plans(plans);
-    let cached = cached_runtime_values(
-        instance,
-        cwd.clone(),
-        active,
-        Arc::clone(&environment),
-        cacheable,
-        false,
-    );
-    let volatile_count = volatile.len();
-    let volatile = runtime::execute_plans(volatile, cwd, Arc::clone(&environment));
-    let (cached, volatile) = tokio::join!(cached, volatile);
-    let mut values = cached?;
-    values.extend(materialize_executions(
-        volatile,
-        volatile_count,
-        &environment,
-    ));
-    Ok(merge_runtime_values(values))
-}
-
-fn same_runtime_set(
-    plans: &[runtime::cache::RuntimePlan],
-    values: &[runtime::CachedRuntimeValue],
-) -> bool {
-    let expected = plans.iter().map(|plan| plan.runtime).collect::<Vec<_>>();
-    let actual = values.iter().map(|value| value.runtime).collect::<Vec<_>>();
-    expected == actual
-}
-
-fn execution_values(
-    executions: Vec<runtime::RuntimeExecution>,
-    expected: usize,
-    environment: &PromptEnvironment,
-) -> (Vec<RuntimeValue>, bool) {
-    let mut complete = executions.len() == expected;
-    let mut values = Vec::new();
-    for execution in executions {
-        match execution.outcome {
-            RuntimeOutcome::Value(value) => values.push(runtime::materialize(value, environment)),
-            RuntimeOutcome::MissingExecutable => {
-                // The runtime is detected but its executable is not installed.
-                // Surface a value without a version so the segment can still
-                // render its symbol and language name.
-                complete = false;
-                values.push(RuntimeValue {
-                    runtime: execution.runtime,
-                    version: None,
-                    label: None,
-                    environment: None,
+    request: &planning::PlanningRequest,
+    mut plan: runtime::cache::RuntimePlan,
+) -> io::Result<runtime::RuntimeExecution> {
+    // One selection retry belongs to this runtime, not to the whole prompt.
+    for attempt in 0..=1 {
+        let Some(key) = runtime::cache::cache_key(&plan, &request.environment) else {
+            return Ok(runtime::execute_plan(plan, &request.cwd, &request.environment).await);
+        };
+        let acquired = acquire_runtime(instance, key, plan.runtime).await;
+        match acquired {
+            Ok(RuntimeAcquire::Hit(value)) => {
+                return Ok(runtime::RuntimeExecution {
+                    runtime: plan.runtime,
+                    outcome: RuntimeOutcome::Value(value),
                 });
             }
-            RuntimeOutcome::TransientFailure => {
-                complete = false;
+            Ok(RuntimeAcquire::Owner(token)) => {
+                let execution =
+                    runtime::execute_plan(plan.clone(), &request.cwd, &request.environment).await;
+                let RuntimeOutcome::Value(value) = &execution.outcome else {
+                    let _ = daemon::runtime_cache_release(instance, key, token).await;
+                    return Ok(execution);
+                };
+                let refreshed = match request.refresh(plan.runtime).await {
+                    Ok(refreshed) => refreshed,
+                    Err(error) => {
+                        let _ = daemon::runtime_cache_release(instance, key, token).await;
+                        return Err(error);
+                    }
+                };
+                if runtime::cache::cache_key(&refreshed, &request.environment) != Some(key) {
+                    let _ = daemon::runtime_cache_release(instance, key, token).await;
+                    if attempt == 0 {
+                        plan = refreshed;
+                        continue;
+                    }
+                    // Neither command proved a stable selection. Do not render
+                    // an old selected version as the current one or cache it.
+                    return Ok(runtime::RuntimeExecution {
+                        runtime: plan.runtime,
+                        outcome: RuntimeOutcome::TransientFailure,
+                    });
+                }
+                let encoded = match runtime::encode(std::slice::from_ref(value)) {
+                    Ok(encoded) => encoded,
+                    Err(error) => {
+                        let _ = daemon::runtime_cache_release(instance, key, token).await;
+                        return Err(error);
+                    }
+                };
+                let _ = daemon::runtime_cache_put_owned(instance, key, token, &encoded).await;
+                return Ok(execution);
+            }
+            Err(error) => {
+                eprintln!("ztheme: runtime cache unavailable: {error}");
+                return Ok(runtime::execute_plan(plan, &request.cwd, &request.environment).await);
             }
         }
     }
-    (values, complete)
+    unreachable!("the final selection attempt always returns")
 }
 
-fn materialize_executions(
-    executions: Vec<runtime::RuntimeExecution>,
-    expected: usize,
+/// Validate the opaque cache boundary, including the singleton's stable ID.
+/// A corrupt entry is removed and reacquired once; transport/corruption failure
+/// then falls back to uncached execution for this runtime only.
+async fn acquire_runtime(
+    instance: &daemon::Instance,
+    key: crate::cache::CacheKey,
+    runtime: Runtime,
+) -> io::Result<RuntimeAcquire> {
+    for attempt in 0..=1 {
+        match daemon::runtime_cache_acquire(instance, key).await? {
+            Acquire::Owner(token) => return Ok(RuntimeAcquire::Owner(token)),
+            Acquire::Hit(encoded) => match decode_runtime(&encoded, runtime) {
+                Ok(value) => return Ok(RuntimeAcquire::Hit(value)),
+                Err(_) if attempt == 0 => {
+                    let _ = daemon::runtime_cache_remove(instance, key).await;
+                }
+                Err(error) => return Err(error),
+            },
+        }
+    }
+    unreachable!("the final acquire attempt always returns")
+}
+
+enum RuntimeAcquire {
+    Hit(runtime::CachedRuntimeValue),
+    Owner(u64),
+}
+
+fn decode_runtime(encoded: &[u8], runtime: Runtime) -> io::Result<runtime::CachedRuntimeValue> {
+    let mut values = runtime::decode(encoded)?;
+    if values.len() != 1 || values[0].runtime != runtime {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "runtime cache value does not match the requested runtime",
+        ));
+    }
+    Ok(values.pop().expect("singleton cache value verified"))
+}
+
+fn execution_value(
+    execution: runtime::RuntimeExecution,
     environment: &PromptEnvironment,
-) -> Vec<RuntimeValue> {
-    execution_values(executions, expected, environment).0
-}
-
-fn merge_runtime_values(mut values: Vec<RuntimeValue>) -> Vec<RuntimeValue> {
-    values.sort_unstable_by_key(|value| value.runtime);
-    values.dedup_by_key(|value| value.runtime);
-    values
+) -> Option<RuntimeValue> {
+    match execution.outcome {
+        RuntimeOutcome::Value(value) => Some(runtime::materialize(value, environment)),
+        // Keep the symbol/name when detected but not installed.
+        RuntimeOutcome::MissingExecutable => Some(RuntimeValue {
+            runtime: execution.runtime,
+            version: None,
+            label: None,
+            environment: None,
+        }),
+        RuntimeOutcome::TransientFailure => None,
+    }
 }
 
 fn record_error(error: &io::Error) -> String {
@@ -553,7 +518,33 @@ mod tests {
 
     use super::{ZSH_INTEGRATION, init_zsh};
     use crate::daemon::Instance;
-    use crate::prompt::protocol::{CONTEXT_EXCLUDED, REQUEST_FIELDS, REQUEST_VERSION};
+    use crate::environment::REQUEST_FIELDS;
+    use crate::prompt::protocol::{CONTEXT_EXCLUDED, REQUEST_VERSION};
+
+    #[test]
+    fn runtime_cache_boundary_requires_one_value_with_the_selected_stable_id() {
+        use crate::runtime::{CachedRuntimeValue, Runtime};
+
+        let value = |runtime| CachedRuntimeValue {
+            runtime,
+            version: "1.2.3".to_owned(),
+            label: None,
+        };
+        let singleton = crate::runtime::encode(&[value(Runtime::Node)]).unwrap();
+        assert_eq!(
+            super::decode_runtime(&singleton, Runtime::Node)
+                .unwrap()
+                .runtime,
+            Runtime::Node
+        );
+        assert!(super::decode_runtime(&singleton, Runtime::Python).is_err());
+        assert!(
+            super::decode_runtime(&crate::runtime::encode(&[]).unwrap(), Runtime::Node).is_err()
+        );
+        let aggregate =
+            crate::runtime::encode(&[value(Runtime::Node), value(Runtime::Python)]).unwrap();
+        assert!(super::decode_runtime(&aggregate, Runtime::Node).is_err());
+    }
 
     /// A scratch directory for init-time artifacts, removed on drop.
     struct Scratch(PathBuf);
@@ -606,18 +597,22 @@ mod tests {
         assert!(script.contains(&version_line), "version not spliced");
 
         for field in REQUEST_FIELDS {
-            let line = format!("request_line+=\"${{{field}:-}}\"$'\\0'");
+            let line = format!("request_line+=\"${{{}:-}}\"$'\\0'", field.name);
             assert!(script.contains(&line), "missing request field line {line}");
         }
         for field in REQUEST_FIELDS
             .iter()
-            .copied()
+            .map(|field| field.name)
             .filter(|field| !CONTEXT_EXCLUDED.contains(field))
         {
             let line = format!("context_key+=\"|${{{field}:-}}\"");
             assert!(script.contains(&line), "missing context field line {line}");
         }
         assert!(script.contains("context_key+=\"|${NVM_BIN:-}|$PATH\""));
+        // Independent contract checks: these inputs affect selection even
+        // though PATH has a separate raw suffix in the key.
+        assert!(script.contains("context_key+=\"|${HOME:-}\""));
+        assert!(script.contains("context_key+=\"|${GIT_CEILING_DIRECTORIES:-}\""));
 
         for token in [
             "@ZTHEME_REQUEST_VERSION@",

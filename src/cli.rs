@@ -201,7 +201,7 @@ pub(crate) fn run() {
             instance,
             shell_pid,
             theme,
-        } => run_async(prompt::serve_client(instance, shell_pid, Arc::new(*theme))),
+        } => run_client_async(prompt::serve_client(instance, shell_pid, Arc::new(*theme))),
         Request::Daemon { instance } => run_async(daemon::serve(&instance)),
     };
     finish(result);
@@ -305,11 +305,49 @@ fn run_async(future: impl Future<Output = io::Result<()>>) -> io::Result<()> {
         .block_on(future)
 }
 
+/// Client filesystem workers can remain blocked in the kernel after EOF or
+/// parent death. Do not let runtime destruction keep the client process alive.
+/// Daemon and clear retain their normal, fully awaited shutdown semantics.
+fn run_client_async(future: impl Future<Output = io::Result<()>>) -> io::Result<()> {
+    let runtime = Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(io::Error::other)?;
+    let result = runtime.block_on(future);
+    runtime.shutdown_timeout(std::time::Duration::from_millis(25));
+    result
+}
+
 #[cfg(test)]
 mod tests {
     use clap::{CommandFactory as _, Parser as _};
 
     use super::{Cli, Command, InitCommand, ThemeCommand};
+
+    #[test]
+    fn client_shutdown_returns_while_a_blocking_worker_is_still_running() {
+        use std::sync::mpsc;
+        use std::time::{Duration, Instant};
+
+        let (release, blocked) = mpsc::channel();
+        let (started, ready) = tokio::sync::oneshot::channel();
+        let (finished, done) = mpsc::channel();
+        let before = Instant::now();
+        super::run_client_async(async move {
+            tokio::task::spawn_blocking(move || {
+                started.send(()).unwrap();
+                let _ = blocked.recv();
+                finished.send(()).unwrap();
+            });
+            ready.await.unwrap();
+            Ok(())
+        })
+        .unwrap();
+        assert!(before.elapsed() < Duration::from_millis(500));
+        assert!(matches!(done.try_recv(), Err(mpsc::TryRecvError::Empty)));
+        release.send(()).unwrap();
+        done.recv_timeout(Duration::from_secs(1)).unwrap();
+    }
 
     #[test]
     fn public_and_internal_commands_parse() {
