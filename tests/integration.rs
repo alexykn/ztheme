@@ -1861,11 +1861,16 @@ fn client_rejects_fifo_rustup_settings_and_serves_new_generations_within_deadlin
     let rustup_home = sandbox.home.join("rustup");
     fs::create_dir_all(&bin).unwrap();
     fs::create_dir_all(&rustup_home).unwrap();
-    // Hard-linked rustc/rustup is recognized as a proxy. The fallback command
-    // needs no external tools and succeeds when selector planning is rejected.
-    fs::write(bin.join("rustup"), "#!/bin/sh\nprintf 'rustc 1.99.0\\n'\n").unwrap();
-    fs::set_permissions(bin.join("rustup"), fs::Permissions::from_mode(0o700)).unwrap();
-    fs::hard_link(bin.join("rustup"), bin.join("rustc")).unwrap();
+    // Hard-linked rustc/rustup is recognized as a proxy. Keep its fallback
+    // native and warmed so shell startup cannot consume the command budget;
+    // the behavior under test is rejection of the FIFO selector.
+    let rustup = compile_c(
+        &sandbox,
+        "rustup",
+        "#include <stdio.h>\nint main(void) { puts(\"rustc 1.99.0\"); return 0; }\n",
+    );
+    fs::hard_link(rustup, bin.join("rustc")).unwrap();
+    warm_executable(&bin.join("rustc"));
     assert!(
         Command::new("mkfifo")
             .arg(rustup_home.join("settings.toml"))
@@ -3240,10 +3245,16 @@ fn assert_runtime_streaming(volatile_python: bool) {
     fs::write(sandbox.home.join("package.json"), b"{}\n").unwrap();
     fs::write(sandbox.home.join("pyproject.toml"), b"[project]\n").unwrap();
     let finished = sandbox.home.join("python-finished");
+    let release_python = sandbox.home.join("python-release");
+    // Warming may complete immediately. Real requests release Python only
+    // after observing Node, so ordering does not depend on a fixed sleep
+    // consuming most of the production command's 250 ms budget.
+    fs::write(&release_python, b"").unwrap();
     let mut python_path = install_fake_python(
         &sandbox,
         &format!(
-            "#include <stdio.h>\n#include <unistd.h>\nint main(void) {{ usleep(200000); fclose(fopen(\"{}\", \"w\")); puts(\"Python 3.12.0\"); return 0; }}\n",
+            "#include <stdio.h>\n#include <unistd.h>\nint main(void) {{ while (access(\"{}\", F_OK) != 0) usleep(1000); FILE *f = fopen(\"{}\", \"w\"); if (!f || fclose(f) != 0) return 1; puts(\"Python 3.12.0\"); return 0; }}\n",
+            release_python.display(),
             finished.display(),
         ),
     );
@@ -3283,7 +3294,8 @@ fn assert_runtime_streaming(volatile_python: bool) {
     // The second volatile generation proves Node came from its warm cache,
     // while Python still runs independently. Native Python is tested cold.
     for generation in 1..=if volatile_python { 2 } else { 1 } {
-        let _ = fs::remove_file(&finished);
+        fs::remove_file(&release_python).unwrap();
+        fs::remove_file(&finished).unwrap();
         stdin
             .write_all(&client_request_with_env(
                 generation,
@@ -3298,6 +3310,7 @@ fn assert_runtime_streaming(volatile_python: bool) {
             if record.contains("\tsegment\tnode\t") {
                 assert!(!python_finished, "Node waited for Python: {record}");
                 assert!(record.contains("24.5.0"), "{record}");
+                fs::write(&release_python, b"").unwrap();
             }
             let done = record.ends_with("\tdone\n");
             records.push(record);
