@@ -23,10 +23,10 @@ version detection, caching) happens in the Rust process; they cannot be
 reimplemented as Zsh segment files. Everything else is a shell function.
 
 The shell computes synchronous segments while the client resolves Git and
-runtime values. By default Git is locked and runtimes are unlocked: the first
-draw waits for Git (or the shared 550 ms deadline), then each runtime can redraw
-independently. Lock both groups via `[async.lock]` for one complete draw, or
-unlock both to display synchronous segments immediately. See
+runtime values. By default both groups are `auto`: the first draw waits up to
+100 ms for them and shows the last known values for anything still pending,
+which later values replace through a redraw. `[async]` sets each group to
+`locked` (wait for it) or `async` (never wait). See
 [Asynchronous rendering](../README.md#asynchronous-rendering).
 
 ## Why custom segments are synchronous

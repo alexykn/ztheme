@@ -9,7 +9,7 @@ use std::env;
 use std::fmt::Write as _;
 use std::io;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use tokio::sync::{mpsc, oneshot};
@@ -24,9 +24,10 @@ use crate::{daemon, gitstatus, setup, theme};
 pub(crate) use protocol::prompt_text;
 
 const REQUEST_TIMEOUT: Duration = Duration::from_millis(550);
-/// Bounds one Git exchange from its start, leaving room beneath the request
-/// deadline to report a timeout as a Git error record.
-const GIT_TIMEOUT: Duration = Duration::from_millis(500);
+/// Bounds one Git exchange from its start. The request's `done` does not wait
+/// for Git: a slow fresh result is still written for its generation, after
+/// `done`, until this cap or a newer request supersedes it.
+const GIT_TIMEOUT: Duration = Duration::from_secs(10);
 const ZSH_DEFAULTS: &str = include_str!("../../shell/defaults.zsh");
 const ZSH_INTEGRATION: &str = include_str!("../../shell/ztheme.zsh");
 const ZSH_DIRECTORY_SEGMENT: &str = include_str!("../../shell/segments/directory.zsh");
@@ -34,176 +35,272 @@ const ZSH_CLOCK_SEGMENT: &str = include_str!("../../shell/segments/clock.zsh");
 const ZSH_STATUS_SEGMENT: &str = include_str!("../../shell/segments/status.zsh");
 const ZSH_CHARACTER_SEGMENT: &str = include_str!("../../shell/segments/character.zsh");
 
+/// The repository whose Git value the shell holds, shared by one client's
+/// sequential requests: `None` when it holds no value or the client cannot
+/// tell. The shell keeps a Git value across prompts and directory changes, so
+/// a request for another repository must withdraw it before its own query
+/// finishes. Updated only as records are written, so it never runs ahead of
+/// what the shell received.
+#[derive(Clone, Default)]
+struct ShownRepository(Arc<Mutex<Option<gitstatus::Query>>>);
+
+impl ShownRepository {
+    fn holds(&self, query: Option<&gitstatus::Query>) -> bool {
+        self.lock().as_ref() == query
+    }
+
+    fn set(&self, query: Option<gitstatus::Query>) {
+        *self.lock() = query;
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, Option<gitstatus::Query>> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+/// Inputs shared by every request a client serves.
+struct ClientState {
+    instance: daemon::Instance,
+    theme: Arc<theme::AsyncTheme>,
+    executor: planning::PlanningExecutor,
+    shown: ShownRepository,
+}
+
 async fn snapshot(
     generation: u64,
     cwd: PathBuf,
-    instance: daemon::Instance,
     environment: Arc<PromptEnvironment>,
-    theme: &theme::AsyncTheme,
-    executor: planning::PlanningExecutor,
+    state: &ClientState,
 ) -> io::Result<()> {
-    let git_enabled = theme.git_enabled();
+    let theme = &*state.theme;
     let active_runtimes = theme.runtimes();
     let deadline = Instant::now() + REQUEST_TIMEOUT;
-    let mut tasks = JoinSet::new();
+    // Separate sets so the request deadline can stop runtime work while Git
+    // continues; dropping this future (a newer request) aborts both.
+    let mut git_task = JoinSet::new();
+    let mut runtime_task = JoinSet::new();
     // The coordinator owns the only receiver. At most one completion per
-    // selected runtime, a stale and a fresh Git result, and group markers can
-    // be buffered for this generation.
-    let (events, mut completions) = mpsc::channel(Runtime::ALL.len() + 4);
+    // selected runtime, a clear, a stale and a fresh Git result, and group
+    // markers can be buffered for this generation.
+    let (events, mut completions) = mpsc::channel(Runtime::ALL.len() + 5);
 
-    let git_started = if git_enabled {
-        let (started_tx, started_rx) = oneshot::channel();
-        let git_instance = instance.clone();
-        let git_cwd = cwd.clone();
-        let git_environment = Arc::clone(&environment);
-        let git_executor = executor.clone();
-        let git_events = events.clone();
-        tasks.spawn(async move {
-            let _ = started_tx.send(());
-            let result = match git_executor.git_query(git_cwd, git_environment).await {
-                Ok(Some(query)) => git_status(&git_instance, &query, &git_events).await,
-                Ok(None) => Ok(None),
-                Err(error) => Err(error),
-            };
-            let _ = git_events.send(SnapshotResult::Git(result)).await;
-        });
-        Some(started_rx)
-    } else {
-        None
-    };
-
-    if let Some(started) = git_started {
+    if theme.git_enabled() {
+        let started = spawn_git(
+            &mut git_task,
+            state,
+            cwd.clone(),
+            Arc::clone(&environment),
+            events.clone(),
+        );
         let _ = timeout_at(deadline, started).await;
     }
 
     if !active_runtimes.is_empty() {
-        let runtime_instance = instance.clone();
-        let runtime_cwd = cwd.clone();
-        let requested = active_runtimes.clone();
-        let runtime_environment = Arc::clone(&environment);
-        let runtime_events = events.clone();
-        tasks.spawn(async move {
-            stream_runtimes(
-                &runtime_instance,
-                planning::PlanningRequest {
-                    cwd: runtime_cwd,
-                    active: requested,
-                    environment: runtime_environment,
-                    executor,
-                },
-                runtime_events,
-            )
-            .await;
+        let instance = state.instance.clone();
+        let request = planning::PlanningRequest {
+            cwd,
+            active: active_runtimes.clone(),
+            environment,
+            executor: state.executor.clone(),
+        };
+        let events = events.clone();
+        runtime_task.spawn(async move {
+            stream_runtimes(&instance, request, events).await;
         });
     }
     drop(events);
 
+    let mut git_pending = !git_task.is_empty();
     let mut receiving = true;
-    while receiving || !tasks.is_empty() {
+    while receiving || !git_task.is_empty() || !runtime_task.is_empty() {
         tokio::select! {
             () = tokio::time::sleep_until(deadline) => break,
             event = completions.recv(), if receiving => {
                 if let Some(event) = event {
-                    write_result(event, generation, &active_runtimes, theme)?;
+                    git_pending &= !event.finishes_git();
+                    write_result(event, generation, theme, &state.shown)?;
                 } else {
                     receiving = false;
                 }
             }
-            result = tasks.join_next(), if !tasks.is_empty() => {
-                if let Some(Err(error)) = result {
-                    protocol::write_error(
-                        &mut io::stdout().lock(), generation, "snapshot",
-                        &record_error(&io::Error::other(error)),
-                    )?;
-                }
+            Some(result) = git_task.join_next(), if !git_task.is_empty() => {
+                write_join_error(result, generation)?;
+            }
+            Some(result) = runtime_task.join_next(), if !runtime_task.is_empty() => {
+                write_join_error(result, generation)?;
             }
         }
     }
 
-    tasks.abort_all();
-    protocol::write_done(&mut io::stdout().lock(), generation)
+    // The deadline ends runtime work and the prompt's main phase. Git alone
+    // may still be outstanding; its fresh result follows `done` for this same
+    // generation, bounded by its own cap (runtime values queued before the
+    // deadline are written on the way). A Git task that failed without a
+    // final event closes the channel once the runtime task is gone.
+    drop(runtime_task);
+    protocol::write_done(&mut io::stdout().lock(), generation)?;
+    while git_pending {
+        let Some(event) = completions.recv().await else {
+            break;
+        };
+        git_pending = !event.finishes_git();
+        write_result(event, generation, theme, &state.shown)?;
+    }
+    Ok(())
 }
 
-/// Requests Git status and returns the fresh result. A cached result the
-/// daemon sends first is forwarded as a `GitStale` event; the fresh one is
-/// still awaited within the same Git deadline.
-async fn git_status(
+fn write_join_error(result: Result<(), tokio::task::JoinError>, generation: u64) -> io::Result<()> {
+    match result {
+        Ok(()) => Ok(()),
+        Err(error) => protocol::write_error(
+            &mut io::stdout().lock(),
+            generation,
+            "snapshot",
+            &record_error(&io::Error::other(error)),
+        ),
+    }
+}
+
+/// Starts the Git task, which always ends with one final Git event, within
+/// `GIT_TIMEOUT`. The receiver resolves once the task runs, so runtime work
+/// starts after the Git request does.
+fn spawn_git(
+    tasks: &mut JoinSet<()>,
+    state: &ClientState,
+    cwd: PathBuf,
+    environment: Arc<PromptEnvironment>,
+    events: mpsc::Sender<SnapshotResult>,
+) -> oneshot::Receiver<()> {
+    let (started_tx, started_rx) = oneshot::channel();
+    let instance = state.instance.clone();
+    let executor = state.executor.clone();
+    let shown = state.shown.clone();
+    tasks.spawn(async move {
+        let _ = started_tx.send(());
+        let exchange = git_exchange(&instance, cwd, environment, &executor, &shown, &events);
+        let result = tokio::time::timeout(GIT_TIMEOUT, exchange)
+            .await
+            .unwrap_or_else(|_| {
+                let error = io::Error::new(io::ErrorKind::TimedOut, "Git status timed out");
+                SnapshotResult::Git(None, Err(error))
+            });
+        let _ = events.send(result).await;
+    });
+    started_rx
+}
+
+/// Discovers the repository and runs its status exchange, returning the
+/// final Git event. Intermediate events (a withdrawn value, a cached value)
+/// are sent as they happen.
+async fn git_exchange(
     instance: &daemon::Instance,
-    query: &gitstatus::Query,
+    cwd: PathBuf,
+    environment: Arc<PromptEnvironment>,
+    executor: &planning::PlanningExecutor,
+    shown: &ShownRepository,
     events: &mpsc::Sender<SnapshotResult>,
-) -> io::Result<Option<gitstatus::Snapshot>> {
-    let deadline = Instant::now() + GIT_TIMEOUT;
-    match daemon::git_status(instance, query, deadline).await? {
-        daemon::GitStatus::Fresh(snapshot) => Ok(snapshot),
-        daemon::GitStatus::Stale { cached, pending } => {
-            let _ = events.send(SnapshotResult::GitStale(cached)).await;
-            pending.fresh(deadline).await
+) -> SnapshotResult {
+    let query = match executor.git_query(cwd, environment).await {
+        Ok(Some(query)) => query,
+        // Outside a repository the empty final value replaces any old one.
+        Ok(None) => return SnapshotResult::Git(None, Ok(None)),
+        Err(error) => {
+            if !shown.holds(None) {
+                let _ = events.send(SnapshotResult::GitCleared).await;
+            }
+            return SnapshotResult::Git(None, Err(error));
         }
+    };
+    if !shown.holds(Some(&query)) {
+        let _ = events.send(SnapshotResult::GitCleared).await;
+    }
+    let deadline = Instant::now() + GIT_TIMEOUT;
+    match daemon::git_status(instance, &query, deadline).await {
+        Ok(daemon::GitStatus::Fresh(snapshot)) => SnapshotResult::Git(Some(query), Ok(snapshot)),
+        Ok(daemon::GitStatus::Stale { cached, pending }) => {
+            let _ = events
+                .send(SnapshotResult::GitStale(query.clone(), cached))
+                .await;
+            match pending.fresh(deadline).await {
+                // The cached value stays on screen; a fresh result that never
+                // came is not worth a message.
+                Err(error) if error.kind() == io::ErrorKind::TimedOut => SnapshotResult::GitKept,
+                result => SnapshotResult::Git(Some(query), result),
+            }
+        }
+        Err(error) => SnapshotResult::Git(Some(query), Err(error)),
     }
 }
 
 /// Renders one typed completion immediately. Runtime group completion is a
 /// separate event, sent only after every independent runtime owner has finished.
+/// Errors leave the shell's current value in place: only a value replaces a
+/// value.
 fn write_result(
     result: SnapshotResult,
     generation: u64,
-    active_runtimes: &[Runtime],
     theme: &theme::AsyncTheme,
+    shown: &ShownRepository,
 ) -> io::Result<()> {
     let mut output = io::stdout().lock();
     match result {
+        SnapshotResult::GitCleared => {
+            protocol::write_segment(&mut output, generation, "git", "")?;
+            shown.set(None);
+            Ok(())
+        }
         // A cached value renders like any Git segment but leaves the group
         // open: the fresh result follows with the group's `complete`.
-        SnapshotResult::GitStale(snapshot) => protocol::write_segment(
-            &mut output,
-            generation,
-            "git",
-            &theme.render_git(snapshot.as_ref()),
-        ),
-        SnapshotResult::Git(Ok(snapshot)) => {
+        SnapshotResult::GitStale(query, snapshot) => {
             protocol::write_segment(
                 &mut output,
                 generation,
                 "git",
                 &theme.render_git(snapshot.as_ref()),
             )?;
+            shown.set(Some(query));
+            Ok(())
+        }
+        SnapshotResult::Git(query, Ok(snapshot)) => {
+            protocol::write_segment(
+                &mut output,
+                generation,
+                "git",
+                &theme.render_git(snapshot.as_ref()),
+            )?;
+            shown.set(query);
             // Each group finishes with a `complete` marker so the shell can
-            // release that group's rendering lock as soon as it is done,
-            // instead of holding the prompt blank until the final `done`.
+            // stop waiting for that group as soon as it is done.
             protocol::write_complete(&mut output, generation, "git")
         }
-        SnapshotResult::Git(Err(error)) => {
+        SnapshotResult::Git(_, Err(error)) => {
             protocol::write_error(&mut output, generation, "git", &record_error(&error))?;
             protocol::write_complete(&mut output, generation, "git")
         }
-        SnapshotResult::Runtime { runtime, value } => {
-            let value = match value {
-                Ok(value) => value,
-                Err(error) => {
-                    // A per-runtime failure must not clear completed siblings.
-                    protocol::write_error(
-                        &mut output,
-                        generation,
-                        runtime.name(),
-                        &record_error(&error),
-                    )?;
-                    None
-                }
-            };
-            let fragment = value
-                .as_ref()
-                .and_then(|value| theme.render_runtime(value))
-                .unwrap_or_default();
-            protocol::write_segment(&mut output, generation, runtime.name(), &fragment)
-        }
+        SnapshotResult::GitKept => protocol::write_complete(&mut output, generation, "git"),
+        SnapshotResult::Runtime { runtime, value } => match value {
+            Ok(value) => {
+                let fragment = value
+                    .as_ref()
+                    .and_then(|value| theme.render_runtime(value))
+                    .unwrap_or_default();
+                protocol::write_segment(&mut output, generation, runtime.name(), &fragment)
+            }
+            // A per-runtime failure must not clear completed siblings.
+            Err(error) => protocol::write_error(
+                &mut output,
+                generation,
+                runtime.name(),
+                &record_error(&error),
+            ),
+        },
         SnapshotResult::RuntimeComplete => {
             protocol::write_complete(&mut output, generation, "runtime")
         }
         SnapshotResult::RuntimePlanningFailed(error) => {
             protocol::write_error(&mut output, generation, "runtime", &record_error(&error))?;
-            for runtime in active_runtimes {
-                protocol::write_segment(&mut output, generation, runtime.name(), "")?;
-            }
             protocol::write_complete(&mut output, generation, "runtime")
         }
     }
@@ -229,7 +326,7 @@ pub fn init_zsh(instance: &daemon::Instance, selector: Option<&str>) -> io::Resu
     // the segments directory; this is the only point that touches the
     // filesystem or the config outside the prompt hot path.
     let custom_segments = theme.custom_sources()?;
-    let lock = theme::async_lock()?;
+    let modes = theme::async_modes()?;
     let bundled = format!(
         "{ZSH_DIRECTORY_SEGMENT}{ZSH_CLOCK_SEGMENT}{ZSH_STATUS_SEGMENT}{ZSH_CHARACTER_SEGMENT}"
     );
@@ -244,8 +341,9 @@ pub fn init_zsh(instance: &daemon::Instance, selector: Option<&str>) -> io::Resu
             "@ZTHEME_SYNTAX_HIGHLIGHTING@",
             &shell_quote(&setup::syntax_highlighting_script().to_string_lossy()),
         )
-        .replace("@ZTHEME_LOCK_GIT@", &lock_flag(lock.git_segment))
-        .replace("@ZTHEME_LOCK_RUNTIME@", &lock_flag(lock.runtime_segment))
+        .replace("@ZTHEME_MODE_GIT@", modes.git.name())
+        .replace("@ZTHEME_MODE_RUNTIME@", modes.runtime.name())
+        .replace("@ZTHEME_ASYNC_BUDGET_MS@", &modes.budget_ms.to_string())
         .replace("@ZTHEME_SHELL_DEFAULTS@", ZSH_DEFAULTS)
         .replace("@ZTHEME_COMPILED_THEME@", &theme_zsh)
         .replace("@ZTHEME_BUNDLED_SEGMENTS@", &bundled)
@@ -262,11 +360,6 @@ pub fn init_zsh(instance: &daemon::Instance, selector: Option<&str>) -> io::Resu
             "    @ZTHEME_CONTEXT_FIELDS@",
             &protocol::context_field_lines(),
         ))
-}
-
-/// Renders a boolean lock flag as a `0`/`1` zsh integer literal.
-fn lock_flag(enabled: bool) -> String {
-    if enabled { "1" } else { "0" }.to_owned()
 }
 
 /// Sources each custom file with its old symbol absent, then stages only the
@@ -334,14 +427,29 @@ pub fn theme_zsh(instance: &daemon::Instance, selector: &str, persist: bool) -> 
 }
 
 enum SnapshotResult {
-    GitStale(Option<gitstatus::Snapshot>),
-    Git(io::Result<Option<gitstatus::Snapshot>>),
+    /// The shell's Git value may belong to another repository: withdraw it.
+    GitCleared,
+    /// The daemon's cached value for this repository, before the fresh one.
+    GitStale(gitstatus::Query, Option<gitstatus::Snapshot>),
+    /// The final Git result; the query is the repository it describes.
+    Git(
+        Option<gitstatus::Query>,
+        io::Result<Option<gitstatus::Snapshot>>,
+    ),
+    /// Final: the fresh result timed out behind a cached value already sent.
+    GitKept,
     Runtime {
         runtime: Runtime,
         value: io::Result<Option<RuntimeValue>>,
     },
     RuntimeComplete,
     RuntimePlanningFailed(io::Error),
+}
+
+impl SnapshotResult {
+    const fn finishes_git(&self) -> bool {
+        matches!(self, Self::Git(..) | Self::GitKept)
+    }
 }
 
 async fn stream_runtimes(
@@ -389,7 +497,14 @@ async fn stream_runtimes(
 
     while let Some(result) = tasks.join_next_with_id().await {
         let (id, value) = match result {
-            Ok(result) => result,
+            Ok((id, Ok(Some(value)))) => (id, Ok(Some(value))),
+            // A transient failure sends nothing: the shell keeps the value
+            // it shows rather than erasing it for one failed command.
+            Ok((id, Ok(None))) => {
+                owners.remove(&id);
+                continue;
+            }
+            Ok((id, Err(error))) => (id, Err(error)),
             Err(error) => (error.id(), Err(io::Error::other(error))),
         };
         let runtime = owners.remove(&id).expect("every runtime task has an owner");
@@ -520,6 +635,7 @@ fn execution_value(
             label: None,
             environment: None,
         }),
+        // No value and no record: the shell keeps what it shows.
         RuntimeOutcome::TransientFailure => None,
     }
 }

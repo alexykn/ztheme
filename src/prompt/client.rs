@@ -13,7 +13,7 @@ use tokio::time::{Instant, MissedTickBehavior, interval_at};
 use crate::daemon;
 use crate::environment::{PromptEnvironment, REQUEST_FIELDS};
 use crate::prompt::protocol::{REQUEST_MAGIC, REQUEST_VERSION};
-use crate::prompt::snapshot;
+use crate::prompt::{ClientState, ShownRepository, snapshot};
 use crate::theme::AsyncTheme;
 
 /// How often the client verifies that the shell that spawned it is still its
@@ -52,7 +52,12 @@ pub async fn serve_client(
     let (sender, mut receiver) = mpsc::channel(4);
     spawn_request_reader(sender);
 
-    let executor = super::planning::PlanningExecutor::new();
+    let state = Arc::new(ClientState {
+        instance,
+        theme,
+        executor: super::planning::PlanningExecutor::new(),
+        shown: ShownRepository::default(),
+    });
     let mut current: Option<JoinHandle<io::Result<()>>> = None;
     let mut parent_check = interval_at(
         Instant::now() + PARENT_CHECK_INTERVAL,
@@ -66,11 +71,13 @@ pub async fn serve_client(
                 if let Some(input) = request {
                     match input {
                         ClientInput::Request(request) => {
-                            // A new request supersedes any in-flight work: the
-                            // records of an older generation would be ignored by
-                            // the shell, and letting the work run on would waste
-                            // time. Await destruction before starting the next
-                            // snapshot so no stale records can be emitted.
+                            // A new request supersedes any in-flight work,
+                            // including a Git result still pending after the
+                            // older request's `done`: the shell ignores older
+                            // generations, and letting the work run on would
+                            // waste time. Await destruction before starting the
+                            // next snapshot so this task stays the only writer
+                            // and no stale records follow newer ones.
                             // Blocking planning workers may outlive cancellation;
                             // they retain immutable request-owned inputs and
                             // their executor permits until they really finish.
@@ -84,18 +91,13 @@ pub async fn serve_client(
                                 }
                             }
                             let request = *request;
-                            let instance = instance.clone();
-                            let theme = Arc::clone(&theme);
-                            let environment = Arc::new(request.environment);
-                            let executor = executor.clone();
+                            let state = Arc::clone(&state);
                             current = Some(tokio::spawn(async move {
                                 snapshot(
                                     request.generation,
                                     request.cwd,
-                                    instance,
-                                    environment,
-                                    &theme,
-                                    executor,
+                                    Arc::new(request.environment),
+                                    &state,
                                 )
                                 .await
                             }));

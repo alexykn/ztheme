@@ -3,10 +3,9 @@
 A Zsh prompt for Git and runtime context, customizable themes, syntax
 highlighting, and autosuggestions.
 
-Git state and language versions are resolved asynchronously. By default the
-prompt waits for Git, then runtime values appear incrementally as each command
-or cache lookup finishes. Group locks can instead hold the prompt for all
-asynchronous results when you prefer a single complete redraw.
+Git state and language versions are resolved asynchronously. The prompt is
+never blank: it waits briefly for fresh values, draws with the last known ones
+otherwise, and redraws as soon as newer values arrive.
 
 <p align="center">
   <img src="img/image-two.png" alt="Catppuccin Mocha ztheme prompt with Git status, Rust version, and syntax highlighting">
@@ -162,37 +161,47 @@ segment key.
 
 ## Asynchronous rendering
 
-Git and runtime segments are resolved asynchronously. Git is *locked* by
-default: the prompt stays blank until Git resolves (or the shared deadline
-expires), then appears in one atomic redraw. Runtime segments are *unlocked*
-by default: the prompt renders as soon as Git is done and each runtime value is
-drawn in when its version command finishes. That ordering reflects the real
-cost of each group — `gitstatusd` is fast, while some runtime version commands
-(such as `swift`) can take long enough to delay every prompt if the prompt
-waited for them.
+Git and runtime segments are resolved asynchronously. Each segment keeps its
+last value until a newer one replaces it, so a slow or failed lookup never
+makes a segment disappear: the prompt shows the last known value and redraws
+when the new one arrives. Runtime segments start over when the directory or
+the environment they depend on changes; the Git segment is replaced when you
+enter another repository or leave one.
 
-Configure this per group in `config.toml`:
+How long the prompt waits before drawing is configured per group in
+`config.toml`:
 
 ```toml
 version = 1
 theme = "my-theme"
 
-[async.lock]
-git_segment = true      # wait for Git (default: true)
-runtime_segment = false # don't wait for language/runtime versions (default: false)
+[async]
+git = "auto"     # the Git segment (default: "auto")
+runtime = "auto" # language, package manager, and runtime segments (default: "auto")
+budget_ms = 100  # how long "auto" waits (default: 100, at most 1000)
 ```
 
-- `git_segment` controls the Git segment. It defaults to `true` (wait).
-- `runtime_segment` controls the language, package manager, and runtime
-  segments (`python`, `rust`, `node`, and so on). It defaults to `false`
-  (don't wait).
+Each group takes one of three modes:
 
-Setting a group to `true` makes the prompt wait for it (holding the whole
-prompt blank until every locked group resolves or the deadline expires);
-`false` lets each of that group's completed values redraw independently once
-the locked groups are done. Lock both groups for one complete redraw. If
-you unlock a group, be aware the prompt's width can change when that segment
-later appears.
+- `auto` waits up to `budget_ms` for the group's fresh values, then draws with
+  whatever is known and redraws when the rest arrives. A warm Git query or a
+  cached runtime version takes a few milliseconds, so most prompts draw once
+  with current values.
+- `locked` waits until the group is complete, at most until the shared 550 ms
+  deadline. Lock both groups for one complete draw.
+- `async` never waits: the prompt draws at once with the last known values and
+  redraws as each value arrives.
+
+In a large repository a fresh Git status can take longer than the deadline.
+The prompt then shows the last known Git status (the background daemon keeps
+the latest result per repository) and redraws when the fresh status arrives,
+even after the deadline, as long as you have not started another command.
+With `auto` or `async`, be aware the prompt's width can change when a later
+value is drawn.
+
+The older `[async.lock]` table is still read: `git_segment = true` means
+`git = "locked"` and `false` means `git = "async"`; `runtime_segment` maps the
+same way to `runtime`. Configuring one group both ways is an error.
 
 ### Git status in large repositories
 

@@ -16,10 +16,11 @@ use crate::setup::install::config_root;
 
 pub use async_theme::AsyncTheme;
 pub(crate) use manage::{apply, edit, list, persist};
+pub(crate) use schema::AsyncModes;
 use schema::{
-    AsyncLock, AsyncSection, CharacterTheme, Config, CustomSegmentTheme, CustomSegmentsConfig,
-    DirectoryTheme, GitSymbols, InputTheme, Layout, RuntimeTheme, Segments, Spacing, StatusTheme,
-    Style, SyntaxStyle, Theme,
+    AsyncSection, CharacterTheme, Config, CustomSegmentTheme, CustomSegmentsConfig, DirectoryTheme,
+    GitSymbols, InputTheme, Layout, RuntimeTheme, Segments, Spacing, StatusTheme, Style,
+    SyntaxStyle, Theme,
 };
 pub(crate) use segments::ResolvedCustomSegment;
 use segments::{resolve_custom_segments, validate_enabled_segments};
@@ -292,6 +293,10 @@ fn load_config() -> io::Result<Option<Config>> {
             path.display()
         )));
     }
+    config
+        .async_section
+        .modes()
+        .map_err(|error| invalid(format!("invalid {}: {error}", path.display())))?;
     Ok(Some(config))
 }
 
@@ -305,13 +310,14 @@ fn default_config() -> Config {
     }
 }
 
-/// The per-asynchronous-group lock configuration from `config.toml`, defaulting
-/// to locked (wait for the group) when unset. Read outside the prompt hot path
+/// The per-asynchronous-group wait modes from `config.toml`, defaulting to
+/// `auto` with the default budget when unset. Read outside the prompt hot path
 /// and baked into the generated shell integration by `init_zsh`.
-pub(crate) fn async_lock() -> io::Result<AsyncLock> {
-    Ok(load_config()?
-        .map(|config| config.async_section.lock)
-        .unwrap_or_default())
+pub(crate) fn async_modes() -> io::Result<AsyncModes> {
+    let Some(config) = load_config()? else {
+        return Ok(AsyncModes::default());
+    };
+    config.async_section.modes().map_err(invalid)
 }
 
 fn theme_path(selector: &str) -> io::Result<PathBuf> {
@@ -577,7 +583,7 @@ pub(super) mod tests_support {
 #[cfg(test)]
 mod tests {
     use super::{
-        CATPPUCCIN_MOCHA_THEME, CompiledTheme, DEFAULT_THEME_SELECTOR, Theme, merge,
+        AsyncModes, CATPPUCCIN_MOCHA_THEME, CompiledTheme, DEFAULT_THEME_SELECTOR, Theme, merge,
         parse_versioned, validate,
     };
 
@@ -736,43 +742,65 @@ mod tests {
         assert!(!runtime.contains("GIT"));
     }
 
+    fn parsed_modes(source: &str) -> Result<AsyncModes, String> {
+        let config: crate::theme::schema::Config =
+            toml::from_str(&format!("version = 1\ntheme = \"x\"\n{source}")).unwrap();
+        config.async_section.modes()
+    }
+
     #[test]
-    fn async_lock_defaults_and_parses_overrides() {
-        use crate::theme::schema::Config;
-        use crate::theme::schema::{AsyncLock, AsyncSection};
+    fn async_modes_default_to_auto_and_parse_overrides() {
+        use crate::theme::schema::AsyncMode::{Async, Auto, Locked};
 
-        // No [async] section: git is locked, runtimes are not (the default).
-        let config: Config = toml::from_str("version = 1\ntheme = \"x\"\n").unwrap();
-        assert!(config.async_section.lock.git_segment);
-        assert!(!config.async_section.lock.runtime_segment);
+        let default = AsyncModes {
+            git: Auto,
+            runtime: Auto,
+            budget_ms: 100,
+        };
+        assert_eq!(parsed_modes(""), Ok(default));
+        assert_eq!(AsyncModes::default(), default);
+        assert_eq!(
+            parsed_modes("[async]\ngit = \"locked\"\nruntime = \"async\"\nbudget_ms = 0\n"),
+            Ok(AsyncModes {
+                git: Locked,
+                runtime: Async,
+                budget_ms: 0,
+            })
+        );
+        assert!(
+            toml::from_str::<crate::theme::schema::Config>(
+                "version = 1\ntheme = \"x\"\n[async]\ngit = \"eager\"\n"
+            )
+            .is_err()
+        );
+        assert!(parsed_modes("[async]\nbudget_ms = 1001\n").is_err());
+    }
 
-        // Overriding only git keeps runtime's default (unlocked).
-        let config: Config =
-            toml::from_str("version = 1\ntheme = \"x\"\n[async.lock]\ngit_segment = false\n")
-                .unwrap();
-        assert!(!config.async_section.lock.git_segment);
-        assert!(!config.async_section.lock.runtime_segment);
+    #[test]
+    fn legacy_async_locks_map_to_modes_and_conflict_with_mode_keys() {
+        use crate::theme::schema::AsyncMode::{Async, Auto, Locked};
 
-        // Both groups can be set explicitly and independently.
-        let config: Config = toml::from_str(
-            "version = 1\ntheme = \"x\"\n[async.lock]\ngit_segment = false\nruntime_segment = false\n",
-        )
-        .unwrap();
-        assert!(!config.async_section.lock.git_segment);
-        assert!(!config.async_section.lock.runtime_segment);
-        let config: Config =
-            toml::from_str("version = 1\ntheme = \"x\"\n[async.lock]\nruntime_segment = true\n")
-                .unwrap();
-        assert!(config.async_section.lock.git_segment);
-        assert!(config.async_section.lock.runtime_segment);
-
-        // Defaults struct matches the parsed default so a missing table and a
-        // missing config both produce the same (git locked, runtimes unlocked).
-        assert!(AsyncSection::default().lock.git_segment);
-        assert!(!AsyncSection::default().lock.runtime_segment);
-        assert!(AsyncLock::default().git_segment);
-        assert!(!AsyncLock::default().runtime_segment);
-        assert!(AsyncSection::default().is_default());
+        let modes = parsed_modes("[async.lock]\ngit_segment = false\nruntime_segment = true\n");
+        assert_eq!(
+            modes.map(|modes| (modes.git, modes.runtime)),
+            Ok((Async, Locked))
+        );
+        // A group without a legacy boolean keeps the new default.
+        let modes = parsed_modes("[async.lock]\ngit_segment = true\n");
+        assert_eq!(
+            modes.map(|modes| (modes.git, modes.runtime)),
+            Ok((Locked, Auto))
+        );
+        // The same group configured both ways is ambiguous; another group's
+        // legacy boolean does not conflict.
+        assert!(
+            parsed_modes("[async]\ngit = \"auto\"\n[async.lock]\ngit_segment = true\n").is_err()
+        );
+        let modes = parsed_modes("[async]\ngit = \"auto\"\n[async.lock]\nruntime_segment = true\n");
+        assert_eq!(
+            modes.map(|modes| (modes.git, modes.runtime)),
+            Ok((Auto, Locked))
+        );
     }
 
     #[test]

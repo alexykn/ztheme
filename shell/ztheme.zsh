@@ -4,9 +4,10 @@
 # user custom segments) are computed in Zsh during `precmd` through the
 # generic `_ztheme_compute_sync_segments` dispatcher and held. Git and runtime
 # values are styled in Rust and arrive as finished fragments from the per-shell
-# `ztheme __client-daemon` process. Unlocked runtime values redraw as each
-# independent command or cache hit completes. Locked groups buffer fragments
-# until completion; the shared deadline releases any remaining rendering locks.
+# `ztheme __client-daemon` process. `precmd` reads them for as long as each
+# group's mode allows (`locked`, `auto` within the budget, `async` not at all),
+# draws once, and later values redraw the prompt as they arrive. Every async
+# segment keeps its last value until a newer one replaces it.
 
 # Prepare custom definitions before stopping the working client or installing
 # the new theme. Only the declared segment functions are installed on success.
@@ -79,6 +80,11 @@ if ! zmodload zsh/system 2>/dev/null; then
     print -u2 -- "ztheme: requires the zsh/system module"
     return 1
 fi
+# Waiting in precmd needs a clock and a bounded wait on the response pipe;
+# without them every group behaves as `async`.
+typeset -gi __ZTHEME_CAN_WAIT=0
+zmodload zsh/datetime 2>/dev/null && zmodload zsh/zselect 2>/dev/null &&
+    __ZTHEME_CAN_WAIT=1
 
 if ! _ztheme_prepare_custom_segments; then
     return 1
@@ -116,14 +122,21 @@ typeset -g __ZTHEME_BIN=@ZTHEME_BIN@
 typeset -ga __ZTHEME_INSTANCE_ARGS=(@ZTHEME_INSTANCE_ARGS@)
 typeset -g __ZTHEME_AUTOSUGGESTIONS=@ZTHEME_AUTOSUGGESTIONS@
 typeset -g __ZTHEME_SYNTAX_HIGHLIGHTING=@ZTHEME_SYNTAX_HIGHLIGHTING@
-typeset -gi __ZTHEME_LOCK_GIT=@ZTHEME_LOCK_GIT@
-typeset -gi __ZTHEME_LOCK_RUNTIME=@ZTHEME_LOCK_RUNTIME@
+typeset -g __ZTHEME_MODE_GIT=@ZTHEME_MODE_GIT@
+typeset -g __ZTHEME_MODE_RUNTIME=@ZTHEME_MODE_RUNTIME@
+typeset -gi __ZTHEME_ASYNC_BUDGET_MS=@ZTHEME_ASYNC_BUDGET_MS@
 typeset -g ZTHEME_PROMPT=""
 typeset -g ZTHEME_RPROMPT=""
 typeset -g ZTHEME_CONTEXT_KEY=""
 typeset -g ZTHEME_LAST_ERROR=""
+typeset -g ZTHEME_MESSAGE=""
 typeset -gi ZTHEME_GENERATION=0
-typeset -gi ZTHEME_LOCKED_PENDING=0
+# Progress of the current generation's request, from its response records.
+typeset -gF ZTHEME_REQUEST_STARTED=0
+typeset -gi ZTHEME_REQUEST_DONE=1
+typeset -gi ZTHEME_GIT_COMPLETE=0
+typeset -gi ZTHEME_RUNTIME_COMPLETE=0
+typeset -gi ZTHEME_REDRAW=0
 typeset -g ZTHEME_CLIENT_PID=""
 typeset -gi ZTHEME_CLIENT_READY=0
 typeset -gi ZTHEME_REQ_FD=-1
@@ -275,7 +288,7 @@ _ztheme_stop_client() {
     local -i response_fd="${ZTHEME_RESP_FD:--1}"
     ZTHEME_CLIENT_PID=""
     ZTHEME_CLIENT_READY=0
-    ZTHEME_LOCKED_PENDING=0
+    ZTHEME_REQUEST_DONE=1
     ZTHEME_REQ_FD=-1
     ZTHEME_RESP_FD=-1
 
@@ -297,93 +310,124 @@ _ztheme_stop_client() {
     return 0
 }
 
-_ztheme_async_callback() {
+# Reads one response record from fd $1 and applies it. Returns 1 when the read
+# fails (the client is gone), 0 otherwise. Sets ZTHEME_REDRAW when a value of
+# the current generation changed and ZTHEME_MESSAGE when a new error should be
+# shown; the caller decides how to draw and display them.
+_ztheme_read_record() {
     emulate -L zsh
     setopt localoptions no_shwordsplit
 
     local -i fd=$1
     local protocol generation kind segment fragment
-    local -i redraw=0
 
-    if ! IFS=$'\t' read -r -u "$fd" \
-        protocol generation kind segment fragment; then
-        _ztheme_stop_client
-        _ztheme_render_layout
-        builtin zle reset-prompt
-        return
-    fi
+    IFS=$'\t' read -r -u "$fd" protocol generation kind segment fragment ||
+        return 1
 
     # Records from superseded generations are ignored, never rendered; the
     # client daemon itself is long-lived, so nothing is torn down here.
+    # Records of the current generation are accepted after `done` too: a slow
+    # fresh Git value follows it.
     if [[ "$protocol" != ZTHEME1 ||
           "$generation" != "$ZTHEME_GENERATION" ]]; then
-        return
+        return 0
     fi
 
     case "$kind" in
         segment)
             ZTHEME_LAST_ERROR=""
-            # Only redraw when the value actually changed: an unchanged or empty
-            # fragment (runtimes emit one record per configured runtime) needs
-            # no second `reset-prompt`.
-            if _ztheme_assign_async_segment "$segment" "$fragment"; then
-                # An unlocked segment arriving after the prompt rendered appears
-                # via a redraw; a segment for a still-locked group is stored and
-                # shown when that group's `complete` releases the barrier.
-                (( ! ZTHEME_LOCKED_PENDING )) && redraw=1
-            fi
+            # An unchanged or empty fragment (runtimes emit one record per
+            # configured runtime) needs no second draw.
+            _ztheme_assign_async_segment "$segment" "$fragment" && ZTHEME_REDRAW=1
             ;;
         error)
-            # Clear only the group that errored (`git` or `runtime`); a
-            # successful unlocked group must not be erased. An unrecognized
-            # source (such as an internal `snapshot` error) clears nothing and
-            # needs no redraw. Otherwise, when the prompt already rendered,
-            # redraw so the visible prompt reflects the cleared group.
-            if _ztheme_clear_async_group "$segment"; then
-                (( ! ZTHEME_LOCKED_PENDING )) && redraw=1
-            fi
+            # The value on screen stays: only a newer value replaces it. The
+            # message is shown once per distinct error.
             if [[ -n "$fragment" && "$fragment" != "$ZTHEME_LAST_ERROR" ]]; then
                 ZTHEME_LAST_ERROR="$fragment"
-                builtin zle -M "ztheme: $fragment"
+                ZTHEME_MESSAGE="ztheme: $fragment"
             fi
             ;;
         complete)
-            # A group finished. Release its rendering lock (when present and
-            # locked); when no locked group remains pending, render the prompt.
             case "$segment" in
-                git)
-                    if (( __ZTHEME_HAS_GIT && __ZTHEME_LOCK_GIT && ZTHEME_LOCKED_PENDING )); then
-                        (( ZTHEME_LOCKED_PENDING-- ))
-                        (( ZTHEME_LOCKED_PENDING == 0 )) && redraw=1
-                    fi
-                    ;;
-                runtime)
-                    if (( __ZTHEME_HAS_RUNTIME && __ZTHEME_LOCK_RUNTIME && ZTHEME_LOCKED_PENDING )); then
-                        (( ZTHEME_LOCKED_PENDING-- ))
-                        (( ZTHEME_LOCKED_PENDING == 0 )) && redraw=1
-                    fi
-                    ;;
+                git) ZTHEME_GIT_COMPLETE=1 ;;
+                runtime) ZTHEME_RUNTIME_COMPLETE=1 ;;
             esac
             ;;
         done)
-            # Shared deadline passed or all work finished. This is the safety
-            # net for a locked group that never delivered a `complete` before
-            # the deadline: when nothing is pending the prompt was already
-            # rendered, so skip the redundant second redraw.
-            if (( ZTHEME_LOCKED_PENDING )); then
-                ZTHEME_LOCKED_PENDING=0
-                redraw=1
-            fi
-            ;;
-        *)
-            return
+            ZTHEME_REQUEST_DONE=1
             ;;
     esac
+    return 0
+}
 
-    if (( redraw )); then
+# Handles records that arrive after precmd drew the prompt.
+_ztheme_async_callback() {
+    emulate -L zsh
+    setopt localoptions no_shwordsplit
+
+    ZTHEME_REDRAW=0
+    ZTHEME_MESSAGE=""
+    if ! _ztheme_read_record "$1"; then
+        _ztheme_stop_client
+        _ztheme_render_layout
+        builtin zle reset-prompt
+        return
+    fi
+    [[ -n "$ZTHEME_MESSAGE" ]] && builtin zle -M "$ZTHEME_MESSAGE"
+    if (( ZTHEME_REDRAW )); then
         _ztheme_render_layout
         builtin zle reset-prompt
     fi
+}
+
+# Seconds precmd may wait for one group: $1 is whether the layout has it, $2
+# its mode. `locked` is bounded by the client's deadline record, with a cap
+# for a client that stops answering.
+_ztheme_group_wait() {
+    emulate -L zsh
+
+    REPLY=0
+    (( $1 )) || return
+    case "$2" in
+        locked) REPLY=1 ;;
+        auto) REPLY=$(( __ZTHEME_ASYNC_BUDGET_MS / 1000.0 )) ;;
+    esac
+}
+
+# Reads response records in precmd until every group whose mode waits is
+# complete, the client reports `done`, or the group's wait has elapsed. The
+# records go through the same handler as the zle callback; whatever arrives
+# later is drawn by the callback. A client that dies ends the wait at once.
+_ztheme_wait_for_groups() {
+    emulate -L zsh
+    setopt localoptions no_shwordsplit
+
+    (( __ZTHEME_CAN_WAIT && ! ZTHEME_REQUEST_DONE && ZTHEME_RESP_FD >= 0 )) || return 0
+
+    local -F git_until runtime_until until now
+    local -i centiseconds
+    _ztheme_group_wait "$__ZTHEME_HAS_GIT" "$__ZTHEME_MODE_GIT"
+    git_until=$(( ZTHEME_REQUEST_STARTED + REPLY ))
+    _ztheme_group_wait "$__ZTHEME_HAS_RUNTIME" "$__ZTHEME_MODE_RUNTIME"
+    runtime_until=$(( ZTHEME_REQUEST_STARTED + REPLY ))
+
+    while (( ! ZTHEME_REQUEST_DONE )); do
+        until=0
+        (( ! ZTHEME_GIT_COMPLETE && git_until > until )) && until=$git_until
+        (( ! ZTHEME_RUNTIME_COMPLETE && runtime_until > until )) && until=$runtime_until
+        now=$EPOCHREALTIME
+        (( until > now )) || return 0
+        # zselect counts hundredths of a second; round up so the wait never
+        # ends just short of its deadline.
+        centiseconds=$(( (until - now) * 100 + 0.999 ))
+        builtin zselect -t "$centiseconds" -r "$ZTHEME_RESP_FD" || return 0
+        if ! _ztheme_read_record "$ZTHEME_RESP_FD"; then
+            _ztheme_stop_client
+            return 0
+        fi
+    done
+    return 0
 }
 
 _ztheme_start_worker() {
@@ -391,7 +435,20 @@ _ztheme_start_worker() {
     setopt localoptions no_shwordsplit
 
     (( ++ZTHEME_GENERATION ))
-    _ztheme_clear_async_segments
+    ZTHEME_REQUEST_DONE=1
+    ZTHEME_GIT_COMPLETE=0
+    ZTHEME_RUNTIME_COMPLETE=0
+    (( __ZTHEME_CAN_WAIT )) && ZTHEME_REQUEST_STARTED=$EPOCHREALTIME
+    _ztheme_send_request || return 1
+    ZTHEME_REQUEST_DONE=0
+    return 0
+}
+
+# Sends the current generation's request, starting the client when needed.
+_ztheme_send_request() {
+    emulate -L zsh
+    setopt localoptions no_shwordsplit
+
     (( __ZTHEME_HAS_ASYNC )) || return 1
     [[ -x "$__ZTHEME_BIN" ]] || return 1
 
@@ -405,9 +462,9 @@ _ztheme_start_worker() {
         if builtin zle -F "$ZTHEME_RESP_FD" _ztheme_async_callback 2>/dev/null; then
             ZTHEME_CLIENT_READY=1
         else
-            # Without a registered callback nobody will ever consume the
-            # response records, so the prompt would stay empty; stop the
-            # client and let the caller render without async segments.
+            # Without a registered callback nobody would consume the records
+            # that arrive after precmd; stop the client and let the caller
+            # render without new async values.
             _ztheme_stop_client
             return 1
         fi
@@ -423,15 +480,6 @@ _ztheme_start_worker() {
         _ztheme_stop_client
         return 1
     fi
-
-    # Count how many present asynchronous groups are locked (wait for them
-    # before rendering). Any unlocked group does not block the prompt; it is
-    # drawn in via a redraw when its records arrive.
-    ZTHEME_LOCKED_PENDING=0
-    (( __ZTHEME_HAS_GIT && __ZTHEME_LOCK_GIT )) && (( ZTHEME_LOCKED_PENDING++ ))
-    (( __ZTHEME_HAS_RUNTIME && __ZTHEME_LOCK_RUNTIME )) && (( ZTHEME_LOCKED_PENDING++ ))
-    ZTHEME_PROMPT=""
-    ZTHEME_RPROMPT=""
     return 0
 }
 
@@ -502,16 +550,18 @@ _ztheme_precmd() {
     @ZTHEME_CONTEXT_FIELDS@
     context_key+="|${NVM_BIN:-}|$PATH"
 
+    # Runtime values depend on the whole context, so they are dropped when it
+    # changes. The Git value stays: the client withdraws it when the
+    # repository changed, so a cd within one repository does not blank it.
     if [[ "$context_key" != "$ZTHEME_CONTEXT_KEY" ]]; then
         ZTHEME_CONTEXT_KEY="$context_key"
-        _ztheme_clear_async_segments
+        _ztheme_clear_async_group runtime
         ZTHEME_LAST_ERROR=""
     fi
 
-    # Rendering is always attempted here: `_ztheme_render_layout` returns early
-    # while a locked group is still pending, and otherwise draws the prompt
-    # immediately (which is what lets an unlocked-only layout appear at once
-    # instead of waiting for the async records).
+    ZTHEME_MESSAGE=""
+    _ztheme_wait_for_groups
+    [[ -n "$ZTHEME_MESSAGE" ]] && builtin print -u2 -r -- "$ZTHEME_MESSAGE"
     _ztheme_render_layout
 }
 
@@ -592,7 +642,6 @@ _ztheme_chpwd() {
 
     (( ++ZTHEME_GENERATION ))
     ZTHEME_CONTEXT_KEY=""
-    _ztheme_clear_async_segments
 }
 
 _ztheme_zshexit() {

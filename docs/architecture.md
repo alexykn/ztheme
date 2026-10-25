@@ -16,26 +16,40 @@ Zsh computes the immediate directory, character, and status segments itself.
 For asynchronous segments it sends a request to its per-shell client daemon
 before rendering the next prompt. The client starts the Git request first,
 starts runtime detection immediately after that, renders the completed
-fragments with the compiled theme, and finishes each request when the shared
-deadline expires or the last fragment is written; the client itself keeps
-running and serves the shell's next request. Each generation owns immutable
+fragments with the compiled theme, and finishes each request's main phase with
+`done` when the shared deadline expires or the last fragment is written. Only
+a Git result still pending then may follow `done`, until the next request or
+the Git cap; the client itself keeps running and serves the shell's next
+request. Each generation owns immutable
 request inputs. The compiled theme and bounded filesystem-planning executor
 survive between prompts; each daemon operation
 opens its own connection rather than retaining a server connection.
 
-The shell buffers incoming fragments while a locked group is pending. By
-default it waits for the Git group's `complete` record, draws the collected
-fragments, and then redraws each unlocked runtime value as it arrives. The
-prompt is empty until every locked group completes or the shared deadline
-expires. Lock both groups to hold all fragments for a single complete draw.
+The prompt is never blank. Every asynchronous segment keeps its last value
+until a newer record replaces it; errors and late or missing results leave it
+in place. After sending a request and computing the synchronous segments,
+`precmd` reads response records itself for as long as each group's mode
+allows, draws once, and leaves later records to the `zle -F` callback, which
+redraws when a value changes. Each group (`git` and `runtime`) has a mode in
+`[async]`:
 
-Each asynchronous group (`git` and `runtime`) can be toggled through
-`[async.lock]`. A lock tells the shell to wait for that group before rendering;
-an unlock tells it not to, so the prompt renders as soon as every still-locked
-group has delivered its `complete` record (immediately when none are locked)
-and redraws each time an unlocked group's records arrive. By default the Git
-group is locked (it stays fast via `gitstatusd`) and the runtime group is
-unlocked, because a slow runtime version command should not delay every prompt.
+- `auto` (default for both) waits up to `budget_ms` (default 100 ms) for the
+  group's `complete` record;
+- `locked` waits for `complete` or `done`, with a 1 s cap in case the client
+  stops answering;
+- `async` does not wait.
+
+Waiting ends early on `done` and immediately when the client's output reaches
+EOF. A warm Git query and cache-hit runtimes take a few milliseconds, so most
+prompts draw once with current values; a slow group draws its last known (or
+the daemon's cached) value and redraws when the fresh one arrives.
+
+Runtime values depend on the whole prompt context, so the shell drops them
+when the context key changes. The Git value is not cleared by the shell on a
+directory or context change: the client knows the repository behind the value
+it last sent and withdraws it with an empty `git` record when a request
+resolves to another repository, so a `cd` within one repository keeps its
+status on screen.
 
 The server daemon provides shared background state. It hosts two independent
 long-lived capabilities:
@@ -85,23 +99,24 @@ Zsh precmd/chpwd
 │               ├── execute volatile selection on every request
 │               └── acquire/execute/revalidate/owned-put its semantic key
 ├── compute synchronous shell segments while the client works
-└── leave the prompt empty only while a configured group lock is pending
+├── read records until each waiting group completes, `done`, or its budget
+└── draw once with current and last known values
 
 prompt protocol records
 ├── emit each current-generation completion immediately
-├── Zsh buffers while any locked group is pending, otherwise redraws
-└── each group's `complete` marker releases that group's rendering lock
+├── precmd applies them before its draw, the zle callback after it
+└── a changed value redraws; errors keep the value on screen
 
 shared 550 ms deadline
-├── cancel unfinished client tasks
-└── write final done record
+├── cancel unfinished runtime tasks
+└── write done record
 
-done record / all locked groups complete
-└── Zsh renders collected segments; unlocked values may redraw independently
+Git still pending at done
+└── fresh value and `complete git` follow `done` (until superseded or 10 s)
 ```
 
 Git and individual runtime records may arrive in any completion order. Rendering
-follows the group locks, not runtime declaration order. Generation IDs prevent
+follows the group modes, not runtime declaration order. Generation IDs prevent
 a slow request for an old working directory from overwriting a newer prompt.
 
 ## Why a daemon
@@ -494,21 +509,31 @@ is the per-request engine used by the client daemon:
 
 - starts the Git task first and lets it begin its daemon request;
 - starts runtime detection immediately afterward;
-- applies one shared 550 ms deadline;
+- applies one shared 550 ms deadline to runtime work and to `done`;
 - writes each completed runtime or Git segment immediately; runtime values
   are independent events, not a single aggregate snapshot;
+- writes an empty `git` segment first when the request's repository differs
+  from the one whose value the shell was last sent (`ShownRepository`, kept
+  across a client's requests and updated only as records are written);
 - writes the daemon's cached Git result, when one arrives first, as an early
-  `git` segment record, then waits for the fresh result within the Git
-  exchange's 500 ms deadline and writes it with the group's `complete`;
+  `git` segment record, then writes the fresh result with the group's
+  `complete`, after `done` when it is late, within the 10 s Git cap; a fresh
+  result that times out behind a cached one ends with `complete` alone;
 - writes a group's `complete` marker once all its tasks finish so the shell
-  can release that rendering lock;
-- cancels unfinished work;
-- writes final `done` on normal completion or deadline expiry;
+  can stop waiting for that group;
+- writes no segment for a runtime whose command failed transiently or did not
+  finish by the deadline, and only an error record for a failed runtime, so
+  the shell keeps the value it shows;
+- cancels unfinished runtime work and writes `done` on normal completion or
+  deadline expiry;
 - sanitizes errors before sending them to Zsh.
 
 `prompt/client.rs` owns the per-shell client daemon: it parses requests from
 the shell, dispatches each request to `snapshot`, and aborts the in-flight
-request when a newer generation arrives. The client's records go to its
+request, including a Git result still pending after its `done`, when a newer
+generation arrives. It awaits that task's destruction before starting the
+next, so one task at a time writes records and no older record can follow a
+newer generation's. The client's records go to its
 stdout, which the shell integration connects to its response pipe. It
 verifies at startup that its parent is the shell it was spawned for, and
 re-checks once per second while idle or serving, so it cannot outlive a
@@ -531,7 +556,8 @@ It does not manage server sockets, process startup, cache persistence, or the
 `gitstatusd` process.
 
 The 550 ms limit is one deadline shared by both jobs, not 550 ms per operation.
-Once it expires, the engine aborts unfinished Tokio tasks and writes `done`.
+Once it expires, the engine aborts unfinished runtime tasks and writes `done`;
+the Git task alone continues, bounded by its own 10 s cap.
 All Git discovery and runtime filesystem planning (detection, PATH resolution,
 selectors, and publication revalidation) run through `prompt/planning.rs` on
 Tokio's blocking pool. Each shell client has two shared permits, acquired before
@@ -541,8 +567,8 @@ Workers retain immutable request-owned inputs, so later generations cannot
 change the environment they observe. Filesystem calls blocked in the kernel
 can outlive the 550 ms request; their results are discarded, and client runtime
 shutdown waits at most 25 ms for blocking workers after EOF or parent death.
-The shell treats `done` as the final rendering barrier, so a slow or missing
-result cannot leave the prompt waiting forever. Dropping an in-flight server
+The shell never waits past `done` (or its own cap), so a slow or missing
+result cannot leave the prompt waiting. Dropping an in-flight server
 request closes that request's
 socket connection; the server daemon remains independent and available to
 later prompts.
@@ -670,10 +696,9 @@ The normal mutation/reset exchange deadline is 25 ms. Cache acquire uses
 status takes its deadlines from the caller: `daemon::git_status` bounds the
 first frame and returns either the fresh result or the stale value with a
 `PendingGit` whose `fresh(deadline)` awaits the rest. The prompt uses one
-500 ms deadline from the start of the exchange for both, which may require
-repository work while still fitting beneath the request's 550 ms overall
-deadline in the usual case. On the daemon side each frame write has its own
-500 ms deadline.
+10 s deadline from the start of the exchange for both: the shell already has
+`done` and a value to show, so a slow fresh result is still worth delivering.
+On the daemon side each frame write has its own 500 ms deadline.
 
 Compatibility is negotiated before reading an operation:
 
@@ -707,27 +732,32 @@ fragment. Error records replace tabs, newlines, and other controls and are
 bounded before output.
 
 A `complete` record is written immediately after a group's segment records
-(`git` or `runtime`) by the client. It lets the shell release that group's
-rendering barrier as soon as the group is done, rather than holding the prompt
-blank until every asynchronous group finishes. The Git group may carry two
-`git` segment records in one generation: the daemon's cached value first,
-then the fresh value immediately before `complete`; the later record replaces
-the earlier one, and a Git error clears the group as before.
+(`git` or `runtime`) by the client. It lets the shell stop waiting for that
+group as soon as the group is done. The Git group may carry up to three `git`
+segment records in one generation: an empty one withdrawing another
+repository's value, the daemon's cached value, then the fresh value
+immediately before `complete`; each later record replaces the earlier one.
 
-By default the Git group is *locked* and the runtime group is *unlocked*: the
-shell stores Git segment and error records without redrawing until Git's
-`complete` record releases its barrier (or `done` arrives), while runtime
-records arrive as unlocked and redraw the prompt as they complete. A group can
-be locked via `[async.lock]` to make the shell wait for it instead. The `done`
-record remains the safety net: if a locked group never completed before
-the shared deadline, `done` forces the render even though one was expected. If
-the worker cannot start or exits without `done`, the shell falls back to
-rendering the immediate segments rather than leaving the prompt stuck.
+Records of the current generation remain valid after `done`. `done` ends the
+request's main phase (runtime work and the shell's waiting); only Git's fresh
+value and `complete git` can follow it, until the next request supersedes the
+generation or the 10 s Git cap ends it with an error record.
+
+Error records never clear a value: the shell keeps what it shows and displays
+each distinct message once (through `zle -M`, or on standard error when the
+error arrives while `precmd` waits). A fresh Git result that times out behind
+a cached value sends no error, only `complete`.
+
+How long `precmd` waits for each group follows its `[async]` mode (`auto`,
+`locked`, or `async`; see the beginning of this document). If the worker
+cannot start or its output reaches EOF, the shell stops the client and draws
+with the values it has rather than waiting.
 
 The generation is allocated by the shell integration. Zsh ignores records from
 superseded generations, allowing directory changes to cancel or outlive an
 older request safely. `done` is emitted on normal completion, including when
-there are no asynchronous segments or the shared deadline expires. Superseded
+there are no asynchronous segments or the shared deadline expires; a later
+record of the same generation can only be Git's. Superseded
 requests and broken output pipes need not emit it; generations and transport fallback
 handle those cases.
 

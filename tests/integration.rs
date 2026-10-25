@@ -960,23 +960,33 @@ spacing = { before = 16, after = 16 }
 }
 
 #[test]
-fn theme_apply_preserves_the_custom_segment_allowlist() {
+fn theme_apply_preserves_the_custom_segment_allowlist_and_async_modes() {
     let sandbox = Sandbox::new();
     sandbox.install_fake_gitstatus();
     sandbox.write_theme("timetheme", &time_theme(""));
     sandbox.write_theme("minimal", &minimal_theme(""));
     install_time_segment(&sandbox, &["time"], "'x'");
+    let config_path = sandbox.config.join("ztheme/config.toml");
+    let mut config = fs::read_to_string(&config_path).unwrap();
+    config.push_str("[async]\ngit = \"locked\"\nbudget_ms = 40\n");
+    fs::write(&config_path, config).unwrap();
 
     let script = r#"
 eval "$("$ZTHEME_TEST_BIN" init zsh --theme timetheme)" || exit 10
 ztheme theme apply minimal >/dev/null || exit 11
+[[ $__ZTHEME_MODE_GIT == locked && $__ZTHEME_MODE_RUNTIME == auto ]] || exit 12
+(( __ZTHEME_ASYNC_BUDGET_MS == 40 )) || exit 13
 "#;
     let output = sandbox.zsh(script);
     assert_success(&output);
 
-    let config = fs::read_to_string(sandbox.config.join("ztheme/config.toml")).unwrap();
+    let config = fs::read_to_string(&config_path).unwrap();
     assert!(config.contains("theme = \"minimal\""), "{config}");
     assert!(config.contains("enabled = [\"time\"]"), "{config}");
+    assert!(
+        config.contains("[async]\ngit = \"locked\"\nbudget_ms = 40\n"),
+        "{config}"
+    );
 }
 
 #[test]
@@ -3368,7 +3378,7 @@ fn assert_runtime_stream_records(records: &[String]) {
 }
 
 #[test]
-fn shell_runtime_stream_buffers_locked_groups_and_redraws_unlocked_changes() {
+fn shell_callback_redraws_current_value_changes_and_keeps_values_on_errors() {
     let sandbox = Sandbox::new();
     sandbox.write_theme(
         "stream-runtimes",
@@ -3386,7 +3396,6 @@ record() {
     exec {fd}<&-
 }
 ZTHEME_GENERATION=7
-__ZTHEME_LOCK_RUNTIME=0
 record $'ZTHEME1\t7\tsegment\tnode\tNODE'
 [[ $renders == 1 && $ZTHEME_PROMPT == *NODE* ]] || exit 11
 record $'ZTHEME1\t7\tsegment\tnode\tNODE'
@@ -3396,40 +3405,129 @@ record $'ZTHEME1\t6\tsegment\tpython\tSTALE'
 record $'ZTHEME1\t6\tcomplete\truntime'
 record $'ZTHEME1\t6\tdone'
 [[ $renders == 1 && -z $ZTHEME_SEGMENT_PYTHON ]] || exit 13
+record $'ZTHEME1\t7\tdone'
+# A value of the current generation still redraws after its `done`.
 record $'ZTHEME1\t7\tsegment\tpython\tPYTHON'
 [[ $renders == 2 && $ZTHEME_PROMPT == *NODE* && $ZTHEME_PROMPT == *PYTHON* ]] || exit 14
-record $'ZTHEME1\t7\tcomplete\truntime'
-record $'ZTHEME1\t7\tdone'
-[[ $renders == 2 ]] || exit 15
-
-ZTHEME_GENERATION=8
-_ztheme_clear_async_segments
-__ZTHEME_LOCK_RUNTIME=1
-ZTHEME_LOCKED_PENDING=1
-renders=0
-record $'ZTHEME1\t8\tsegment\tnode\tLOCKED-NODE'
-record $'ZTHEME1\t7\tcomplete\truntime'
-record $'ZTHEME1\t7\tdone'
-[[ $renders == 0 && $ZTHEME_LOCKED_PENDING == 1 ]] || exit 16
-record $'ZTHEME1\t8\tsegment\tpython\tLOCKED-PYTHON'
-[[ $renders == 0 ]] || exit 17
-record $'ZTHEME1\t8\tcomplete\truntime'
-[[ $renders == 1 && $ZTHEME_LOCKED_PENDING == 0 && $ZTHEME_PROMPT == *LOCKED-NODE* && $ZTHEME_PROMPT == *LOCKED-PYTHON* ]] || exit 18
-record $'ZTHEME1\t8\tdone'
-[[ $renders == 1 ]] || exit 19
-
-# Deadline done releases a group even when its completion never arrived.
-ZTHEME_GENERATION=9
-_ztheme_clear_async_segments
-ZTHEME_LOCKED_PENDING=1
-renders=0
-record $'ZTHEME1\t9\tsegment\tnode\tPARTIAL'
-record $'ZTHEME1\t9\tdone'
-[[ $renders == 1 && $ZTHEME_LOCKED_PENDING == 0 && $ZTHEME_PROMPT == *PARTIAL* ]] || exit 20
-record $'ZTHEME1\t9\tdone'
-[[ $renders == 1 ]] || exit 21
+# An error keeps every value on screen and needs no redraw.
+record $'ZTHEME1\t7\terror\truntime\tbroken'
+record $'ZTHEME1\t7\terror\tnode\tbroken'
+[[ $renders == 2 && $ZTHEME_SEGMENT_NODE == NODE && $ZTHEME_SEGMENT_PYTHON == PYTHON ]] || exit 15
+[[ $ZTHEME_LAST_ERROR == broken ]] || exit 16
 "#;
     assert_success(&sandbox.zsh(script));
+}
+
+/// Runs one prompt through the real precmd with `_ztheme_send_request`
+/// replaced by a fake client: the zsh function body `fake` writes records
+/// for generation `$1` to the response descriptor. The Git value starts as
+/// `OLD`; `checks` runs after precmd with `$elapsed` (seconds) and `$renders`.
+fn shell_wait_script(sandbox: &Sandbox, mode: &str, budget_ms: u32, fake: &str, checks: &str) {
+    sandbox.install_fake_gitstatus();
+    sandbox.write_theme(
+        "wait-git",
+        "version = 1\n[layout]\nlines = [[\"git\"]]\nright = []\nblank_line_before = false\n",
+    );
+    let instance = format!("shell-wait-{}", SEQUENCE.fetch_add(1, Ordering::Relaxed));
+    let script = format!(
+        r#"
+eval "$("$ZTHEME_TEST_BIN" init zsh --dev {instance} --theme wait-git)" || exit 10
+_ztheme_stop_client
+__ZTHEME_MODE_GIT={mode}
+__ZTHEME_ASYNC_BUDGET_MS={budget_ms}
+functions[_ztheme_test_render_layout]=$functions[_ztheme_render_layout]
+typeset -gi renders=0
+_ztheme_render_layout() {{ (( ++renders )); _ztheme_test_render_layout; }}
+r() {{ print -r -- "ZTHEME1"$'\t'"$@"; }}
+fake() {{
+    local g=$1
+    {fake}
+}}
+_ztheme_send_request() {{
+    exec {{ZTHEME_RESP_FD}}< <(fake "$ZTHEME_GENERATION" 2>/dev/null)
+}}
+ZTHEME_SEGMENT_GIT=OLD
+typeset -F started=$EPOCHREALTIME
+_ztheme_precmd
+typeset -F elapsed=$(( EPOCHREALTIME - started ))
+# The integration started a server daemon; stop it with the test.
+for lock in "$ZTHEME_RUNTIME_DIR"/*.lock(N); do
+    read -r pid < "$lock" && kill "$pid" 2>/dev/null
+done
+{checks}
+"#
+    );
+    assert_success(&sandbox.zsh(&script));
+}
+
+#[test]
+fn shell_auto_mode_draws_once_with_a_value_completed_within_the_budget() {
+    let sandbox = Sandbox::new();
+    shell_wait_script(
+        &sandbox,
+        "auto",
+        1000,
+        r#"r "$g"$'\tsegment\tgit\tFRESH'; r "$g"$'\tcomplete\tgit'; /bin/sleep 1.5"#,
+        r"(( elapsed < 0.9 )) || exit 11
+[[ $renders == 1 && $ZTHEME_PROMPT == *FRESH* ]] || exit 12",
+    );
+}
+
+#[test]
+fn shell_auto_mode_draws_the_known_value_at_the_budget_then_redraws() {
+    let sandbox = Sandbox::new();
+    shell_wait_script(
+        &sandbox,
+        "auto",
+        50,
+        r#"r "$g"$'\tsegment\tgit\tSTALE'; /bin/sleep 0.4; r "$g"$'\tsegment\tgit\tFRESH'; r "$g"$'\tcomplete\tgit'"#,
+        r#"(( elapsed < 0.35 )) || exit 11
+[[ $renders == 1 && $ZTHEME_PROMPT == *STALE* ]] || exit 12
+for attempt in 1 2 3; do
+    [[ $ZTHEME_SEGMENT_GIT == FRESH ]] && break
+    _ztheme_async_callback "$ZTHEME_RESP_FD" 2>/dev/null
+done
+[[ $renders == 2 && $ZTHEME_PROMPT == *FRESH* ]] || exit 13"#,
+    );
+}
+
+#[test]
+fn shell_locked_mode_waits_for_the_group_to_complete() {
+    let sandbox = Sandbox::new();
+    shell_wait_script(
+        &sandbox,
+        "locked",
+        0,
+        r#"/bin/sleep 0.3; r "$g"$'\tsegment\tgit\tFRESH'; r "$g"$'\tcomplete\tgit'; /bin/sleep 1.5"#,
+        r"(( elapsed >= 0.3 && elapsed < 0.95 )) || exit 11
+[[ $renders == 1 && $ZTHEME_PROMPT == *FRESH* ]] || exit 12",
+    );
+}
+
+#[test]
+fn shell_async_mode_draws_the_known_value_without_waiting() {
+    let sandbox = Sandbox::new();
+    shell_wait_script(
+        &sandbox,
+        "async",
+        1000,
+        r#"/bin/sleep 0.3; r "$g"$'\tsegment\tgit\tFRESH'; r "$g"$'\tcomplete\tgit'"#,
+        r"(( elapsed < 0.25 )) || exit 11
+[[ $renders == 1 && $ZTHEME_PROMPT == *OLD* ]] || exit 12",
+    );
+}
+
+#[test]
+fn shell_wait_ends_when_the_client_closes_its_output() {
+    let sandbox = Sandbox::new();
+    shell_wait_script(
+        &sandbox,
+        "locked",
+        0,
+        ":",
+        r"(( elapsed < 0.5 )) || exit 11
+[[ $renders == 1 && $ZTHEME_PROMPT == *OLD* && $ZTHEME_RESP_FD == -1 ]] || exit 12",
+    );
 }
 
 #[test]
@@ -3446,7 +3544,7 @@ typeset -gi starts=0 clears=0
 _ztheme_start_worker() { (( ++starts )); }
 _ztheme_compute_sync_segments() { :; }
 _ztheme_render_layout() { :; }
-_ztheme_clear_async_segments() { ZTHEME_SEGMENT_NODE=''; (( ++clears )); }
+_ztheme_clear_async_group() { [[ $1 == runtime ]] && ZTHEME_SEGMENT_NODE=''; (( ++clears )); }
 HOME=/home-one
 GIT_CEILING_DIRECTORIES=/ceiling-one
 _ztheme_precmd
@@ -3519,12 +3617,12 @@ fn failing_runtime_does_not_prevent_sibling_values_from_being_persisted() {
                 .any(|record| record.contains("\tsegment\tnode\t") && record.contains("24.5.0")),
             "{records:?}"
         );
-        assert!(python_fragment(&records).is_empty(), "{records:?}");
+        // The failed command sends no record: the shell keeps its value.
         assert!(
-            records
+            !records
                 .iter()
-                .any(|record| record.ends_with("\tsegment\tpython\t\n")),
-            "failed selection lacked its empty record: {records:?}"
+                .any(|record| record.contains("\tsegment\tpython\t")),
+            "failed selection sent a segment record: {records:?}"
         );
     }
     assert_eq!(fs::read_to_string(&node_counter).unwrap().trim(), "1");
@@ -3813,10 +3911,15 @@ fn transient_runtime_failures_are_not_persisted() {
     let (mut child, mut stdin, mut stdout) = spawn_client_daemon(&sandbox, &instance, &hex, &[]);
     let cwd = sandbox.home.to_str().unwrap().as_bytes().to_vec();
 
-    let failed = send_python_request(&mut stdin, &mut stdout, 1, &cwd, &[("PATH", &fake_path)]);
+    // A transient failure sends no python record at all, so the shell keeps
+    // the value it already shows instead of erasing it.
+    let failed =
+        send_and_read_until_done(&mut stdin, &mut stdout, 1, &cwd, &[("PATH", &fake_path)]);
     assert!(
-        failed.is_empty(),
-        "failed runtime produced a value: {failed}"
+        !failed
+            .iter()
+            .any(|record| record.contains("\tsegment\tpython\t")),
+        "failed runtime produced a segment record: {failed:?}"
     );
     let recovered = send_python_request(&mut stdin, &mut stdout, 2, &cwd, &[("PATH", &fake_path)]);
     assert!(recovered.contains("3.12.0"));
@@ -3900,12 +4003,15 @@ fn client_daemon_cancels_in_flight_work_without_emitting_stale_records() {
     let fake_path = sandbox.data.to_str().unwrap();
 
     // Request A: its git query is still in flight (the fake gitstatusd
-    // delays 150 ms) when B arrives and supersedes it, so A must contribute
-    // no records at all.
+    // delays 150 ms) when B arrives and supersedes it. A's only record is the
+    // immediate withdrawal of a Git value from an unknown repository; nothing
+    // of A may follow once B is sent.
     stdin
         .write_all(&client_request_with_env(1, &cwd, &[("PATH", fake_path)]))
         .unwrap();
-    thread::sleep(Duration::from_millis(50));
+    let mut line = String::new();
+    stdout.read_line(&mut line).unwrap();
+    assert_eq!(line, "ZTHEME1\t1\tsegment\tgit\t\n");
     stdin
         .write_all(&client_request_with_env(
             2,
@@ -5289,6 +5395,176 @@ fn git_config_options_reach_gitstatusd_and_reset_rereads_them() {
     assert!(
         restarted.contains(" -t 3 ") && restarted.contains(" -m 1000 "),
         "configured arguments missing: {restarted}"
+    );
+    shutdown_server(server, &socket);
+}
+
+/// Forwards a client's response lines through a channel so a test can wait
+/// for a record with a deadline instead of blocking forever on a missing one.
+struct RecordReader(std::sync::mpsc::Receiver<String>);
+
+impl RecordReader {
+    fn new(mut stdout: BufReader<std::process::ChildStdout>) -> Self {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        thread::spawn(move || {
+            loop {
+                let mut line = String::new();
+                if stdout.read_line(&mut line).unwrap_or(0) == 0 || sender.send(line).is_err() {
+                    return;
+                }
+            }
+        });
+        Self(receiver)
+    }
+
+    /// Returns the `generation`, `kind`, `segment` and `fragment` fields of
+    /// the next record, panicking when none arrives within `timeout`.
+    fn next(&self, timeout: Duration) -> Vec<String> {
+        let line = self
+            .0
+            .recv_timeout(timeout)
+            .expect("no client record arrived in time");
+        let fields: Vec<String> = line
+            .trim_end_matches('\n')
+            .split('\t')
+            .map(str::to_owned)
+            .collect();
+        assert_eq!(fields[0], "ZTHEME1", "{line}");
+        fields[1..].to_vec()
+    }
+
+    /// Reads records until `kind` (and `segment`, when given) arrives for
+    /// `generation`, asserting every record belongs to that generation.
+    fn until(&self, generation: u64, kind: &str, segment: Option<&str>) -> Vec<Vec<String>> {
+        let mut records = Vec::new();
+        loop {
+            let record = self.next(PROCESS_TIMEOUT);
+            assert_eq!(record[0], generation.to_string(), "{records:?} {record:?}");
+            let found = record[1] == kind && segment.is_none_or(|name| record[2] == name);
+            records.push(record);
+            if found {
+                return records;
+            }
+        }
+    }
+}
+
+fn git_segments(records: &[Vec<String>]) -> Vec<String> {
+    records
+        .iter()
+        .filter(|record| record[1] == "segment" && record[2] == "git")
+        .map(|record| record.get(3).cloned().unwrap_or_default())
+        .collect()
+}
+
+#[test]
+fn client_emits_a_late_fresh_git_result_after_done_until_superseded() {
+    let sandbox = Sandbox::new();
+    install_scripted_gitstatusd(&sandbox);
+    let repository = git_repository(&sandbox);
+    let hold = sandbox.home.join("git-hold");
+    let instance = format!("git-late-{}", SEQUENCE.fetch_add(1, Ordering::Relaxed));
+    write_git_theme(&sandbox, "git-only");
+    let (server, socket) = spawn_server(&sandbox, &instance);
+    let hex = theme_hex(&sandbox, &instance, "git-only");
+    let (mut child, mut stdin, stdout) = spawn_client_daemon(&sandbox, &instance, &hex, &[]);
+    let records = RecordReader::new(stdout);
+    let cwd = repository.as_os_str().as_bytes().to_vec();
+
+    stdin.write_all(&client_request(1, &cwd)).unwrap();
+    let cold = git_segments(&records.until(1, "done", None));
+    assert!(cold.last().unwrap().contains("⇡1"), "{cold:?}");
+
+    // The covering query is held past the request deadline: the cached value
+    // comes first, `done` follows without a Git completion, and the fresh
+    // value still arrives for the same prompt once the query finishes.
+    fs::write(&hold, "").unwrap();
+    stdin.write_all(&client_request(2, &cwd)).unwrap();
+    let before_done = records.until(2, "done", None);
+    assert!(
+        !before_done
+            .iter()
+            .any(|record| record[1] == "complete" && record[2] == "git"),
+        "{before_done:?}"
+    );
+    let stale = git_segments(&before_done);
+    assert!(
+        stale.len() == 1 && stale[0].contains("⇡1"),
+        "{before_done:?}"
+    );
+    fs::remove_file(&hold).unwrap();
+    let late = records.until(2, "complete", Some("git"));
+    assert!(git_segments(&late)[0].contains("⇡2"), "{late:?}");
+
+    // A newer request supersedes the held continuation: nothing more is
+    // written for generation 3 once generation 4 has started.
+    fs::write(&hold, "").unwrap();
+    stdin.write_all(&client_request(3, &cwd)).unwrap();
+    records.until(3, "done", None);
+    stdin.write_all(&client_request(4, &cwd)).unwrap();
+    let first = records.until(4, "segment", Some("git"));
+    fs::remove_file(&hold).unwrap();
+    let rest = records.until(4, "complete", Some("git"));
+    assert!(
+        git_segments(&first).len() == 1 && git_segments(&rest).len() == 1,
+        "{rest:?}"
+    );
+
+    drop(stdin);
+    assert!(
+        wait_for_exit(&mut child, PROCESS_TIMEOUT)
+            .unwrap()
+            .success()
+    );
+    shutdown_server(server, &socket);
+}
+
+#[test]
+fn client_clears_git_immediately_when_the_repository_changes() {
+    let sandbox = Sandbox::new();
+    install_scripted_gitstatusd(&sandbox);
+    let first_repository = git_repository(&sandbox);
+    let second_repository = sandbox.home.join("other");
+    fs::create_dir_all(second_repository.join(".git/objects")).unwrap();
+    fs::create_dir_all(second_repository.join(".git/refs")).unwrap();
+    fs::write(
+        second_repository.join(".git/HEAD"),
+        "ref: refs/heads/main\n",
+    )
+    .unwrap();
+    let hold = sandbox.home.join("git-hold");
+    let instance = format!(
+        "git-repo-change-{}",
+        SEQUENCE.fetch_add(1, Ordering::Relaxed)
+    );
+    write_git_theme(&sandbox, "git-only");
+    let (server, socket) = spawn_server(&sandbox, &instance);
+    let hex = theme_hex(&sandbox, &instance, "git-only");
+    let (mut child, mut stdin, stdout) = spawn_client_daemon(&sandbox, &instance, &hex, &[]);
+    let records = RecordReader::new(stdout);
+
+    stdin
+        .write_all(&client_request(1, first_repository.as_os_str().as_bytes()))
+        .unwrap();
+    records.until(1, "done", None);
+
+    // The new repository has no cached result and its query is held, so the
+    // old repository's branch must be withdrawn before the fresh value.
+    fs::write(&hold, "").unwrap();
+    stdin
+        .write_all(&client_request(2, second_repository.as_os_str().as_bytes()))
+        .unwrap();
+    let first = records.until(2, "segment", Some("git"));
+    assert_eq!(git_segments(&first), [""], "{first:?}");
+    fs::remove_file(&hold).unwrap();
+    let fresh = records.until(2, "complete", Some("git"));
+    assert!(git_segments(&fresh)[0].contains("main"), "{fresh:?}");
+
+    drop(stdin);
+    assert!(
+        wait_for_exit(&mut child, PROCESS_TIMEOUT)
+            .unwrap()
+            .success()
     );
     shutdown_server(server, &socket);
 }
