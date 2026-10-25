@@ -46,10 +46,13 @@ the daemon's cached) value and redraws when the fresh one arrives.
 
 Runtime values depend on the whole prompt context, so the shell drops them
 when the context key changes. The Git value is not cleared by the shell on a
-directory or context change: the client knows the repository behind the value
-it last sent and withdraws it with an empty `git` record when a request
-resolves to another repository, so a `cd` within one repository keeps its
-status on screen.
+directory or context change in `auto` and `locked` mode: the client knows the
+repository behind the value it last sent and withdraws it with a `clear git`
+record when a request resolves to another repository, so a `cd` within one
+repository keeps its status on screen. An `async` prompt draws before that
+record can arrive, so in `async` mode the shell drops Git on a context change
+too; the daemon's cached value for the new directory follows within
+milliseconds.
 
 The server daemon provides shared background state. It hosts two independent
 long-lived capabilities:
@@ -334,7 +337,9 @@ client error instead. This asymmetry lets a newly installed binary replace an
 old background process while preventing an older still-running shell client
 from downgrading the daemon.
 
-`reset` is deliberately different. When the daemon exists it sends `RESET`,
+`reset` is deliberately different. It first reads `[git]` and fails with that
+error, changing nothing, when the table is invalid; the daemon checks it again
+before clearing anything. When the daemon exists it sends `RESET`,
 which clears runtime cache state and the cached Git results and restarts
 `gitstatusd` (rereading `[git]`) only when one is already running; a query
 in flight finishes for its waiters first, and its result is not cached. When no daemon is available it deletes persistent
@@ -493,8 +498,9 @@ switch) is never hidden by an older in-flight query. A request for a key whose
 query is in flight and started earlier joins that key's single follow-up;
 every request arriving during the same in-flight query shares it. An idle key
 starts at once, and follow-ups for different keys start in arrival order. A
-request therefore waits at most for the remainder of the current query plus
-its own, however many shells ask. Each request also immediately receives the
+request therefore waits at most for the remainder of its key's current query
+plus its own, however many shells ask about that key; follow-ups queued
+earlier for other keys add their own query times. Each request also immediately receives the
 key's cached result, if any, as a stale frame before the fresh one.
 
 A requester that disconnects drops only its waiter; a started query always
@@ -512,9 +518,12 @@ is the per-request engine used by the client daemon:
 - applies one shared 550 ms deadline to runtime work and to `done`;
 - writes each completed runtime or Git segment immediately; runtime values
   are independent events, not a single aggregate snapshot;
-- writes an empty `git` segment first when the request's repository differs
-  from the one whose value the shell was last sent (`ShownRepository`, kept
-  across a client's requests and updated only as records are written);
+- writes a `clear git` record first unless the shell can hold only the
+  request's repository's value (`ShownRepository`, kept across a client's
+  requests and updated only as records are written; a new client assumes
+  the shell may hold anything). The shell applies `clear` whatever its
+  generation while it may discard a superseded generation's values, so the
+  client never takes another repository's value for the request's;
 - writes the daemon's cached Git result, when one arrives first, as an early
   `git` segment record, then writes the fresh result with the group's
   `complete`, after `done` when it is late, within the 10 s Git cap; a fresh
@@ -720,6 +729,7 @@ daemon to stdout and consumed by the Zsh integration:
 
 ```text
 ZTHEME1<TAB>generation<TAB>segment<TAB>name<TAB>rendered-fragment<NL>
+ZTHEME1<TAB>generation<TAB>clear<TAB>name<NL>
 ZTHEME1<TAB>generation<TAB>error<TAB>source<TAB>message<NL>
 ZTHEME1<TAB>generation<TAB>complete<TAB>group<NL>
 ZTHEME1<TAB>generation<TAB>done<NL>
@@ -733,10 +743,11 @@ bounded before output.
 
 A `complete` record is written immediately after a group's segment records
 (`git` or `runtime`) by the client. It lets the shell stop waiting for that
-group as soon as the group is done. The Git group may carry up to three `git`
-segment records in one generation: an empty one withdrawing another
-repository's value, the daemon's cached value, then the fresh value
+group as soon as the group is done. The Git group may carry a `clear git`
+withdrawing another repository's value, then up to two `git` segment records
+in one generation: the daemon's cached value, then the fresh value
 immediately before `complete`; each later record replaces the earlier one.
+`clear` is the one record the shell applies from any generation.
 
 Records of the current generation remain valid after `done`. `done` ends the
 request's main phase (runtime work and the shell's waiting); only Git's fresh
@@ -744,8 +755,10 @@ value and `complete git` can follow it, until the next request supersedes the
 generation or the 10 s Git cap ends it with an error record.
 
 Error records never clear a value: the shell keeps what it shows and displays
-each distinct message once (through `zle -M`, or on standard error when the
-error arrives while `precmd` waits). A fresh Git result that times out behind
+a message once, until a value changes or the context key does (through
+`zle -M`, or on standard error when the error arrives while `precmd` waits).
+Unchanged and empty segment records, which the client re-sends every prompt,
+do not make the same error show again. A fresh Git result that times out behind
 a cached value sends no error, only `complete`.
 
 How long `precmd` waits for each group follows its `[async]` mode (`auto`,

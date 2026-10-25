@@ -37,7 +37,9 @@ pub const UNTRACKED: u8 = 1 << 4;
 
 /// `[git]` in `config.toml`: the tunable `gitstatusd` flags. The theme schema
 /// embeds this table so `init` and `reload` validate it; the daemon reads only
-/// this table, each time it starts or restarts `gitstatusd`.
+/// this table, when it starts `gitstatusd` and when `ztheme clear` or a timed
+/// out query restarts it. Replacing a crashed `gitstatusd` reuses the
+/// options it ran with.
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Options {

@@ -80,6 +80,12 @@ pub fn write_error(
     write_fields(output, generation, &["error", segment, &message])
 }
 
+/// Withdraws a segment's value. Unlike every other record, the shell applies
+/// it whatever its generation, so the client can rely on it having arrived.
+pub fn write_clear(output: &mut impl Write, generation: u64, segment: &str) -> io::Result<()> {
+    write_fields(output, generation, &["clear", segment])
+}
+
 pub fn write_done(output: &mut impl Write, generation: u64) -> io::Result<()> {
     write_fields(output, generation, &["done"])
 }

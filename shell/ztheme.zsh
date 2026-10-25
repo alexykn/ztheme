@@ -324,21 +324,29 @@ _ztheme_read_record() {
     IFS=$'\t' read -r -u "$fd" protocol generation kind segment fragment ||
         return 1
 
-    # Records from superseded generations are ignored, never rendered; the
-    # client daemon itself is long-lived, so nothing is torn down here.
-    # Records of the current generation are accepted after `done` too: a slow
-    # fresh Git value follows it.
-    if [[ "$protocol" != ZTHEME1 ||
-          "$generation" != "$ZTHEME_GENERATION" ]]; then
+    [[ "$protocol" == ZTHEME1 ]] || return 0
+    # A withdrawal applies whatever its generation: the client counts the
+    # value as gone once it is written, and decides by that when the next
+    # request must withdraw another repository's value.
+    if [[ "$kind" == clear ]]; then
+        _ztheme_assign_async_segment "$segment" "" &&
+            { ZTHEME_REDRAW=1; ZTHEME_LAST_ERROR=""; }
         return 0
     fi
+    # Other records from superseded generations are ignored, never rendered;
+    # the client daemon itself is long-lived, so nothing is torn down here.
+    # Records of the current generation are accepted after `done` too: a slow
+    # fresh Git value follows it.
+    [[ "$generation" == "$ZTHEME_GENERATION" ]] || return 0
 
     case "$kind" in
         segment)
-            ZTHEME_LAST_ERROR=""
             # An unchanged or empty fragment (runtimes emit one record per
-            # configured runtime) needs no second draw.
-            _ztheme_assign_async_segment "$segment" "$fragment" && ZTHEME_REDRAW=1
+            # configured runtime) needs no second draw, and it does not make
+            # the same error worth showing again: the client re-sends both
+            # on every prompt.
+            _ztheme_assign_async_segment "$segment" "$fragment" &&
+                { ZTHEME_REDRAW=1; ZTHEME_LAST_ERROR=""; }
             ;;
         error)
             # The value on screen stays: only a newer value replaces it. The
@@ -553,9 +561,12 @@ _ztheme_precmd() {
     # Runtime values depend on the whole context, so they are dropped when it
     # changes. The Git value stays: the client withdraws it when the
     # repository changed, so a cd within one repository does not blank it.
+    # In `async` mode the prompt draws before that withdrawal can arrive, so
+    # the shell drops Git too; the daemon's cached value follows at once.
     if [[ "$context_key" != "$ZTHEME_CONTEXT_KEY" ]]; then
         ZTHEME_CONTEXT_KEY="$context_key"
         _ztheme_clear_async_group runtime
+        [[ "$__ZTHEME_MODE_GIT" == async ]] && _ztheme_clear_async_group git
         ZTHEME_LAST_ERROR=""
     fi
 

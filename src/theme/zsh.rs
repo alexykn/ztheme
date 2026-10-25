@@ -317,8 +317,9 @@ fn emit_segment_state(output: &mut String, layout: &ValidatedLayout) {
 }
 
 /// Emits a group-scoped async clear dispatcher (`git` or `runtime`). The shell
-/// clears only the runtime group, when the prompt context changes; every other
-/// value stays until a newer one replaces it.
+/// clears a group only when the prompt context changes: always the runtime
+/// group, and Git in `async` mode; every other value stays until a newer one
+/// replaces it.
 fn emit_clear_async_group(output: &mut String, segments: &[SegmentId]) {
     output.push_str("_ztheme_clear_async_group() {\n    emulate -L zsh\n    case \"$1\" in\n");
     if segments.contains(&SegmentId::Git) {

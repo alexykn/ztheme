@@ -190,7 +190,9 @@ Each group takes one of three modes:
 - `locked` waits until the group is complete, at most until the shared 550 ms
   deadline. Lock both groups for one complete draw.
 - `async` never waits: the prompt draws at once with the last known values and
-  redraws as each value arrives.
+  redraws as each value arrives. Because it cannot wait to learn whether a
+  `cd` left the repository, it drops the Git segment whenever the directory
+  or the prompt environment changes, and redraws it a moment later.
 
 In a large repository a fresh Git status can take longer than the deadline.
 The prompt then shows the last known Git status (the background daemon keeps
@@ -209,7 +211,7 @@ All shells share one background `gitstatusd`. Prompts that ask about the same
 repository while a status query runs share one follow-up query, so several
 shells, or Enter pressed repeatedly, do not queue a query each. Two
 `gitstatusd` settings can be tuned in `config.toml`; they apply when the
-background daemon next starts `gitstatusd` (`ztheme reset` restarts it):
+background daemon next starts `gitstatusd` (`ztheme clear` restarts it):
 
 ```toml
 [git]

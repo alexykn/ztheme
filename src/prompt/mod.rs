@@ -35,25 +35,40 @@ const ZSH_CLOCK_SEGMENT: &str = include_str!("../../shell/segments/clock.zsh");
 const ZSH_STATUS_SEGMENT: &str = include_str!("../../shell/segments/status.zsh");
 const ZSH_CHARACTER_SEGMENT: &str = include_str!("../../shell/segments/character.zsh");
 
-/// The repository whose Git value the shell holds, shared by one client's
-/// sequential requests: `None` when it holds no value or the client cannot
-/// tell. The shell keeps a Git value across prompts and directory changes, so
-/// a request for another repository must withdraw it before its own query
-/// finishes. Updated only as records are written, so it never runs ahead of
-/// what the shell received.
+/// The repository whose Git value the shell may hold, shared by one client's
+/// sequential requests. The shell keeps a Git value across prompts and
+/// directory changes, so a request for another repository must withdraw it
+/// before its own query finishes. Updated only as records are written. The
+/// shell discards a superseded generation's value records but applies every
+/// withdrawal, so once a request's records are written it holds that
+/// repository's value or none: never another repository's.
 #[derive(Clone, Default)]
-struct ShownRepository(Arc<Mutex<Option<gitstatus::Query>>>);
+struct ShownRepository(Arc<Mutex<Shown>>);
+
+#[derive(Default)]
+enum Shown {
+    /// A new client cannot tell what the shell kept from its predecessor.
+    #[default]
+    Unknown,
+    Nothing,
+    Repository(gitstatus::Query),
+}
 
 impl ShownRepository {
+    /// Whether the shell can hold only `query`'s value, or no value for `None`.
     fn holds(&self, query: Option<&gitstatus::Query>) -> bool {
-        self.lock().as_ref() == query
+        match (&*self.lock(), query) {
+            (Shown::Nothing, None) => true,
+            (Shown::Repository(shown), Some(query)) => shown == query,
+            _ => false,
+        }
     }
 
     fn set(&self, query: Option<gitstatus::Query>) {
-        *self.lock() = query;
+        *self.lock() = query.map_or(Shown::Nothing, Shown::Repository);
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, Option<gitstatus::Query>> {
+    fn lock(&self) -> std::sync::MutexGuard<'_, Shown> {
         self.0
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -165,7 +180,9 @@ fn write_join_error(result: Result<(), tokio::task::JoinError>, generation: u64)
 
 /// Starts the Git task, which always ends with one final Git event, within
 /// `GIT_TIMEOUT`. The receiver resolves once the task runs, so runtime work
-/// starts after the Git request does.
+/// starts after the Git request does. The exchange shares the task's
+/// deadline: when it expires, the exchange's own handling of a fresh result
+/// that never came (polled first) wins over the cap's error.
 fn spawn_git(
     tasks: &mut JoinSet<()>,
     state: &ClientState,
@@ -177,10 +194,17 @@ fn spawn_git(
     let instance = state.instance.clone();
     let executor = state.executor.clone();
     let shown = state.shown.clone();
+    let deadline = Instant::now() + GIT_TIMEOUT;
     tasks.spawn(async move {
         let _ = started_tx.send(());
-        let exchange = git_exchange(&instance, cwd, environment, &executor, &shown, &events);
-        let result = tokio::time::timeout(GIT_TIMEOUT, exchange)
+        let git = GitRequest {
+            instance: &instance,
+            executor: &executor,
+            shown: &shown,
+            events: &events,
+            deadline,
+        };
+        let result = timeout_at(deadline, git.exchange(cwd, environment))
             .await
             .unwrap_or_else(|_| {
                 let error = io::Error::new(io::ErrorKind::TimedOut, "Git status timed out");
@@ -191,46 +215,60 @@ fn spawn_git(
     started_rx
 }
 
-/// Discovers the repository and runs its status exchange, returning the
-/// final Git event. Intermediate events (a withdrawn value, a cached value)
-/// are sent as they happen.
-async fn git_exchange(
-    instance: &daemon::Instance,
-    cwd: PathBuf,
-    environment: Arc<PromptEnvironment>,
-    executor: &planning::PlanningExecutor,
-    shown: &ShownRepository,
-    events: &mpsc::Sender<SnapshotResult>,
-) -> SnapshotResult {
-    let query = match executor.git_query(cwd, environment).await {
-        Ok(Some(query)) => query,
+/// One request's Git exchange, bounded by `deadline`.
+struct GitRequest<'a> {
+    instance: &'a daemon::Instance,
+    executor: &'a planning::PlanningExecutor,
+    shown: &'a ShownRepository,
+    events: &'a mpsc::Sender<SnapshotResult>,
+    deadline: Instant,
+}
+
+impl GitRequest<'_> {
+    /// Discovers the repository and runs its status exchange, returning the
+    /// final Git event. Intermediate events (a withdrawn value, a cached
+    /// value) are sent as they happen.
+    async fn exchange(&self, cwd: PathBuf, environment: Arc<PromptEnvironment>) -> SnapshotResult {
+        let query = match self.executor.git_query(cwd, environment).await {
+            Ok(query) => query,
+            Err(error) => {
+                self.withdraw_unless_shown(None).await;
+                return SnapshotResult::Git(None, Err(error));
+            }
+        };
+        self.withdraw_unless_shown(query.as_ref()).await;
         // Outside a repository the empty final value replaces any old one.
-        Ok(None) => return SnapshotResult::Git(None, Ok(None)),
-        Err(error) => {
-            if !shown.holds(None) {
-                let _ = events.send(SnapshotResult::GitCleared).await;
+        let Some(query) = query else {
+            return SnapshotResult::Git(None, Ok(None));
+        };
+        match daemon::git_status(self.instance, &query, self.deadline).await {
+            Ok(daemon::GitStatus::Fresh(snapshot)) => {
+                SnapshotResult::Git(Some(query), Ok(snapshot))
             }
-            return SnapshotResult::Git(None, Err(error));
+            Ok(daemon::GitStatus::Stale { cached, pending }) => {
+                let _ = self
+                    .events
+                    .send(SnapshotResult::GitStale(query.clone(), cached))
+                    .await;
+                match pending.fresh(self.deadline).await {
+                    // The cached value stays on screen; a fresh result that
+                    // never came is not worth a message.
+                    Err(error) if error.kind() == io::ErrorKind::TimedOut => {
+                        SnapshotResult::GitKept
+                    }
+                    result => SnapshotResult::Git(Some(query), result),
+                }
+            }
+            Err(error) => SnapshotResult::Git(Some(query), Err(error)),
         }
-    };
-    if !shown.holds(Some(&query)) {
-        let _ = events.send(SnapshotResult::GitCleared).await;
     }
-    let deadline = Instant::now() + GIT_TIMEOUT;
-    match daemon::git_status(instance, &query, deadline).await {
-        Ok(daemon::GitStatus::Fresh(snapshot)) => SnapshotResult::Git(Some(query), Ok(snapshot)),
-        Ok(daemon::GitStatus::Stale { cached, pending }) => {
-            let _ = events
-                .send(SnapshotResult::GitStale(query.clone(), cached))
-                .await;
-            match pending.fresh(deadline).await {
-                // The cached value stays on screen; a fresh result that never
-                // came is not worth a message.
-                Err(error) if error.kind() == io::ErrorKind::TimedOut => SnapshotResult::GitKept,
-                result => SnapshotResult::Git(Some(query), result),
-            }
+
+    /// Withdraws the shell's Git value unless it can belong only to `query`
+    /// (`None`: unless the shell holds none).
+    async fn withdraw_unless_shown(&self, query: Option<&gitstatus::Query>) {
+        if !self.shown.holds(query) {
+            let _ = self.events.send(SnapshotResult::GitCleared).await;
         }
-        Err(error) => SnapshotResult::Git(Some(query), Err(error)),
     }
 }
 
@@ -247,7 +285,7 @@ fn write_result(
     let mut output = io::stdout().lock();
     match result {
         SnapshotResult::GitCleared => {
-            protocol::write_segment(&mut output, generation, "git", "")?;
+            protocol::write_clear(&mut output, generation, "git")?;
             shown.set(None);
             Ok(())
         }

@@ -57,10 +57,14 @@ impl Client {
         }
     }
 
-    /// Replaces `gitstatusd`, rereading `[git]` so an explicit restart (such
-    /// as `ztheme reset`) applies edited options.
+    /// Replaces `gitstatusd`, rereading `[git]` so edited options apply.
     pub fn restart(&mut self) -> io::Result<()> {
-        let options = Options::load()?;
+        self.restart_with(Options::load()?)
+    }
+
+    /// Replaces `gitstatusd` with already read options (`ztheme clear`
+    /// validates them before it changes anything).
+    pub fn restart_with(&mut self, options: Options) -> io::Result<()> {
         self.process = Some(Process::start(&options)?);
         self.options = options;
         Ok(())

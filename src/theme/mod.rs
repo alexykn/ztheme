@@ -700,7 +700,7 @@ mod tests {
     }
 
     #[test]
-    fn generated_group_clear_is_scoped_to_the_errored_group() {
+    fn generated_group_clear_is_scoped_to_its_group() {
         // git + two runtimes: each variable must land in its own group's branch.
         let theme =
             merged_theme("version = 1\n[layout]\nlines = [[\"git\", \"python\", \"rust\"]]")

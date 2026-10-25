@@ -116,7 +116,8 @@ struct Owner {
     running: Option<Running>,
     /// Incremented by RESET so a query started before it is not cached.
     epoch: u64,
-    restart_after_query: bool,
+    /// The options a RESET during a query restarts `gitstatusd` with.
+    restart_after_query: Option<gitstatus::Options>,
     tick: u64,
 }
 
@@ -191,7 +192,11 @@ impl Owner {
         }
     }
 
+    /// Reads `[git]` before changing anything, so an invalid table fails the
+    /// reset as a whole. An unstarted `gitstatusd` reads it when it starts.
     fn reset(&mut self) -> io::Result<()> {
+        let started = self.client.is_some() || self.running.is_some();
+        let options = started.then(gitstatus::Options::load).transpose()?;
         self.epoch += 1;
         self.keys.retain(|_, key| !key.idle());
         for key in self.keys.values_mut() {
@@ -199,20 +204,21 @@ impl Owner {
         }
         if self.running.is_some() {
             // The client is lent to the running query; replace it on return.
-            self.restart_after_query = true;
+            self.restart_after_query = options;
             return Ok(());
         }
-        self.client
-            .as_mut()
-            .map_or(Ok(()), gitstatus::Client::restart)
+        match (self.client.as_mut(), options) {
+            (Some(client), Some(options)) => client.restart_with(options),
+            _ => Ok(()),
+        }
     }
 
     fn complete(&mut self, completion: Completion) {
         self.running = None;
         self.client = completion.client;
-        if mem::take(&mut self.restart_after_query)
+        if let Some(options) = self.restart_after_query.take()
             && let Some(client) = self.client.as_mut()
-            && let Err(error) = client.restart()
+            && let Err(error) = client.restart_with(options)
         {
             eprintln!("ztheme: gitstatusd restart after reset failed: {error}");
         }

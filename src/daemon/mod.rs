@@ -194,6 +194,9 @@ pub(crate) async fn git_status(
 }
 
 pub(crate) async fn reset(instance: &Instance) -> io::Result<()> {
+    // The daemon rereads `[git]` to restart gitstatusd; report an invalid
+    // table here rather than as a dropped connection after a partial reset.
+    gitstatus::Options::load()?;
     let socket = instance.socket_path();
     match protocol::reset(&socket).await {
         Ok(()) => return Ok(()),
@@ -500,9 +503,11 @@ async fn dispatch(request: protocol::Request, shared: &Shared) -> io::Result<pro
     Ok(response)
 }
 
+/// Resets Git first: it fails without changing anything when `[git]` is
+/// invalid, so a failed reset leaves both caches intact.
 async fn reset_state(shared: &Shared) -> io::Result<()> {
-    shared.cache.clear().await?;
-    shared.git.reset().await
+    shared.git.reset().await?;
+    shared.cache.clear().await
 }
 
 /// Serves one Git status request that arrived at `arrived`: a stale frame
