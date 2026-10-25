@@ -2,12 +2,16 @@ mod install;
 mod process;
 
 use std::io;
+use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
+
+use serde::{Deserialize, Serialize};
 
 pub use install::{ensure_installed, managed_binary};
 pub use process::Client;
 
-#[derive(Clone, Debug)]
+/// Also the daemon's Git cache key: the query kind and its exact path.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub enum Query {
     Directory(PathBuf),
     GitDir(PathBuf),
@@ -31,6 +35,91 @@ pub const STAGED: u8 = 1 << 2;
 pub const UNSTAGED: u8 = 1 << 3;
 pub const UNTRACKED: u8 = 1 << 4;
 
+/// `[git]` in `config.toml`: the tunable `gitstatusd` flags. The theme schema
+/// embeds this table so `init` and `reload` validate it; the daemon reads only
+/// this table, when it starts `gitstatusd` and when `ztheme clear` or a timed
+/// out query restarts it. Replacing a crashed `gitstatusd` reuses the
+/// options it ran with.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Options {
+    /// Worker threads that scan the working tree (`-t`). Unset selects
+    /// `DEFAULT_MAX_THREADS` or the number of available cores when fewer.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub threads: Option<NonZeroU32>,
+    /// Index size above which `gitstatusd` stops scanning for unstaged and
+    /// untracked files (`-m`). Unset or negative means no limit.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dirty_max_index_size: Option<i64>,
+}
+
+/// Measured on an 8-core Apple M1 Pro (6 performance cores) against a
+/// 100k-file repository with 50k changes: 6 threads answered fastest (p50
+/// 145-190 ms against 180-215 ms with 4 and 175-250 ms with 8, whose busy-
+/// machine outliers reached seconds) at 0.78 s of CPU per query against 0.85 s
+/// with 8. Small repositories answer in about 2 ms at any thread count.
+const DEFAULT_MAX_THREADS: u32 = 6;
+
+/// The minimal `config.toml` view the daemon needs. Unlike the theme schema it
+/// ignores every other table, so the daemon never depends on theme settings.
+#[derive(Deserialize)]
+struct ConfigFile {
+    #[serde(default)]
+    git: Options,
+}
+
+impl Options {
+    /// Reads `[git]` from `config.toml`; a missing file or table yields the
+    /// defaults, while an unreadable or invalid one is an explicit error.
+    pub fn load() -> io::Result<Self> {
+        let Some(root) = crate::setup::install::config_root() else {
+            return Ok(Self::default());
+        };
+        let path = root.join("ztheme/config.toml");
+        match std::fs::read_to_string(&path) {
+            Ok(source) => Self::parse(&source).map_err(|error| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("invalid [git] in {}: {error}", path.display()),
+                )
+            }),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(Self::default()),
+            Err(error) => Err(io::Error::new(
+                error.kind(),
+                format!("cannot read {}: {error}", path.display()),
+            )),
+        }
+    }
+
+    fn parse(source: &str) -> Result<Self, toml::de::Error> {
+        toml::from_str::<ConfigFile>(source).map(|config| config.git)
+    }
+
+    pub(crate) fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+
+    fn thread_count(&self) -> u32 {
+        self.threads.map_or_else(
+            || {
+                std::thread::available_parallelism()
+                    .map_or(1, |cores| u32::try_from(cores.get()).unwrap_or(u32::MAX))
+                    .min(DEFAULT_MAX_THREADS)
+            },
+            NonZeroU32::get,
+        )
+    }
+
+    /// The configurable `gitstatusd` arguments, `-t` and `-m`.
+    fn arguments(&self) -> [String; 4] {
+        [
+            "-t".to_owned(),
+            self.thread_count().to_string(),
+            "-m".to_owned(),
+            self.dirty_max_index_size.unwrap_or(-1).to_string(),
+        ]
+    }
+}
 impl Query {
     /// Pure explicit selection, before any filesystem planning. Both supported
     /// environment selections bypass automatic discovery and its ceilings.
@@ -99,7 +188,27 @@ mod tests {
     use std::io;
     use std::path::Path;
 
-    use super::Query;
+    use super::{Options, Query};
+
+    #[test]
+    fn git_options_ignore_other_tables_and_reject_invalid_values() {
+        let defaults =
+            Options::parse("version = 1\ntheme = \"x\"\n[async.lock]\ngit_segment = false\n")
+                .unwrap();
+        assert_eq!(defaults, Options::default());
+        assert_eq!(
+            defaults.arguments()[3],
+            "-1",
+            "no index-size limit by default"
+        );
+
+        let configured =
+            Options::parse("[git]\nthreads = 3\ndirty_max_index_size = 1000\n").unwrap();
+        assert_eq!(configured.arguments(), ["-t", "3", "-m", "1000"]);
+
+        assert!(Options::parse("[git]\nthreads = 0\n").is_err());
+        assert!(Options::parse("[git]\nthread = 3\n").is_err());
+    }
 
     #[test]
     fn environment_values_select_the_correct_query_kind() {

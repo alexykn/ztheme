@@ -194,17 +194,20 @@ mod tests {
             .unwrap(),
         );
         assert_eq!(theme.runtimes(), vec![Runtime::Rust]);
+        let state = Arc::new(prompt::ClientState {
+            instance: daemon::Instance::Development("blocked-planning-test".to_owned()),
+            theme,
+            executor: executor.clone(),
+            shown: prompt::ShownRepository::default(),
+        });
         let snapshot = |generation| {
-            let executor = executor.clone();
-            let theme = Arc::clone(&theme);
+            let state = Arc::clone(&state);
             async move {
                 prompt::snapshot(
                     generation,
                     std::env::temp_dir(),
-                    daemon::Instance::Development("blocked-planning-test".to_owned()),
                     Arc::new(PromptEnvironment::default()),
-                    &theme,
-                    executor,
+                    &state,
                 )
                 .await
             }

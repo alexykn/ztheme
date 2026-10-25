@@ -12,57 +12,139 @@ pub(super) struct Config {
     #[serde(skip_serializing_if = "CustomSegmentsConfig::is_empty")]
     pub(super) custom_segments: CustomSegmentsConfig,
 
-    /// `[async]` prompt-rendering behavior. Currently holds only the per-group
-    /// lock settings that decide whether the prompt waits for an asynchronous
-    /// segment group or renders immediately and redraws when it is ready.
+    /// `[async]` prompt-rendering behavior: how long the prompt waits for
+    /// each asynchronous segment group before drawing (see `AsyncSection`).
     #[serde(default)]
     #[serde(rename = "async")]
     #[serde(skip_serializing_if = "AsyncSection::is_default")]
     pub(super) async_section: AsyncSection,
+
+    /// `[git]` gitstatusd tuning. Validated here at init and reload so a typo
+    /// is reported, and preserved by `theme apply`; the daemon reads it.
+    #[serde(default)]
+    #[serde(skip_serializing_if = "crate::gitstatus::Options::is_default")]
+    pub(super) git: crate::gitstatus::Options,
 }
 
+/// The `[async]` table exactly as written. Every key is optional so that
+/// `theme apply` writes back only what the user set; `modes` resolves the
+/// defaults and the legacy `[async.lock]` booleans.
 #[derive(Clone, Default, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub(super) struct AsyncSection {
-    pub(super) lock: AsyncLock,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) git: Option<AsyncMode>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) runtime: Option<AsyncMode>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) budget_ms: Option<u64>,
+    /// Pre-mode lock booleans: `true` maps to `locked`, `false` to `async`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) lock: Option<AsyncLock>,
 }
 
 impl AsyncSection {
     pub(super) fn is_default(&self) -> bool {
-        self.lock.git_segment && !self.lock.runtime_segment
+        self.git.is_none()
+            && self.runtime.is_none()
+            && self.budget_ms.is_none()
+            && self.lock.is_none()
+    }
+
+    /// Resolves the effective per-group modes, rejecting a group configured
+    /// both through its mode key and through the legacy lock boolean.
+    pub(super) fn modes(&self) -> Result<AsyncModes, String> {
+        let lock = self.lock.clone().unwrap_or_default();
+        let budget_ms = self.budget_ms.unwrap_or(DEFAULT_BUDGET_MS);
+        if budget_ms > MAX_BUDGET_MS {
+            return Err(format!(
+                "async.budget_ms must be at most {MAX_BUDGET_MS}, got {budget_ms}"
+            ));
+        }
+        Ok(AsyncModes {
+            git: group_mode("git", self.git, lock.git_segment, "git_segment")?,
+            runtime: group_mode(
+                "runtime",
+                self.runtime,
+                lock.runtime_segment,
+                "runtime_segment",
+            )?,
+            budget_ms,
+        })
     }
 }
 
-/// Per-asynchronous-group prompt lock. A locked group holds the prompt blank
-/// until it completes (or the shared deadline expires); an unlocked group lets
-/// the prompt render immediately and redraw when its value arrives. The Git
-/// group is locked by default; the runtime group is unlocked by default,
-/// because runtime version commands (such as Swift) are often the slow part
-/// while `gitstatusd` is fast.
-#[derive(Clone, Deserialize, Serialize)]
-#[serde(default, deny_unknown_fields)]
-pub(crate) struct AsyncLock {
-    #[serde(default = "default_true")]
-    pub(crate) git_segment: bool,
-    #[serde(default = "default_false")]
-    pub(crate) runtime_segment: bool,
+fn group_mode(
+    key: &str,
+    mode: Option<AsyncMode>,
+    locked: Option<bool>,
+    lock_key: &str,
+) -> Result<AsyncMode, String> {
+    match (mode, locked) {
+        (Some(_), Some(_)) => Err(format!(
+            "async.{key} and async.lock.{lock_key} both configure the {key} group; keep only async.{key}"
+        )),
+        (Some(mode), None) => Ok(mode),
+        (None, Some(true)) => Ok(AsyncMode::Locked),
+        (None, Some(false)) => Ok(AsyncMode::Async),
+        (None, None) => Ok(AsyncMode::Auto),
+    }
 }
 
-impl Default for AsyncLock {
-    fn default() -> Self {
-        Self {
-            git_segment: true,
-            runtime_segment: false,
+/// How long the shell waits for an asynchronous group before drawing:
+/// `locked` until the group completes (bounded by the request deadline),
+/// `auto` up to `budget_ms`, `async` not at all. Whatever arrives later is
+/// drawn by a redraw; until then the last known value stays visible.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum AsyncMode {
+    Locked,
+    Async,
+    Auto,
+}
+
+impl AsyncMode {
+    pub(crate) const fn name(self) -> &'static str {
+        match self {
+            Self::Locked => "locked",
+            Self::Async => "async",
+            Self::Auto => "auto",
         }
     }
 }
 
-fn default_true() -> bool {
-    true
+/// The resolved `[async]` behavior baked into the shell integration.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct AsyncModes {
+    pub(crate) git: AsyncMode,
+    pub(crate) runtime: AsyncMode,
+    pub(crate) budget_ms: u64,
 }
 
-fn default_false() -> bool {
-    false
+impl Default for AsyncModes {
+    fn default() -> Self {
+        AsyncSection::default()
+            .modes()
+            .expect("the default async section is valid")
+    }
+}
+
+/// A warm Git query in a small repository and a cache-hit runtime both answer
+/// in well under 10 ms; 100 ms covers them with margin under load while
+/// staying below the delay a user notices before the prompt.
+const DEFAULT_BUDGET_MS: u64 = 100;
+/// The shell stops waiting at the client's 550 ms `done` anyway; a larger
+/// budget would only lengthen the wait on a client that stopped answering.
+const MAX_BUDGET_MS: u64 = 1000;
+
+/// Legacy `[async.lock]` table, kept for existing configurations.
+#[derive(Clone, Default, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub(super) struct AsyncLock {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) git_segment: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) runtime_segment: Option<bool>,
 }
 
 #[derive(Clone, Default, Deserialize, Serialize)]

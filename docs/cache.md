@@ -34,10 +34,13 @@ For each prompt, the client:
 9. materializes presentation labels from the current request and emits each
    completed runtime immediately, without waiting for slow siblings.
 
-The first value rendered for each runtime comes from the current request.
-ztheme does not render a stale snapshot and replace it later. The shell's
-runtime group lock controls whether these independent events are buffered or
-redrawn incrementally; by default runtimes are unlocked.
+The first value rendered for each runtime in a new context comes from the
+current request: the shell drops runtime values when the prompt context
+changes. Within one context the shell keeps the last value until a newer one
+arrives, and a runtime whose command failed transiently sends no value, so a
+single failure does not erase the segment. The shell's runtime group mode
+decides how long the first draw waits for these independent events (`auto`, up
+to the budget, by default); later ones redraw incrementally.
 
 One volatile runtime does not disable caching for unrelated cacheable runtimes
 in the same prompt.

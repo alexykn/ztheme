@@ -9,10 +9,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::{Mutex, MutexGuard, Notify, Semaphore};
+use tokio::sync::{Notify, Semaphore};
 use tokio::task::JoinSet;
-use tokio::time::timeout;
+use tokio::time::{Instant, timeout};
 
+mod git;
 mod protocol;
 
 use crate::cache::{Acquire, CacheKey, RuntimeCache};
@@ -20,7 +21,6 @@ use crate::gitstatus;
 use crate::utils::HashBuilder;
 
 const IDLE_TIMEOUT: Duration = Duration::from_hours(1);
-const GITSTATUS_TIMEOUT: Duration = Duration::from_secs(30);
 const CONNECTION_LIMIT: usize = 64;
 const FRAME_TIMEOUT: Duration = Duration::from_millis(500);
 const RESPONSE_TIMEOUT: Duration = Duration::from_millis(500);
@@ -146,17 +146,57 @@ pub(crate) async fn runtime_cache_remove(instance: &Instance, key: CacheKey) -> 
     Ok(())
 }
 
+/// The first frame of a Git status exchange.
+pub(crate) enum GitStatus {
+    /// The daemon had no cached result: this is the fresh result.
+    Fresh(Option<gitstatus::Snapshot>),
+    /// The daemon's last successful result for this query, sent before the
+    /// covering query finishes. `PendingGit::fresh` awaits that result.
+    Stale {
+        cached: Option<gitstatus::Snapshot>,
+        pending: PendingGit,
+    },
+}
+
+/// The open connection of a Git status exchange that has delivered its stale
+/// frame. Dropping it withdraws the request; the daemon still completes a
+/// started query and caches its result.
+pub(crate) struct PendingGit {
+    stream: UnixStream,
+}
+
+impl PendingGit {
+    /// Awaits the fresh result: one from a query that started after the
+    /// daemon received the request. Fails with `TimedOut` at `deadline`.
+    pub(crate) async fn fresh(
+        mut self,
+        deadline: Instant,
+    ) -> io::Result<Option<gitstatus::Snapshot>> {
+        protocol::git_fresh(&mut self.stream, deadline).await
+    }
+}
+
+/// Requests Git status for `query`, returning once its first frame arrives
+/// or failing with `TimedOut` at `deadline`. The fresh result reflects the
+/// repository no earlier than this request; a cached result, when the daemon
+/// has one, comes first so a caller can render it while the query runs.
 pub(crate) async fn git_status(
     instance: &Instance,
     query: &gitstatus::Query,
-) -> io::Result<Option<gitstatus::Snapshot>> {
-    let Response::GitStatus(value) = request(instance, Operation::GitStatus(query)).await? else {
+    deadline: Instant,
+) -> io::Result<GitStatus> {
+    let Response::GitStatus(value) =
+        request(instance, Operation::GitStatus(query, deadline)).await?
+    else {
         unreachable!("Git status returned a different response")
     };
     Ok(value)
 }
 
 pub(crate) async fn reset(instance: &Instance) -> io::Result<()> {
+    // The daemon rereads `[git]` to restart gitstatusd; report an invalid
+    // table here rather than as a dropped connection after a partial reset.
+    gitstatus::Options::load()?;
     let socket = instance.socket_path();
     match protocol::reset(&socket).await {
         Ok(()) => return Ok(()),
@@ -193,13 +233,13 @@ enum Operation<'a> {
     RuntimeCachePutOwned(CacheKey, u64, &'a [u8]),
     RuntimeCacheRelease(CacheKey, u64),
     RuntimeCacheRemove(CacheKey),
-    GitStatus(&'a gitstatus::Query),
+    GitStatus(&'a gitstatus::Query, Instant),
 }
 
 enum Response {
     CacheAcquire(Acquire),
     CacheMutation(bool),
-    GitStatus(Option<gitstatus::Snapshot>),
+    GitStatus(GitStatus),
     Complete,
 }
 
@@ -287,9 +327,17 @@ async fn perform(socket: &Path, operation: Operation<'_>) -> protocol::Result<Re
         Operation::RuntimeCacheRemove(key) => protocol::runtime_cache_remove(socket, key)
             .await
             .map(|()| Response::Complete),
-        Operation::GitStatus(query) => protocol::git_status(socket, query)
+        Operation::GitStatus(query, deadline) => protocol::git_status(socket, query, deadline)
             .await
-            .map(Response::GitStatus),
+            .map(|reply| {
+                Response::GitStatus(match reply {
+                    protocol::GitReply::Fresh(value) => GitStatus::Fresh(value),
+                    protocol::GitReply::Stale(cached, stream) => GitStatus::Stale {
+                        cached,
+                        pending: PendingGit { stream },
+                    },
+                })
+            }),
     }
 }
 
@@ -332,7 +380,7 @@ fn replacement_transition(error: &io::Error) -> bool {
 struct Shared {
     cache: Arc<RuntimeCache>,
     shutdown: Notify,
-    gitstatus: Mutex<Option<gitstatus::Client>>,
+    git: git::GitService,
 }
 
 struct LockGuard {
@@ -356,10 +404,11 @@ async fn serve_socket(socket: PathBuf, cache: RuntimeCache) -> io::Result<()> {
     };
 
     let cache = Arc::new(cache);
+    let (git, git_task) = git::GitService::spawn();
     let shared = Arc::new(Shared {
         cache: Arc::clone(&cache),
         shutdown: Notify::new(),
-        gitstatus: Mutex::new(None),
+        git,
     });
 
     // Load before accepting requests so a client cannot observe a cold cache
@@ -386,6 +435,8 @@ async fn serve_socket(socket: PathBuf, cache: RuntimeCache) -> io::Result<()> {
     flush_task.abort();
     clients.abort_all();
     while clients.join_next().await.is_some() {}
+    // Dropping the Git owner drops gitstatusd, even mid-query.
+    git_task.abort();
     shared.cache.flush_latest().await.map(|_| ())
 }
 
@@ -412,27 +463,21 @@ async fn handle_client(mut stream: UnixStream, shared: Arc<Shared>) -> io::Resul
     let request = timeout(FRAME_TIMEOUT, protocol::read_request(&mut stream))
         .await
         .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "daemon request frame timed out"))??;
-    // Cache acquire keeps its 400 ms waiter budget; Git owns its separate
-    // 30 second protocol deadline. Neither is part of the framing deadline.
-    let response = dispatch(request, &shared, &stream).await?;
+    if let protocol::Request::GitStatus(query) = request {
+        return serve_git(&mut stream, &shared.git, query, Instant::now()).await;
+    }
+    // Cache acquire keeps its 400 ms waiter budget outside the framing
+    // deadline; Git status has its own multi-frame exchange above.
+    let response = dispatch(request, &shared).await?;
     let shutdown = matches!(response, protocol::Response::DaemonOutdated);
-    timeout(
-        RESPONSE_TIMEOUT,
-        protocol::write_response(&mut stream, response),
-    )
-    .await
-    .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "daemon response timed out"))??;
+    bounded_write(protocol::write_response(&mut stream, response)).await?;
     if shutdown {
         shared.shutdown.notify_one();
     }
     Ok(())
 }
 
-async fn dispatch(
-    request: protocol::Request,
-    shared: &Shared,
-    stream: &UnixStream,
-) -> io::Result<protocol::Response> {
+async fn dispatch(request: protocol::Request, shared: &Shared) -> io::Result<protocol::Response> {
     use protocol::{Request, Response};
 
     let response = match request {
@@ -453,54 +498,46 @@ async fn dispatch(
             reset_state(shared).await?;
             Response::Complete
         }
-        Request::GitStatus(query) => Response::GitStatus(git_query(shared, &query, stream).await),
+        Request::GitStatus(_) => unreachable!("Git status is served by serve_git"),
     };
     Ok(response)
 }
 
+/// Resets Git first: it fails without changing anything when `[git]` is
+/// invalid, so a failed reset leaves both caches intact.
 async fn reset_state(shared: &Shared) -> io::Result<()> {
-    shared.cache.clear().await?;
-    // Reset an already started capability, but never start an unused one.
-    let mut client = shared.gitstatus.lock().await;
-    if let Some(client) = client.as_mut() {
-        client.restart()?;
+    shared.git.reset().await?;
+    shared.cache.clear().await
+}
+
+/// Serves one Git status request that arrived at `arrived`: a stale frame
+/// with the cached result when one exists, then the fresh frame from a query
+/// that started no earlier than the request. A disconnected peer withdraws
+/// only its own waiter; a write-half-closed peer still receives its frames.
+async fn serve_git(
+    stream: &mut UnixStream,
+    git: &git::GitService,
+    query: gitstatus::Query,
+    arrived: Instant,
+) -> io::Result<()> {
+    let admission = git.status(query, arrived).await?;
+    if let Some(git::Cached(cached)) = admission.stale {
+        bounded_write(protocol::write_git_stale(stream, cached.as_ref())).await?;
     }
-    Ok(())
-}
-
-/// Runs one Git query against the lazily started `gitstatusd` client. The
-/// client is created on the first real Git request, so a daemon that only
-/// serves runtime-cache operations never requires the managed binary. Startup
-/// and restart failures surface as explicit Git errors without taking down
-/// the daemon.
-async fn git_query(
-    shared: &Shared,
-    query: &gitstatus::Query,
-    stream: &UnixStream,
-) -> io::Result<Option<gitstatus::Snapshot>> {
-    let mut client = acquire_git_owner(shared, stream).await?;
-    let client = match *client {
-        Some(ref mut client) => client,
-        None => client.insert(gitstatus::Client::start()?),
-    };
-    // After taking ownership, finish/drain the query even if the peer leaves.
-    // Cancelling here would abandon a reply on the shared gitstatusd pipe.
-    run_git_query(client, query).await
-}
-
-async fn acquire_git_owner<'a>(
-    shared: &'a Shared,
-    stream: &UnixStream,
-) -> io::Result<MutexGuard<'a, Option<gitstatus::Client>>> {
-    let client = tokio::select! {
+    let result = tokio::select! {
         biased;
         error = disconnected(stream) => return Err(error),
-        client = shared.gitstatus.lock() => client,
+        result = admission.fresh => result.map_err(|_| io::Error::other("Git service stopped"))?,
     };
-    // Close the race between the disconnect watcher and an available mutex.
-    // No gitstatusd request has started, so releasing this guard is safe.
-    probe_response_peer(stream).await?;
-    Ok(client)
+    bounded_write(protocol::write_git_result(stream, &result)).await
+}
+
+/// Bounds one response write, so a peer that stops reading cannot hold its
+/// connection's admission permit.
+async fn bounded_write(write: impl Future<Output = io::Result<()>>) -> io::Result<()> {
+    timeout(RESPONSE_TIMEOUT, write)
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "daemon response timed out"))?
 }
 
 /// A connection has exactly one request. Extra input is invalid. Read EOF
@@ -541,24 +578,6 @@ async fn probe_response_peer(stream: &UnixStream) -> io::Result<()> {
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
             Err(error) => return Err(error),
         }
-    }
-}
-
-async fn run_git_query(
-    client: &mut gitstatus::Client,
-    query: &gitstatus::Query,
-) -> io::Result<Option<gitstatus::Snapshot>> {
-    if let Ok(result) = timeout(GITSTATUS_TIMEOUT, client.query(query)).await {
-        return result;
-    }
-    match client.restart() {
-        Ok(()) => Err(io::Error::new(
-            io::ErrorKind::TimedOut,
-            "gitstatusd query exceeded 30 seconds",
-        )),
-        Err(error) => Err(io::Error::other(format!(
-            "gitstatusd query timed out and restart failed: {error}"
-        ))),
     }
 }
 
@@ -686,7 +705,7 @@ mod tests {
         std::sync::Arc::new(super::Shared {
             cache: std::sync::Arc::new(crate::cache::RuntimeCache::new_with_path(None)),
             shutdown: tokio::sync::Notify::new(),
-            gitstatus: tokio::sync::Mutex::new(None),
+            git: super::git::GitService::spawn().0,
         })
     }
 
@@ -699,7 +718,7 @@ mod tests {
         let mut cases = JoinSet::new();
         let state = shared();
         let key = crate::cache::CacheKey::from_value(42);
-        let mut put = b"ZT\x00\x02\x02".to_vec();
+        let mut put = b"ZT\x00\x03\x02".to_vec();
         put.extend_from_slice(&key.bytes());
         put.extend_from_slice(&0_u64.to_be_bytes());
         put.extend_from_slice(&10_u32.to_be_bytes());
@@ -707,9 +726,9 @@ mod tests {
         for frame in [
             Vec::new(),
             b"Z".to_vec(),
-            b"ZT\x00\x02\x01x".to_vec(),
+            b"ZT\x00\x03\x01x".to_vec(),
             put,
-            b"ZT\x00\x02\x05\x00\x00\x00\x00\x04x".to_vec(),
+            b"ZT\x00\x03\x05\x00\x00\x00\x00\x04x".to_vec(),
         ] {
             let state = std::sync::Arc::clone(&state);
             cases.spawn(async move {
@@ -776,7 +795,7 @@ mod tests {
         }
 
         let (mut client, server) = UnixStream::pair().unwrap();
-        client.write_all(b"ZT\x00\x02\x06").await.unwrap();
+        client.write_all(b"ZT\x00\x03\x06").await.unwrap();
         client
             .write_all(&crate::cache::CacheKey::from_value(42).bytes())
             .await
@@ -813,75 +832,11 @@ mod tests {
             )
         };
         assert_eq!(result, 0);
-        client.write_all(b"ZT\x00\x02\x01").await.unwrap();
+        client.write_all(b"ZT\x00\x03\x01").await.unwrap();
         client.write_all(&key.bytes()).await.unwrap();
         let error = super::handle_client(server, state).await.unwrap_err();
         assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
         assert_eq!(error.to_string(), "daemon response timed out");
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn disconnected_queued_git_never_acquires_or_starts_the_process() {
-        use std::sync::Arc;
-        use tokio::net::UnixStream;
-
-        for half_close_first in [false, true] {
-            let state = shared();
-            let owner = state.gitstatus.lock().await;
-            let (client, server) = UnixStream::pair().unwrap();
-            let queued_state = Arc::clone(&state);
-            let queued = tokio::spawn(async move {
-                super::git_query(
-                    &queued_state,
-                    &crate::gitstatus::Query::Directory("/repo".into()),
-                    &server,
-                )
-                .await
-            });
-            if half_close_first {
-                use tokio::io::AsyncWriteExt as _;
-                let mut client = client;
-                client.shutdown().await.unwrap();
-                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-                assert!(
-                    !queued.is_finished(),
-                    "write-half-close still awaits a response"
-                );
-                drop(client);
-            } else {
-                drop(client);
-            }
-            let result = tokio::time::timeout(std::time::Duration::from_millis(200), queued)
-                .await
-                .unwrap()
-                .unwrap();
-            assert!(result.is_err());
-            assert!(owner.is_none(), "obsolete Git work started gitstatusd");
-            drop(owner);
-            assert!(state.gitstatus.lock().await.is_none());
-        }
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn write_half_closed_git_client_can_acquire_the_owner() {
-        use std::sync::Arc;
-        use tokio::io::AsyncWriteExt as _;
-        use tokio::net::UnixStream;
-
-        let state = shared();
-        let owner = state.gitstatus.lock().await;
-        let (mut client, server) = UnixStream::pair().unwrap();
-        client.shutdown().await.unwrap();
-        let queued_state = Arc::clone(&state);
-        let queued = tokio::spawn(async move {
-            super::acquire_git_owner(&queued_state, &server)
-                .await
-                .is_ok()
-        });
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        assert!(!queued.is_finished());
-        drop(owner);
-        assert!(queued.await.unwrap());
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -891,7 +846,7 @@ mod tests {
 
         use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
         use tokio::net::UnixStream;
-        use tokio::sync::{Mutex, Notify};
+        use tokio::sync::Notify;
 
         use super::{Shared, handle_client};
         use crate::cache::{Acquire, CacheKey, RuntimeCache};
@@ -906,10 +861,10 @@ mod tests {
         let shared = Arc::new(Shared {
             cache,
             shutdown: Notify::new(),
-            gitstatus: Mutex::new(None),
+            git: super::git::GitService::spawn().0,
         });
         let (mut client, server) = UnixStream::pair().unwrap();
-        client.write_all(b"ZT\x00\x02\x01").await.unwrap();
+        client.write_all(b"ZT\x00\x03\x01").await.unwrap();
         client
             .write_all(&CacheKey::from_value(500).bytes())
             .await

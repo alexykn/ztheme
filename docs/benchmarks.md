@@ -43,6 +43,22 @@ Environment variables: `BENCHMARK_MEASURED_PROMPTS` (default 1000 per run,
 5 runs), `BENCHMARK_WARMUP_PROMPTS` (100), `BENCHMARK_REALISTIC_PROMPTS`
 (5000), `BENCHMARK_SKIP_REALISTIC`, `BENCHMARK_SKIP_LATENCY`.
 
+Concurrent prompting against one repository is measured by
+`tools/probe-prompt.zsh`, which drives real `ztheme __client-daemon`
+processes like prompting shells, against a private server daemon using the
+caller's config and managed gitstatusd:
+
+```console
+tools/probe-prompt.zsh -q -n 4 -r 6 /path/to/large-repo
+```
+
+`-n` sets the shells prompting in parallel and `-r` the prompts per directory
+and shell; `-b BINARY` probes another build (for example a baseline) instead
+of building this tree, `-c` keeps the first cold prompt in the measurement,
+and without `-q` every record is printed with its latency. The summary line
+counts prompts, Git `complete` records, Git errors and timeouts, and Git
+completion latency.
+
 The synchronous-path numbers were measured by eval'ing the generated
 integration into a fresh `zsh -dfc` and timing 5000 dispatcher+render cycles
 (`_ztheme_compute_sync_segments 0; _ztheme_render_layout`), reporting the
@@ -96,6 +112,44 @@ adds roughly 1.2 ms of untracked scanning, and a 20,000-file repository
 reaches ~18 ms p50 — two orders of magnitude above every other warm case.
 That cost lives entirely inside `gitstatusd`'s worktree scan; the ztheme
 pipeline around it stays in the low hundreds of microseconds.
+
+### Concurrent prompts in a large dirty repository
+
+A 100,000-file repository with 50,000 changes, on the same M1 Pro (8 cores,
+6 of them performance cores) while unrelated work kept the load average
+between 4 and 13. One warm `gitstatusd` query there costs roughly 150–220 ms
+of wall time, so serializing one query per prompt cannot keep several shells
+under the 500 ms Git deadline.
+
+`gitstatusd` thread count, warm, 40 queries per setting, two interleaved
+rounds; CPU is per query:
+
+| `-t` | p50 (ms) | max (ms) | CPU (s) |
+| ---: | ---: | ---: | ---: |
+| 2 | 314–327 | 515–583 | 0.46 |
+| 4 | 206–222 | 305–354 | 0.63 |
+| 6 | 154–168 | 223–244 | 0.78 |
+| 8 | 173–182 | 225–239 | 0.97 |
+
+Earlier rounds at load averages of 11–13 showed the same order, with 8
+threads also reaching 0.4–1.8 s outliers. Six threads is therefore the
+default cap (`[git] threads`); a small repository answers in about 2 ms at
+any setting.
+
+`tools/probe-prompt.zsh -q -n 4 -r 6`: four shells prompting back to back,
+24 prompts per run, warm daemon, three interleaved runs each:
+
+| Build | Git timeouts | Git p50 (ms) | Git max (ms) |
+| --- | ---: | ---: | ---: |
+| v1.8.0 (one query per prompt, serialized) | 18–22 of 24 | 502–503 | 506–511 |
+| shared follow-up queries | 0 of 24 | 313–342 | 399–454 |
+
+Back-to-back prompting is the worst case for the follow-up rule: every request
+arrives just after a query started, so it waits for that query plus its own
+follow-up, about two query times. At load averages above 10 that can still
+reach the deadline: those runs had up to 8 of 24 timeouts, and one run during
+a load spike 21 of 24 (the v1.8.0 baseline had 19–22 throughout). The same
+probe in this repository's small working tree completes Git in 6 ms p50.
 
 ### Cold miss
 
@@ -183,9 +237,10 @@ function dispatch and layout rendering.
 
 ## Coverage
 
-Measured: warm and cold prompt latency, git status in the loop, cache hit rate
-and stale-result behavior, singleflight concurrency, persistence across daemon
-restart, and the synchronous segment path.
+Measured: warm and cold prompt latency, git status in the loop, concurrent
+prompts in a large repository, cache hit rate and stale-result behavior,
+singleflight concurrency, persistence across daemon restart, and the
+synchronous segment path.
 
 Not measured here: full shell startup/init time and memory usage. These are
 candidates for future additions to `tools/benchmark-runtime-cache.zsh`.

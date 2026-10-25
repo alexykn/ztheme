@@ -15,7 +15,7 @@ pub(crate) const REQUEST_VERSION: &str = "3";
 
 use crate::environment::REQUEST_FIELDS;
 
-/// The context key clears stale fragments and diagnostics when request inputs
+/// The context key clears runtime fragments and diagnostics when request inputs
 /// change; it does not gate request submission (every precmd starts work).
 /// PATH is appended separately at the end of the key. HOME and Git ceilings
 /// participate because they affect runtime selection and repository discovery.
@@ -80,14 +80,19 @@ pub fn write_error(
     write_fields(output, generation, &["error", segment, &message])
 }
 
+/// Withdraws a segment's value. Unlike every other record, the shell applies
+/// it whatever its generation, so the client can rely on it having arrived.
+pub fn write_clear(output: &mut impl Write, generation: u64, segment: &str) -> io::Result<()> {
+    write_fields(output, generation, &["clear", segment])
+}
+
 pub fn write_done(output: &mut impl Write, generation: u64) -> io::Result<()> {
     write_fields(output, generation, &["done"])
 }
 
 /// Records that one asynchronous group (git or runtime) has finished producing
-/// its segment records. The shell uses these to release the rendering barrier
-/// for locked groups, so the prompt can appear as soon as every *locked* group
-/// is complete instead of waiting for the final `done`.
+/// its segment records. The shell stops waiting for a group once it has its
+/// `complete`, so the prompt can draw before `done`; Git's may follow `done`.
 pub fn write_complete(output: &mut impl Write, generation: u64, group: &str) -> io::Result<()> {
     write_fields(output, generation, &["complete", group])
 }

@@ -5,7 +5,9 @@ use std::process::Stdio;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 
-use super::{CONFLICTED, DELETED, Query, STAGED, Snapshot, UNSTAGED, UNTRACKED, managed_binary};
+use super::{
+    CONFLICTED, DELETED, Options, Query, STAGED, Snapshot, UNSTAGED, UNTRACKED, managed_binary,
+};
 
 const FIELD_SEPARATOR: u8 = 31;
 const MESSAGE_SEPARATOR: u8 = 30;
@@ -14,6 +16,7 @@ const MAX_RESPONSE_BYTES: usize = 64 * 1024;
 
 pub struct Client {
     process: Option<Process>,
+    options: Options,
     next_request_id: u64,
 }
 
@@ -24,9 +27,12 @@ struct Process {
 }
 
 impl Client {
+    /// Starts `gitstatusd` with the `[git]` options read from `config.toml`.
     pub fn start() -> io::Result<Self> {
+        let options = Options::load()?;
         Ok(Self {
-            process: Some(Process::start()?),
+            process: Some(Process::start(&options)?),
+            options,
             next_request_id: 0,
         })
     }
@@ -39,7 +45,7 @@ impl Client {
             Ok(snapshot) => Ok(snapshot),
             Err(first_error) => {
                 self.process = None;
-                self.process = Some(Process::start().map_err(|restart_error| {
+                self.process = Some(Process::start(&self.options).map_err(|restart_error| {
                     io::Error::other(format!(
                         "gitstatusd failed ({first_error}) and could not restart: {restart_error}"
                     ))
@@ -51,8 +57,16 @@ impl Client {
         }
     }
 
+    /// Replaces `gitstatusd`, rereading `[git]` so edited options apply.
     pub fn restart(&mut self) -> io::Result<()> {
-        self.process = Some(Process::start()?);
+        self.restart_with(Options::load()?)
+    }
+
+    /// Replaces `gitstatusd` with already read options (`ztheme clear`
+    /// validates them before it changes anything).
+    pub fn restart_with(&mut self, options: Options) -> io::Result<()> {
+        self.process = Some(Process::start(&options)?);
+        self.options = options;
         Ok(())
     }
 
@@ -68,8 +82,7 @@ impl Client {
 }
 
 impl Process {
-    fn start() -> io::Result<Self> {
-        let thread_count = std::thread::available_parallelism().map_or(1, usize::from);
+    fn start(options: &Options) -> io::Result<Self> {
         let mut command = Command::new(managed_binary());
         command
             .arg("-G")
@@ -88,8 +101,7 @@ impl Process {
             .arg("1")
             .arg("-z")
             .arg("0")
-            .arg("-t")
-            .arg(thread_count.to_string())
+            .args(options.arguments())
             .arg("-p")
             .arg(std::process::id().to_string())
             .stdin(Stdio::piped())

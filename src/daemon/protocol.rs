@@ -6,12 +6,12 @@ use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
-use tokio::time::timeout;
+use tokio::time::{Instant, timeout, timeout_at};
 
 use crate::cache::{Acquire, CacheKey, MAX_VALUE_BYTES, validate_value};
 use crate::gitstatus::{Query, Snapshot};
 
-pub(super) const VERSION: u16 = 2;
+pub(super) const VERSION: u16 = 3;
 pub(super) const RUNTIME_CACHE_ACQUIRE: u8 = 1;
 pub(super) const RUNTIME_CACHE_PUT_OWNED: u8 = 2;
 pub(super) const RUNTIME_CACHE_RELEASE: u8 = 3;
@@ -28,7 +28,6 @@ const DAEMON_OUTDATED: u8 = 0xfe;
 const CLIENT_OUTDATED: u8 = 0xff;
 const EXCHANGE_TIMEOUT: Duration = Duration::from_millis(25);
 const CACHE_ACQUIRE_TIMEOUT: Duration = Duration::from_millis(500);
-const GIT_TIMEOUT: Duration = Duration::from_millis(500);
 const MAX_PATH_BYTES: usize = 16 * 1024;
 const MAX_GIT_TEXT_BYTES: usize = 16 * 1024;
 const MAX_ERROR_BYTES: usize = 1024;
@@ -36,6 +35,7 @@ const MAX_ERROR_BYTES: usize = 1024;
 const GIT_NONE: u8 = 0;
 const GIT_SNAPSHOT: u8 = 1;
 const GIT_ERROR: u8 = 2;
+const GIT_STALE: u8 = 3;
 const QUERY_DIRECTORY: u8 = 0;
 const QUERY_GIT_DIR: u8 = 1;
 
@@ -71,7 +71,6 @@ pub(super) enum Response {
     CacheAcquire(Acquire),
     Mutation(bool),
     Complete,
-    GitStatus(io::Result<Option<Snapshot>>),
 }
 
 pub(super) type Result<T> = std::result::Result<T, Error>;
@@ -156,21 +155,51 @@ pub(super) async fn reset(socket: &Path) -> Result<()> {
     .await
 }
 
-pub(super) async fn git_status(socket: &Path, query: &Query) -> Result<Option<Snapshot>> {
-    exchange_with_timeout(socket, GIT_TIMEOUT, async |stream| {
-        write_request(stream, GIT_STATUS).await?;
-        write_query(stream, query).await?;
-        match read_response(stream).await? {
-            GIT_NONE => Ok(None),
-            GIT_SNAPSHOT => Ok(Some(read_snapshot(stream).await?)),
-            GIT_ERROR => {
-                let message = read_text(stream, MAX_ERROR_BYTES, "Git error").await?;
-                Err(io::Error::other(message).into())
-            }
-            _ => Err(invalid_data("invalid Git response").into()),
+/// The first Git status frame. A stale frame carries the daemon's cached
+/// result and keeps the connection open for the fresh frame (`git_fresh`).
+pub(super) enum GitReply {
+    Fresh(Option<Snapshot>),
+    Stale(Option<Snapshot>, UnixStream),
+}
+
+/// Sends a Git status request and reads its first frame by `deadline`.
+pub(super) async fn git_status(
+    socket: &Path,
+    query: &Query,
+    deadline: Instant,
+) -> Result<GitReply> {
+    let exchange = async {
+        let mut stream = UnixStream::connect(socket).await?;
+        write_request(&mut stream, GIT_STATUS).await?;
+        write_query(&mut stream, query).await?;
+        match read_response(&mut stream).await? {
+            GIT_STALE => match stream.read_u8().await? {
+                GIT_ERROR => Err(invalid_data("stale Git frame carries an error").into()),
+                tag => {
+                    let cached = read_git_result(&mut stream, tag).await?;
+                    Ok(GitReply::Stale(cached, stream))
+                }
+            },
+            tag => Ok(GitReply::Fresh(read_git_result(&mut stream, tag).await?)),
         }
-    })
-    .await
+    };
+    timeout_at(deadline, exchange)
+        .await
+        .map_err(|_| Error::Io(timed_out()))?
+}
+
+/// Reads the fresh frame that follows a stale one by `deadline`.
+pub(super) async fn git_fresh(
+    stream: &mut UnixStream,
+    deadline: Instant,
+) -> io::Result<Option<Snapshot>> {
+    let exchange = async {
+        let tag = stream.read_u8().await?;
+        read_git_result(stream, tag).await
+    };
+    timeout_at(deadline, exchange)
+        .await
+        .map_err(|_| timed_out())?
 }
 
 pub(super) async fn read_header(stream: &mut UnixStream) -> io::Result<RequestHeader> {
@@ -221,7 +250,6 @@ pub(super) async fn write_response(stream: &mut UnixStream, response: Response) 
         Response::CacheAcquire(Acquire::Owner(token)) => write_cache_owner(stream, token).await,
         Response::Mutation(true) | Response::Complete => write_ok(stream).await,
         Response::Mutation(false) => write_rejected(stream).await,
-        Response::GitStatus(result) => write_git_result(stream, result).await,
     }
 }
 
@@ -281,20 +309,47 @@ pub(super) async fn write_client_outdated(stream: &mut UnixStream) -> io::Result
     stream.write_u8(CLIENT_OUTDATED).await
 }
 
+/// Writes the optional stale frame: the cached result of an earlier query.
+pub(super) async fn write_git_stale(
+    stream: &mut UnixStream,
+    cached: Option<&Snapshot>,
+) -> io::Result<()> {
+    stream.write_u8(GIT_STALE).await?;
+    write_git_value(stream, cached).await
+}
+
+/// Writes the fresh frame, the final frame of a Git status response.
 pub(super) async fn write_git_result(
     stream: &mut UnixStream,
-    result: io::Result<Option<Snapshot>>,
+    result: &std::result::Result<Option<Snapshot>, String>,
 ) -> io::Result<()> {
     match result {
-        Ok(None) => stream.write_u8(GIT_NONE).await,
-        Ok(Some(snapshot)) => {
-            stream.write_u8(GIT_SNAPSHOT).await?;
-            write_snapshot(stream, &snapshot).await
-        }
-        Err(error) => {
+        Ok(value) => write_git_value(stream, value.as_ref()).await,
+        Err(message) => {
             stream.write_u8(GIT_ERROR).await?;
-            write_text(stream, &error.to_string(), MAX_ERROR_BYTES).await
+            write_text(stream, message, MAX_ERROR_BYTES).await
         }
+    }
+}
+
+async fn write_git_value(stream: &mut UnixStream, value: Option<&Snapshot>) -> io::Result<()> {
+    match value {
+        None => stream.write_u8(GIT_NONE).await,
+        Some(snapshot) => {
+            stream.write_u8(GIT_SNAPSHOT).await?;
+            write_snapshot(stream, snapshot).await
+        }
+    }
+}
+
+async fn read_git_result(stream: &mut UnixStream, tag: u8) -> io::Result<Option<Snapshot>> {
+    match tag {
+        GIT_NONE => Ok(None),
+        GIT_SNAPSHOT => Ok(Some(read_snapshot(stream).await?)),
+        GIT_ERROR => Err(io::Error::other(
+            read_text(stream, MAX_ERROR_BYTES, "Git error").await?,
+        )),
+        _ => Err(invalid_data("invalid Git response")),
     }
 }
 
@@ -314,12 +369,11 @@ where
         operation(&mut stream).await
     })
     .await
-    .map_err(|_| {
-        Error::Io(io::Error::new(
-            io::ErrorKind::TimedOut,
-            "daemon exchange timed out",
-        ))
-    })?
+    .map_err(|_| Error::Io(timed_out()))?
+}
+
+fn timed_out() -> io::Error {
+    io::Error::new(io::ErrorKind::TimedOut, "daemon exchange timed out")
 }
 
 async fn write_request(stream: &mut UnixStream, operation: u8) -> io::Result<()> {
@@ -447,7 +501,6 @@ fn invalid_data(message: &'static str) -> io::Error {
 #[cfg(test)]
 mod tests {
     use std::ffi::OsString;
-    use std::io;
     use std::os::unix::ffi::OsStringExt as _;
     use std::path::PathBuf;
 
@@ -531,18 +584,18 @@ mod tests {
         assert_eq!(decoded.changes, 0b1_1111);
 
         let (mut writer, mut reader) = UnixStream::pair().unwrap();
-        write_git_result(&mut writer, Ok(None)).await.unwrap();
+        write_git_result(&mut writer, &Ok(None)).await.unwrap();
         assert_eq!(read_response(&mut reader).await.unwrap(), GIT_NONE);
 
         let (mut writer, mut reader) = UnixStream::pair().unwrap();
-        write_git_result(&mut writer, Ok(Some(snapshot)))
+        write_git_result(&mut writer, &Ok(Some(snapshot)))
             .await
             .unwrap();
         assert_eq!(read_response(&mut reader).await.unwrap(), GIT_SNAPSHOT);
         assert_eq!(read_snapshot(&mut reader).await.unwrap().branch, "main");
 
         let (mut writer, mut reader) = UnixStream::pair().unwrap();
-        write_git_result(&mut writer, Err(io::Error::other("broken")))
+        write_git_result(&mut writer, &Err("broken".to_owned()))
             .await
             .unwrap();
         assert_eq!(reader.read_u8().await.unwrap(), GIT_ERROR);

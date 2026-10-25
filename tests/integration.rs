@@ -376,7 +376,7 @@ fn shutdown_outdated_daemon(socket: &Path) {
         );
     });
     stream.write_all(b"ZT").unwrap();
-    stream.write_all(&3_u16.to_be_bytes()).unwrap();
+    stream.write_all(&4_u16.to_be_bytes()).unwrap();
     let mut response = [0];
     stream.read_exact(&mut response).unwrap();
     assert_eq!(response[0], 0xfe);
@@ -960,23 +960,33 @@ spacing = { before = 16, after = 16 }
 }
 
 #[test]
-fn theme_apply_preserves_the_custom_segment_allowlist() {
+fn theme_apply_preserves_the_custom_segment_allowlist_and_async_modes() {
     let sandbox = Sandbox::new();
     sandbox.install_fake_gitstatus();
     sandbox.write_theme("timetheme", &time_theme(""));
     sandbox.write_theme("minimal", &minimal_theme(""));
     install_time_segment(&sandbox, &["time"], "'x'");
+    let config_path = sandbox.config.join("ztheme/config.toml");
+    let mut config = fs::read_to_string(&config_path).unwrap();
+    config.push_str("[async]\ngit = \"locked\"\nbudget_ms = 40\n");
+    fs::write(&config_path, config).unwrap();
 
     let script = r#"
 eval "$("$ZTHEME_TEST_BIN" init zsh --theme timetheme)" || exit 10
 ztheme theme apply minimal >/dev/null || exit 11
+[[ $__ZTHEME_MODE_GIT == locked && $__ZTHEME_MODE_RUNTIME == auto ]] || exit 12
+(( __ZTHEME_ASYNC_BUDGET_MS == 40 )) || exit 13
 "#;
     let output = sandbox.zsh(script);
     assert_success(&output);
 
-    let config = fs::read_to_string(sandbox.config.join("ztheme/config.toml")).unwrap();
+    let config = fs::read_to_string(&config_path).unwrap();
     assert!(config.contains("theme = \"minimal\""), "{config}");
     assert!(config.contains("enabled = [\"time\"]"), "{config}");
+    assert!(
+        config.contains("[async]\ngit = \"locked\"\nbudget_ms = 40\n"),
+        "{config}"
+    );
 }
 
 #[test]
@@ -2258,9 +2268,7 @@ while (( ! found_done )); do
     [[ "$protocol" == ZTHEME1 ]] || exit 85
     (( generation == request_generation )) || exit 86
     case "$kind" in
-        segment) ;;
-        error) ;;
-        complete) ;;
+        segment|clear|error|complete) ;;
         done) found_done=1 ;;
         *) exit 87 ;;
     esac
@@ -2478,10 +2486,13 @@ fn assert_runtime_cache_failure_falls_back(corrupt_hit: bool) {
                     Err(error) => panic!("cache peer accept failed: {error}"),
                 }
             };
+            // An accepted socket inherits the listener's O_NONBLOCK on macOS,
+            // which would fail the read below before the request arrives.
+            stream.set_nonblocking(false).unwrap();
             stream.set_read_timeout(Some(PROCESS_TIMEOUT)).unwrap();
             let mut request = [0; 37];
             stream.read_exact(&mut request).unwrap();
-            assert_eq!(&request[..5], &[b'Z', b'T', 0, 2, *operation]);
+            assert_eq!(&request[..5], &[b'Z', b'T', 0, 3, *operation]);
             if corrupt_hit && index == 0 {
                 stream.write_all(&[1, 0, 0, 0, 0]).unwrap();
             } else if *operation == 6 {
@@ -3368,7 +3379,7 @@ fn assert_runtime_stream_records(records: &[String]) {
 }
 
 #[test]
-fn shell_runtime_stream_buffers_locked_groups_and_redraws_unlocked_changes() {
+fn shell_callback_redraws_current_value_changes_and_keeps_values_on_errors() {
     let sandbox = Sandbox::new();
     sandbox.write_theme(
         "stream-runtimes",
@@ -3386,7 +3397,6 @@ record() {
     exec {fd}<&-
 }
 ZTHEME_GENERATION=7
-__ZTHEME_LOCK_RUNTIME=0
 record $'ZTHEME1\t7\tsegment\tnode\tNODE'
 [[ $renders == 1 && $ZTHEME_PROMPT == *NODE* ]] || exit 11
 record $'ZTHEME1\t7\tsegment\tnode\tNODE'
@@ -3396,40 +3406,225 @@ record $'ZTHEME1\t6\tsegment\tpython\tSTALE'
 record $'ZTHEME1\t6\tcomplete\truntime'
 record $'ZTHEME1\t6\tdone'
 [[ $renders == 1 && -z $ZTHEME_SEGMENT_PYTHON ]] || exit 13
+record $'ZTHEME1\t7\tdone'
+# A value of the current generation still redraws after its `done`.
 record $'ZTHEME1\t7\tsegment\tpython\tPYTHON'
 [[ $renders == 2 && $ZTHEME_PROMPT == *NODE* && $ZTHEME_PROMPT == *PYTHON* ]] || exit 14
-record $'ZTHEME1\t7\tcomplete\truntime'
-record $'ZTHEME1\t7\tdone'
-[[ $renders == 2 ]] || exit 15
-
-ZTHEME_GENERATION=8
-_ztheme_clear_async_segments
-__ZTHEME_LOCK_RUNTIME=1
-ZTHEME_LOCKED_PENDING=1
-renders=0
-record $'ZTHEME1\t8\tsegment\tnode\tLOCKED-NODE'
-record $'ZTHEME1\t7\tcomplete\truntime'
-record $'ZTHEME1\t7\tdone'
-[[ $renders == 0 && $ZTHEME_LOCKED_PENDING == 1 ]] || exit 16
-record $'ZTHEME1\t8\tsegment\tpython\tLOCKED-PYTHON'
-[[ $renders == 0 ]] || exit 17
-record $'ZTHEME1\t8\tcomplete\truntime'
-[[ $renders == 1 && $ZTHEME_LOCKED_PENDING == 0 && $ZTHEME_PROMPT == *LOCKED-NODE* && $ZTHEME_PROMPT == *LOCKED-PYTHON* ]] || exit 18
-record $'ZTHEME1\t8\tdone'
-[[ $renders == 1 ]] || exit 19
-
-# Deadline done releases a group even when its completion never arrived.
-ZTHEME_GENERATION=9
-_ztheme_clear_async_segments
-ZTHEME_LOCKED_PENDING=1
-renders=0
-record $'ZTHEME1\t9\tsegment\tnode\tPARTIAL'
-record $'ZTHEME1\t9\tdone'
-[[ $renders == 1 && $ZTHEME_LOCKED_PENDING == 0 && $ZTHEME_PROMPT == *PARTIAL* ]] || exit 20
-record $'ZTHEME1\t9\tdone'
-[[ $renders == 1 ]] || exit 21
+# An error keeps every value on screen and needs no redraw.
+record $'ZTHEME1\t7\terror\truntime\tbroken'
+record $'ZTHEME1\t7\terror\tnode\tbroken'
+[[ $renders == 2 && $ZTHEME_SEGMENT_NODE == NODE && $ZTHEME_SEGMENT_PYTHON == PYTHON ]] || exit 15
+[[ $ZTHEME_LAST_ERROR == broken ]] || exit 16
 "#;
     assert_success(&sandbox.zsh(script));
+}
+
+#[test]
+fn shell_shows_a_repeated_error_once_until_a_value_changes() {
+    let sandbox = Sandbox::new();
+    sandbox.write_theme(
+        "repeated-error",
+        "version = 1\n[layout]\nlines = [[\"python\", \"node\"]]\nright = []\nblank_line_before = false\n",
+    );
+    let script = r#"
+eval "$("$ZTHEME_TEST_BIN" init zsh --theme repeated-error)" || exit 10
+record() {
+    local fd
+    exec {fd}< <(print -r -- "$1")
+    _ztheme_async_callback "$fd" 2>/dev/null
+    exec {fd}<&-
+}
+ZTHEME_GENERATION=7
+record $'ZTHEME1\t7\terror\tnode\tbroken'
+[[ $ZTHEME_MESSAGE == 'ztheme: broken' ]] || exit 11
+# Every prompt re-sends unchanged and empty records around the same error.
+record $'ZTHEME1\t7\tsegment\tpython\t'
+record $'ZTHEME1\t7\terror\tnode\tbroken'
+[[ -z $ZTHEME_MESSAGE ]] || exit 12
+record $'ZTHEME1\t7\tsegment\tnode\tNODE'
+record $'ZTHEME1\t7\terror\tnode\tbroken'
+[[ $ZTHEME_MESSAGE == 'ztheme: broken' ]] || exit 13
+"#;
+    assert_success(&sandbox.zsh(script));
+}
+
+#[test]
+fn shell_applies_a_git_withdrawal_from_any_generation() {
+    let sandbox = Sandbox::new();
+    sandbox.install_fake_gitstatus();
+    write_git_theme(&sandbox, "withdrawal");
+    let script = r#"
+eval "$("$ZTHEME_TEST_BIN" init zsh --theme withdrawal)" || exit 10
+_ztheme_stop_client
+for lock in "$ZTHEME_RUNTIME_DIR"/*.lock(N); do
+    read -r pid < "$lock" && kill "$pid" 2>/dev/null
+done
+functions[_ztheme_test_render_layout]=$functions[_ztheme_render_layout]
+typeset -gi renders=0
+_ztheme_render_layout() { (( ++renders )); _ztheme_test_render_layout; }
+record() {
+    local fd
+    exec {fd}< <(print -r -- "$1")
+    _ztheme_async_callback "$fd" 2>/dev/null
+    exec {fd}<&-
+}
+ZTHEME_SEGMENT_GIT=OLD
+ZTHEME_GENERATION=8
+# A superseded generation's value is ignored, but its withdrawal is not:
+# the client already counts the shell's value as gone.
+record $'ZTHEME1\t7\tsegment\tgit\tNEW'
+[[ $ZTHEME_SEGMENT_GIT == OLD && $renders == 0 ]] || exit 11
+record $'ZTHEME1\t7\tclear\tgit'
+[[ -z $ZTHEME_SEGMENT_GIT && $renders == 1 ]] || exit 12
+"#;
+    assert_success(&sandbox.zsh(script));
+}
+
+/// Runs one prompt through the real precmd with `_ztheme_send_request`
+/// replaced by a fake client: the zsh function body `fake` writes records
+/// for generation `$1` to the response descriptor. An earlier prompt in the
+/// same context left the Git value `OLD`; `before` runs between the two
+/// prompts. `checks` runs after precmd with `$elapsed` (seconds) and
+/// `$renders`.
+fn shell_wait_script(
+    sandbox: &Sandbox,
+    mode: &str,
+    budget_ms: u32,
+    before: &str,
+    fake: &str,
+    checks: &str,
+) {
+    sandbox.install_fake_gitstatus();
+    sandbox.write_theme(
+        "wait-git",
+        "version = 1\n[layout]\nlines = [[\"git\"]]\nright = []\nblank_line_before = false\n",
+    );
+    let instance = format!("shell-wait-{}", SEQUENCE.fetch_add(1, Ordering::Relaxed));
+    let script = format!(
+        r#"
+eval "$("$ZTHEME_TEST_BIN" init zsh --dev {instance} --theme wait-git)" || exit 10
+_ztheme_stop_client
+__ZTHEME_MODE_GIT={mode}
+__ZTHEME_ASYNC_BUDGET_MS={budget_ms}
+functions[_ztheme_test_render_layout]=$functions[_ztheme_render_layout]
+typeset -gi renders=0
+_ztheme_render_layout() {{ (( ++renders )); _ztheme_test_render_layout; }}
+r() {{ print -r -- "ZTHEME1"$'\t'"$@"; }}
+fake() {{
+    local g=$1
+    {fake}
+}}
+# The earlier prompt records the context key without a client.
+_ztheme_send_request() {{ return 1; }}
+_ztheme_precmd
+ZTHEME_SEGMENT_GIT=OLD
+renders=0
+{before}
+_ztheme_send_request() {{
+    exec {{ZTHEME_RESP_FD}}< <(fake "$ZTHEME_GENERATION" 2>/dev/null)
+}}
+typeset -F started=$EPOCHREALTIME
+_ztheme_precmd
+typeset -F elapsed=$(( EPOCHREALTIME - started ))
+# The integration started a server daemon; stop it with the test.
+for lock in "$ZTHEME_RUNTIME_DIR"/*.lock(N); do
+    read -r pid < "$lock" && kill "$pid" 2>/dev/null
+done
+{checks}
+"#
+    );
+    assert_success(&sandbox.zsh(&script));
+}
+
+#[test]
+fn shell_auto_mode_draws_once_with_a_value_completed_within_the_budget() {
+    let sandbox = Sandbox::new();
+    shell_wait_script(
+        &sandbox,
+        "auto",
+        1000,
+        "",
+        r#"r "$g"$'\tsegment\tgit\tFRESH'; r "$g"$'\tcomplete\tgit'; /bin/sleep 1.5"#,
+        r"(( elapsed < 0.9 )) || exit 11
+[[ $renders == 1 && $ZTHEME_PROMPT == *FRESH* ]] || exit 12",
+    );
+}
+
+#[test]
+fn shell_auto_mode_draws_the_known_value_at_the_budget_then_redraws() {
+    let sandbox = Sandbox::new();
+    shell_wait_script(
+        &sandbox,
+        "auto",
+        300,
+        "",
+        r#"r "$g"$'\tsegment\tgit\tSTALE'; /bin/sleep 1.2; r "$g"$'\tsegment\tgit\tFRESH'; r "$g"$'\tcomplete\tgit'"#,
+        r#"(( elapsed >= 0.3 && elapsed < 1.0 )) || exit 11
+[[ $renders == 1 && $ZTHEME_PROMPT == *STALE* ]] || exit 12
+for attempt in 1 2 3; do
+    [[ $ZTHEME_SEGMENT_GIT == FRESH ]] && break
+    _ztheme_async_callback "$ZTHEME_RESP_FD" 2>/dev/null
+done
+[[ $renders == 2 && $ZTHEME_PROMPT == *FRESH* ]] || exit 13"#,
+    );
+}
+
+#[test]
+fn shell_locked_mode_waits_for_the_group_to_complete() {
+    let sandbox = Sandbox::new();
+    shell_wait_script(
+        &sandbox,
+        "locked",
+        0,
+        "",
+        r#"/bin/sleep 0.3; r "$g"$'\tsegment\tgit\tFRESH'; r "$g"$'\tcomplete\tgit'; /bin/sleep 1.5"#,
+        r"(( elapsed >= 0.3 && elapsed < 0.95 )) || exit 11
+[[ $renders == 1 && $ZTHEME_PROMPT == *FRESH* ]] || exit 12",
+    );
+}
+
+#[test]
+fn shell_async_mode_draws_the_known_value_without_waiting() {
+    let sandbox = Sandbox::new();
+    shell_wait_script(
+        &sandbox,
+        "async",
+        1000,
+        "",
+        r#"/bin/sleep 0.3; r "$g"$'\tsegment\tgit\tFRESH'; r "$g"$'\tcomplete\tgit'"#,
+        r"(( elapsed < 0.25 )) || exit 11
+[[ $renders == 1 && $ZTHEME_PROMPT == *OLD* ]] || exit 12",
+    );
+}
+
+#[test]
+fn shell_async_mode_withdraws_git_when_the_directory_changes() {
+    let sandbox = Sandbox::new();
+    // The prompt draws before any record can arrive, so only the shell can
+    // keep the previous directory's repository off it.
+    shell_wait_script(
+        &sandbox,
+        "async",
+        1000,
+        "cd /",
+        r#"/bin/sleep 0.3; r "$g"$'\tsegment\tgit\tFRESH'; r "$g"$'\tcomplete\tgit'"#,
+        r"(( elapsed < 0.25 )) || exit 11
+[[ $renders == 1 && $ZTHEME_PROMPT != *OLD* ]] || exit 12",
+    );
+}
+
+#[test]
+fn shell_wait_ends_when_the_client_closes_its_output() {
+    let sandbox = Sandbox::new();
+    shell_wait_script(
+        &sandbox,
+        "locked",
+        0,
+        "",
+        ":",
+        r"(( elapsed < 0.5 )) || exit 11
+[[ $renders == 1 && $ZTHEME_PROMPT == *OLD* && $ZTHEME_RESP_FD == -1 ]] || exit 12",
+    );
 }
 
 #[test]
@@ -3446,7 +3641,7 @@ typeset -gi starts=0 clears=0
 _ztheme_start_worker() { (( ++starts )); }
 _ztheme_compute_sync_segments() { :; }
 _ztheme_render_layout() { :; }
-_ztheme_clear_async_segments() { ZTHEME_SEGMENT_NODE=''; (( ++clears )); }
+_ztheme_clear_async_group() { [[ $1 == runtime ]] && ZTHEME_SEGMENT_NODE=''; (( ++clears )); }
 HOME=/home-one
 GIT_CEILING_DIRECTORIES=/ceiling-one
 _ztheme_precmd
@@ -3519,12 +3714,12 @@ fn failing_runtime_does_not_prevent_sibling_values_from_being_persisted() {
                 .any(|record| record.contains("\tsegment\tnode\t") && record.contains("24.5.0")),
             "{records:?}"
         );
-        assert!(python_fragment(&records).is_empty(), "{records:?}");
+        // The failed command sends no record: the shell keeps its value.
         assert!(
-            records
+            !records
                 .iter()
-                .any(|record| record.ends_with("\tsegment\tpython\t\n")),
-            "failed selection lacked its empty record: {records:?}"
+                .any(|record| record.contains("\tsegment\tpython\t")),
+            "failed selection sent a segment record: {records:?}"
         );
     }
     assert_eq!(fs::read_to_string(&node_counter).unwrap().trim(), "1");
@@ -3601,7 +3796,7 @@ fn independent_runtime_cache_acquires_are_in_flight_together() {
                     stream.set_read_timeout(Some(PROCESS_TIMEOUT)).unwrap();
                     let mut request = [0; 37];
                     stream.read_exact(&mut request).unwrap();
-                    assert_eq!(&request[..5], &[b'Z', b'T', 0, 2, 1]);
+                    assert_eq!(&request[..5], &[b'Z', b'T', 0, 3, 1]);
                     streams.push((stream, request));
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
@@ -3813,10 +4008,15 @@ fn transient_runtime_failures_are_not_persisted() {
     let (mut child, mut stdin, mut stdout) = spawn_client_daemon(&sandbox, &instance, &hex, &[]);
     let cwd = sandbox.home.to_str().unwrap().as_bytes().to_vec();
 
-    let failed = send_python_request(&mut stdin, &mut stdout, 1, &cwd, &[("PATH", &fake_path)]);
+    // A transient failure sends no python record at all, so the shell keeps
+    // the value it already shows instead of erasing it.
+    let failed =
+        send_and_read_until_done(&mut stdin, &mut stdout, 1, &cwd, &[("PATH", &fake_path)]);
     assert!(
-        failed.is_empty(),
-        "failed runtime produced a value: {failed}"
+        !failed
+            .iter()
+            .any(|record| record.contains("\tsegment\tpython\t")),
+        "failed runtime produced a segment record: {failed:?}"
     );
     let recovered = send_python_request(&mut stdin, &mut stdout, 2, &cwd, &[("PATH", &fake_path)]);
     assert!(recovered.contains("3.12.0"));
@@ -3900,12 +4100,15 @@ fn client_daemon_cancels_in_flight_work_without_emitting_stale_records() {
     let fake_path = sandbox.data.to_str().unwrap();
 
     // Request A: its git query is still in flight (the fake gitstatusd
-    // delays 150 ms) when B arrives and supersedes it, so A must contribute
-    // no records at all.
+    // delays 150 ms) when B arrives and supersedes it. A's only record is the
+    // immediate withdrawal of a Git value from an unknown repository; nothing
+    // of A may follow once B is sent.
     stdin
         .write_all(&client_request_with_env(1, &cwd, &[("PATH", fake_path)]))
         .unwrap();
-    thread::sleep(Duration::from_millis(50));
+    let mut line = String::new();
+    stdout.read_line(&mut line).unwrap();
+    assert_eq!(line, "ZTHEME1\t1\tclear\tgit\n");
     stdin
         .write_all(&client_request_with_env(
             2,
@@ -4113,7 +4316,7 @@ fn check_runtime_group_cancellation(supersede: bool) {
             empty_project.as_os_str().as_bytes(),
             &[],
         );
-        assert!(!records.is_empty());
+        assert_ne!(records.len(), 0);
         assert_runtime_group_removed(
             &pids,
             Duration::from_millis(200).saturating_sub(request_started.elapsed()),
@@ -4793,7 +4996,7 @@ fn daemon_without_gitstatusd_starts_and_serves_the_runtime_cache() {
     let mut key = [0_u8; 32];
     key[31] = 7;
     let value = b"runtime-value";
-    let acquire = protocol_exchange(&socket, &[b"ZT", &2_u16.to_be_bytes(), &[1], &key]);
+    let acquire = protocol_exchange(&socket, &[b"ZT", &3_u16.to_be_bytes(), &[1], &key]);
     assert_eq!(acquire.len(), 9);
     assert_eq!(acquire[0], 2);
     let token = u64::from_be_bytes(acquire[1..9].try_into().unwrap());
@@ -4803,7 +5006,7 @@ fn daemon_without_gitstatusd_starts_and_serves_the_runtime_cache() {
         &socket,
         &[
             b"ZT",
-            &2_u16.to_be_bytes(),
+            &3_u16.to_be_bytes(),
             &[2],
             &key,
             &token_bytes,
@@ -4813,7 +5016,7 @@ fn daemon_without_gitstatusd_starts_and_serves_the_runtime_cache() {
     );
     assert_eq!(put, [3]);
 
-    let get = protocol_exchange(&socket, &[b"ZT", &2_u16.to_be_bytes(), &[1], &key]);
+    let get = protocol_exchange(&socket, &[b"ZT", &3_u16.to_be_bytes(), &[1], &key]);
     assert_eq!(get[0], 1, "expected a cache hit");
     let length = u32::from_be_bytes(get[1..5].try_into().unwrap()) as usize;
     assert_eq!(&get[5..5 + length], value);
@@ -4835,7 +5038,7 @@ fn daemon_reclaims_idle_and_partial_connections_and_continues_serving() {
         if index == 0 {
             stream.write_all(b"Z").unwrap();
         } else if index == 1 {
-            stream.write_all(b"ZT\x00\x02\x01partial-key").unwrap();
+            stream.write_all(b"ZT\x00\x03\x01partial-key").unwrap();
         }
         peers.push(stream);
     }
@@ -4844,15 +5047,15 @@ fn daemon_reclaims_idle_and_partial_connections_and_continues_serving() {
     for mut peer in peers {
         let mut response = Vec::new();
         peer.read_to_end(&mut response).unwrap();
-        assert!(response.is_empty());
+        assert_eq!(response, []);
     }
     let key = [0_u8; 32];
-    assert_eq!(protocol_exchange(&socket, &[b"ZT\x00\x02\x06", &key]), [3]);
+    assert_eq!(protocol_exchange(&socket, &[b"ZT\x00\x03\x06", &key]), [3]);
     shutdown_server(server, &socket);
 }
 
 #[test]
-fn daemon_cancels_disconnected_git_queue_but_drains_the_in_flight_owner() {
+fn daemon_drops_disconnected_queued_git_but_completes_and_caches_the_started_query() {
     let sandbox = Sandbox::new();
     let fake = compile_c(
         &sandbox,
@@ -4885,18 +5088,7 @@ int main(void) {
     fs::copy(fake, managed).unwrap();
     let instance = format!("git-queue-{}", SEQUENCE.fetch_add(1, Ordering::Relaxed));
     let (server, socket) = spawn_server(&sandbox, &instance);
-    let send = |path: &[u8]| {
-        let mut stream = UnixStream::connect(&socket).unwrap();
-        stream
-            .set_read_timeout(Some(Duration::from_secs(2)))
-            .unwrap();
-        stream.write_all(b"ZT\x00\x02\x05\x00").unwrap();
-        stream
-            .write_all(&u32::try_from(path.len()).unwrap().to_be_bytes())
-            .unwrap();
-        stream.write_all(path).unwrap();
-        stream
-    };
+    let send = |path: &[u8]| git_request(&socket, path);
     let first = send(b"/first");
     let log = sandbox.home.join("git-requests");
     let deadline = Instant::now() + Duration::from_secs(2);
@@ -4913,7 +5105,7 @@ int main(void) {
     thread::sleep(Duration::from_millis(600));
     assert_eq!(fs::read_to_string(&log).unwrap(), "/first\n");
     let key = [0_u8; 32];
-    assert_eq!(protocol_exchange(&socket, &[b"ZT\x00\x02\x06", &key]), [3]);
+    assert_eq!(protocol_exchange(&socket, &[b"ZT\x00\x03\x06", &key]), [3]);
     drop(first);
     fs::write(sandbox.home.join("release-git"), b"ready").unwrap();
     let mut response = Vec::new();
@@ -4923,7 +5115,18 @@ int main(void) {
         [0],
         "live successor must receive its own Git reply"
     );
-    assert_eq!(fs::read_to_string(log).unwrap(), "/first\n/live\n");
+    assert_eq!(fs::read_to_string(&log).unwrap(), "/first\n/live\n");
+    // The abandoned first query still completed and cached its result: a new
+    // request for it gets that value as a stale frame before its fresh one.
+    let mut again = send(b"/first");
+    let mut response = Vec::new();
+    again.read_to_end(&mut response).unwrap();
+    assert_eq!(
+        response,
+        [3, 0, 0],
+        "expected stale then fresh non-repository frames"
+    );
+    assert_eq!(fs::read_to_string(log).unwrap(), "/first\n/live\n/first\n");
     assert_eq!(
         fs::read_to_string(sandbox.home.join("git-starts")).unwrap(),
         "start\n"
@@ -4961,7 +5164,7 @@ fn gitstatusd_starts_lazily_and_reset_does_not_start_it() {
 
     assert!(!marker.exists(), "gitstatusd started during daemon startup");
 
-    let reset = protocol_exchange(&socket, &[b"ZT", &2_u16.to_be_bytes(), &[4]]);
+    let reset = protocol_exchange(&socket, &[b"ZT", &3_u16.to_be_bytes(), &[4]]);
     assert_eq!(reset, [3]);
     assert!(!marker.exists(), "RESET started an unused gitstatusd");
 
@@ -4970,7 +5173,7 @@ fn gitstatusd_starts_lazily_and_reset_does_not_start_it() {
         &socket,
         &[
             b"ZT",
-            &2_u16.to_be_bytes(),
+            &3_u16.to_be_bytes(),
             &[5],
             &[0],
             &(u32::try_from(path.len()).unwrap()).to_be_bytes(),
@@ -4983,5 +5186,636 @@ fn gitstatusd_starts_lazily_and_reset_does_not_start_it() {
         "first Git request did not start gitstatusd"
     );
 
+    shutdown_server(server, &socket);
+}
+
+/// A gitstatusd stand-in for daemon Git-service tests. It appends its argv to
+/// `$HOME/git-argv` at startup and each requested path to `$HOME/git-requests`
+/// when a query starts. While `$HOME/git-hold` exists it holds the current
+/// query; `$HOME/git-delay-ms` adds a fixed per-query delay. Every answer is a
+/// repository on branch `main` whose ahead count is the query's 1-based
+/// sequence number in this process, so a response identifies its query.
+fn install_scripted_gitstatusd(sandbox: &Sandbox) {
+    let fake = compile_c(
+        sandbox,
+        "scripted-gitstatusd",
+        r#"#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+static void path_in_home(char *out, size_t size, const char *name) {
+    snprintf(out, size, "%s/%s", getenv("HOME"), name);
+}
+int main(int argc, char **argv) {
+    char argv_log[4096], log[4096], hold[4096], delay_file[4096], request[8192];
+    path_in_home(argv_log, sizeof argv_log, "git-argv");
+    path_in_home(log, sizeof log, "git-requests");
+    path_in_home(hold, sizeof hold, "git-hold");
+    path_in_home(delay_file, sizeof delay_file, "git-delay-ms");
+    FILE *file = fopen(argv_log, "a");
+    for (int index = 1; index < argc; index++) fprintf(file, "%s%s", index > 1 ? " " : "", argv[index]);
+    fputc('\n', file); fclose(file);
+    long delay = 0;
+    file = fopen(delay_file, "r");
+    if (file) { if (fscanf(file, "%ld", &delay) != 1) delay = 0; fclose(file); }
+    int byte; size_t length = 0; unsigned long sequence = 0;
+    while ((byte = getchar()) != EOF) {
+        if (byte != 30) { if (length + 1 < sizeof request) request[length++] = (char)byte; continue; }
+        request[length] = 0; length = 0;
+        char *path = strchr(request, 31); if (!path) return 1; *path++ = 0;
+        if (*path == ':') path++;
+        file = fopen(log, "a"); fprintf(file, "%s\n", path); fclose(file);
+        while (!access(hold, F_OK)) usleep(1000);
+        if (delay > 0) usleep((useconds_t)delay * 1000);
+        sequence++;
+        printf("%s\0371\037%s\037oid\037main\037\037\037\037\037\0370\0370\0370\0370\037%lu\0370\0370\0370\0370\0370\0370\036",
+               request, path, sequence);
+        fflush(stdout);
+    }
+    return 0;
+}
+"#,
+    );
+    let managed = sandbox.data.join("ztheme/gitstatus/v1.5/gitstatusd");
+    fs::create_dir_all(managed.parent().unwrap()).unwrap();
+    fs::copy(fake, managed).unwrap();
+}
+
+/// A repository directory that automatic Git discovery selects.
+fn git_repository(sandbox: &Sandbox) -> PathBuf {
+    let repository = sandbox.home.join("repo");
+    let git = repository.join(".git");
+    fs::create_dir_all(git.join("objects")).unwrap();
+    fs::create_dir_all(git.join("refs")).unwrap();
+    fs::write(git.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+    repository
+}
+
+#[test]
+fn concurrent_prompts_against_a_slow_repository_all_receive_git() {
+    let sandbox = Sandbox::new();
+    install_scripted_gitstatusd(&sandbox);
+    fs::write(sandbox.home.join("git-delay-ms"), "150").unwrap();
+    let repository = git_repository(&sandbox);
+    let instance = format!("git-pileup-{}", SEQUENCE.fetch_add(1, Ordering::Relaxed));
+    write_git_theme(&sandbox, "git-only");
+    let (server, socket) = spawn_server(&sandbox, &instance);
+    let hex = theme_hex(&sandbox, &instance, "git-only");
+    let mut clients: Vec<_> = (0..4)
+        .map(|_| spawn_client_daemon(&sandbox, &instance, &hex, &[]))
+        .collect();
+    let cwd = repository.as_os_str().as_bytes().to_vec();
+
+    // Four shells prompt at once, twice. Serializing one 150 ms query per
+    // request pushes later prompts past the client's Git deadline; requests
+    // arriving during an in-flight query must instead share one follow-up.
+    for round in 0..2_u64 {
+        let records: Vec<Vec<String>> = thread::scope(|scope| {
+            let handles: Vec<_> = clients
+                .iter_mut()
+                .enumerate()
+                .map(|(index, (_, stdin, stdout))| {
+                    let generation = round * 10 + index as u64 + 1;
+                    let cwd = &cwd;
+                    scope.spawn(move || {
+                        send_and_read_until_done(stdin, stdout, generation, cwd, &[])
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .collect()
+        });
+        for prompt in records {
+            assert!(
+                prompt
+                    .iter()
+                    .any(|record| record.contains("\tsegment\tgit\t") && record.contains("main")),
+                "round {round}: prompt lacks a Git segment: {prompt:?}"
+            );
+            assert!(
+                !prompt.iter().any(|record| record.contains("\terror\t")),
+                "round {round}: prompt reported an error: {prompt:?}"
+            );
+        }
+    }
+
+    for (mut child, stdin, _) in clients {
+        drop(stdin);
+        assert!(
+            wait_for_exit(&mut child, PROCESS_TIMEOUT)
+                .unwrap()
+                .success()
+        );
+    }
+    shutdown_server(server, &socket);
+}
+
+/// Sends one raw Git status request for a directory path; the caller reads
+/// its frames.
+fn git_request(socket: &Path, path: &[u8]) -> UnixStream {
+    let mut stream = UnixStream::connect(socket).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    stream.write_all(b"ZT\x00\x03\x05\x00").unwrap();
+    stream
+        .write_all(&u32::try_from(path.len()).unwrap().to_be_bytes())
+        .unwrap();
+    stream.write_all(path).unwrap();
+    stream
+}
+
+fn read_u32(stream: &mut UnixStream) -> u32 {
+    let mut bytes = [0; 4];
+    stream.read_exact(&mut bytes).unwrap();
+    u32::from_be_bytes(bytes)
+}
+
+fn read_u64(stream: &mut UnixStream) -> u64 {
+    let mut bytes = [0; 8];
+    stream.read_exact(&mut bytes).unwrap();
+    u64::from_be_bytes(bytes)
+}
+
+fn skip_field(stream: &mut UnixStream) {
+    let mut bytes = vec![0; usize::try_from(read_u32(stream)).unwrap()];
+    stream.read_exact(&mut bytes).unwrap();
+}
+
+/// Decodes the next Git frame as `stale:<ahead>`, `fresh:<ahead>`,
+/// `fresh:none`, or `fresh:error`; `None` at end of stream. The scripted
+/// gitstatusd numbers its queries through the ahead count.
+fn read_git_frame(stream: &mut UnixStream) -> Option<String> {
+    let mut tag = [0];
+    if stream.read(&mut tag).unwrap() == 0 {
+        return None;
+    }
+    let freshness = if tag[0] == 3 {
+        stream.read_exact(&mut tag).unwrap();
+        "stale"
+    } else {
+        "fresh"
+    };
+    let value = match tag[0] {
+        0 => "none".to_owned(),
+        1 => {
+            for _ in 0..4 {
+                skip_field(stream);
+            }
+            let ahead = read_u64(stream);
+            read_u64(stream);
+            read_u64(stream);
+            stream.read_exact(&mut tag).unwrap();
+            ahead.to_string()
+        }
+        2 => {
+            skip_field(stream);
+            "error".to_owned()
+        }
+        other => panic!("invalid Git frame tag {other}"),
+    };
+    Some(format!("{freshness}:{value}"))
+}
+
+fn wait_for_git_queries(sandbox: &Sandbox, count: usize) {
+    let log = sandbox.home.join("git-requests");
+    let deadline = Instant::now() + PROCESS_TIMEOUT;
+    while fs::read_to_string(&log).map_or(0, |log| log.lines().count()) < count {
+        assert!(Instant::now() < deadline, "Git query {count} never started");
+        thread::sleep(Duration::from_millis(5));
+    }
+}
+
+fn git_query_count(sandbox: &Sandbox) -> usize {
+    fs::read_to_string(sandbox.home.join("git-requests"))
+        .unwrap()
+        .lines()
+        .count()
+}
+
+#[test]
+fn git_requests_during_an_in_flight_query_share_one_fresh_follow_up() {
+    let sandbox = Sandbox::new();
+    install_scripted_gitstatusd(&sandbox);
+    let hold = sandbox.home.join("git-hold");
+    fs::write(&hold, "").unwrap();
+    let instance = format!("git-follow-up-{}", SEQUENCE.fetch_add(1, Ordering::Relaxed));
+    let (server, socket) = spawn_server(&sandbox, &instance);
+
+    let mut first = git_request(&socket, b"/repo");
+    wait_for_git_queries(&sandbox, 1);
+    // These arrive after the held query started, so its result predates them
+    // (a `git add` just before Enter would be missing from it).
+    let mut later: Vec<_> = (0..3).map(|_| git_request(&socket, b"/repo")).collect();
+    thread::sleep(Duration::from_millis(50));
+    fs::remove_file(&hold).unwrap();
+
+    assert_eq!(read_git_frame(&mut first).as_deref(), Some("fresh:1"));
+    assert_eq!(read_git_frame(&mut first), None);
+    for stream in &mut later {
+        assert_eq!(read_git_frame(stream).as_deref(), Some("fresh:2"));
+        assert_eq!(read_git_frame(stream), None);
+    }
+    assert_eq!(git_query_count(&sandbox), 2, "the follow-up must be shared");
+    shutdown_server(server, &socket);
+}
+
+#[test]
+fn cached_git_result_arrives_as_a_stale_frame_before_the_fresh_one() {
+    let sandbox = Sandbox::new();
+    install_scripted_gitstatusd(&sandbox);
+    let instance = format!("git-stale-{}", SEQUENCE.fetch_add(1, Ordering::Relaxed));
+    let (server, socket) = spawn_server(&sandbox, &instance);
+
+    let mut cold = git_request(&socket, b"/repo");
+    assert_eq!(read_git_frame(&mut cold).as_deref(), Some("fresh:1"));
+    assert_eq!(read_git_frame(&mut cold), None);
+
+    let hold = sandbox.home.join("git-hold");
+    fs::write(&hold, "").unwrap();
+    let mut warm = git_request(&socket, b"/repo");
+    // The stale frame is readable while the covering query is still held.
+    assert_eq!(read_git_frame(&mut warm).as_deref(), Some("stale:1"));
+    wait_for_git_queries(&sandbox, 2);
+    fs::remove_file(&hold).unwrap();
+    assert_eq!(read_git_frame(&mut warm).as_deref(), Some("fresh:2"));
+    assert_eq!(read_git_frame(&mut warm), None);
+    shutdown_server(server, &socket);
+}
+
+#[test]
+fn reset_during_a_git_query_answers_its_waiters_but_does_not_cache_the_result() {
+    let sandbox = Sandbox::new();
+    install_scripted_gitstatusd(&sandbox);
+    let instance = format!(
+        "git-reset-busy-{}",
+        SEQUENCE.fetch_add(1, Ordering::Relaxed)
+    );
+    let (server, socket) = spawn_server(&sandbox, &instance);
+    let mut cold = git_request(&socket, b"/repo");
+    assert_eq!(read_git_frame(&mut cold).as_deref(), Some("fresh:1"));
+
+    let hold = sandbox.home.join("git-hold");
+    fs::write(&hold, "").unwrap();
+    let mut busy = git_request(&socket, b"/repo");
+    assert_eq!(read_git_frame(&mut busy).as_deref(), Some("stale:1"));
+    wait_for_git_queries(&sandbox, 2);
+    // RESET answers while the query holds gitstatusd.
+    let reset = protocol_exchange(&socket, &[b"ZT", &3_u16.to_be_bytes(), &[4]]);
+    assert_eq!(reset, [3]);
+    fs::remove_file(&hold).unwrap();
+    assert_eq!(read_git_frame(&mut busy).as_deref(), Some("fresh:2"));
+
+    // No stale frame: the pre-reset result was not cached. The answer comes
+    // from a replacement gitstatusd, whose query count starts again.
+    let mut after = git_request(&socket, b"/repo");
+    assert_eq!(read_git_frame(&mut after).as_deref(), Some("fresh:1"));
+    assert_eq!(read_git_frame(&mut after), None);
+    shutdown_server(server, &socket);
+}
+
+#[test]
+fn git_cache_keeps_the_64_most_recently_requested_keys() {
+    let sandbox = Sandbox::new();
+    install_scripted_gitstatusd(&sandbox);
+    let instance = format!(
+        "git-cache-bound-{}",
+        SEQUENCE.fetch_add(1, Ordering::Relaxed)
+    );
+    let (server, socket) = spawn_server(&sandbox, &instance);
+    let request = |key: usize| {
+        let mut stream = git_request(&socket, format!("/key{key}").as_bytes());
+        let mut frames = Vec::new();
+        while let Some(frame) = read_git_frame(&mut stream) {
+            frames.push(frame);
+        }
+        frames
+    };
+    for key in 1..=65 {
+        assert_eq!(request(key), [format!("fresh:{key}")]);
+    }
+    // The 65th key evicted the least recently requested one only.
+    assert_eq!(request(65), ["stale:65", "fresh:66"]);
+    assert_eq!(request(2), ["stale:2", "fresh:67"]);
+    assert_eq!(request(1), ["fresh:68"]);
+    shutdown_server(server, &socket);
+}
+
+#[test]
+fn git_config_options_reach_gitstatusd_and_reset_rereads_them() {
+    let sandbox = Sandbox::new();
+    install_scripted_gitstatusd(&sandbox);
+    let instance = format!("git-options-{}", SEQUENCE.fetch_add(1, Ordering::Relaxed));
+    let (server, socket) = spawn_server(&sandbox, &instance);
+    let argv = sandbox.home.join("git-argv");
+
+    let mut request = git_request(&socket, b"/repo");
+    assert_eq!(read_git_frame(&mut request).as_deref(), Some("fresh:1"));
+    let default_threads = thread::available_parallelism()
+        .map_or(1, usize::from)
+        .min(6);
+    let started = fs::read_to_string(&argv).unwrap();
+    assert!(
+        started.contains(&format!(" -t {default_threads} ")) && started.contains(" -m -1 "),
+        "unexpected default arguments: {started}"
+    );
+    assert!(
+        started.contains("-s -1 -u -1"),
+        "exact counts are required: {started}"
+    );
+
+    let config = sandbox.config.join("ztheme/config.toml");
+    fs::create_dir_all(config.parent().unwrap()).unwrap();
+    fs::write(
+        &config,
+        "version = 1\ntheme = \"catppuccin-mocha\"\n\n[git]\nthreads = 3\ndirty_max_index_size = 1000\n",
+    )
+    .unwrap();
+    let reset = protocol_exchange(&socket, &[b"ZT", &3_u16.to_be_bytes(), &[4]]);
+    assert_eq!(reset, [3]);
+    // RESET returns once the replacement is spawned, not once it has run.
+    let deadline = Instant::now() + PROCESS_TIMEOUT;
+    let restarted = loop {
+        if let Some(line) = fs::read_to_string(&argv).unwrap().lines().nth(1) {
+            break line.to_owned();
+        }
+        assert!(
+            Instant::now() < deadline,
+            "RESET did not restart gitstatusd"
+        );
+        thread::sleep(Duration::from_millis(5));
+    };
+    assert!(
+        restarted.contains(" -t 3 ") && restarted.contains(" -m 1000 "),
+        "configured arguments missing: {restarted}"
+    );
+    shutdown_server(server, &socket);
+}
+
+/// Starts a daemon with the scripted gitstatusd, caches one result for
+/// `/repo` and then makes `[git]` invalid.
+fn daemon_with_cached_git_and_invalid_options(
+    sandbox: &Sandbox,
+    name: &str,
+) -> (ChildGuard, PathBuf, String) {
+    install_scripted_gitstatusd(sandbox);
+    let instance = format!("{name}-{}", SEQUENCE.fetch_add(1, Ordering::Relaxed));
+    let (server, socket) = spawn_server(sandbox, &instance);
+    let mut request = git_request(&socket, b"/repo");
+    assert_eq!(read_git_frame(&mut request).as_deref(), Some("fresh:1"));
+    let config = sandbox.config.join("ztheme/config.toml");
+    fs::create_dir_all(config.parent().unwrap()).unwrap();
+    fs::write(&config, "[git]\nthreads = 0\n").unwrap();
+    (server, socket, instance)
+}
+
+#[test]
+fn clear_with_an_invalid_git_table_reports_it_and_clears_nothing() {
+    let sandbox = Sandbox::new();
+    let (server, socket, instance) =
+        daemon_with_cached_git_and_invalid_options(&sandbox, "clear-invalid");
+
+    let output = sandbox
+        .command()
+        .args(["clear", "--dev", &instance])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("invalid [git]"), "{stderr}");
+    let mut request = git_request(&socket, b"/repo");
+    assert_eq!(read_git_frame(&mut request).as_deref(), Some("stale:1"));
+    shutdown_server(server, &socket);
+}
+
+#[test]
+fn daemon_reset_with_invalid_git_options_keeps_its_git_state() {
+    let sandbox = Sandbox::new();
+    let (server, socket, _) = daemon_with_cached_git_and_invalid_options(&sandbox, "reset-invalid");
+
+    let reset = protocol_exchange(&socket, &[b"ZT", &3_u16.to_be_bytes(), &[4]]);
+    assert!(reset.is_empty(), "RESET answered {reset:?}");
+    // The cache survives and the running gitstatusd keeps answering.
+    let mut request = git_request(&socket, b"/repo");
+    assert_eq!(read_git_frame(&mut request).as_deref(), Some("stale:1"));
+    assert_eq!(read_git_frame(&mut request).as_deref(), Some("fresh:2"));
+    shutdown_server(server, &socket);
+}
+
+/// Forwards a client's response lines through a channel so a test can wait
+/// for a record with a deadline instead of blocking forever on a missing one.
+struct RecordReader(std::sync::mpsc::Receiver<String>);
+
+impl RecordReader {
+    fn new(mut stdout: BufReader<std::process::ChildStdout>) -> Self {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        thread::spawn(move || {
+            loop {
+                let mut line = String::new();
+                if stdout.read_line(&mut line).unwrap_or(0) == 0 || sender.send(line).is_err() {
+                    return;
+                }
+            }
+        });
+        Self(receiver)
+    }
+
+    /// Returns the `generation`, `kind`, `segment` and `fragment` fields of
+    /// the next record, panicking when none arrives within `timeout`.
+    fn next(&self, timeout: Duration) -> Vec<String> {
+        let line = self
+            .0
+            .recv_timeout(timeout)
+            .expect("no client record arrived in time");
+        let fields: Vec<String> = line
+            .trim_end_matches('\n')
+            .split('\t')
+            .map(str::to_owned)
+            .collect();
+        assert_eq!(fields[0], "ZTHEME1", "{line}");
+        fields[1..].to_vec()
+    }
+
+    /// Reads records until `kind` (and `segment`, when given) arrives for
+    /// `generation`, asserting every record belongs to that generation.
+    fn until(&self, generation: u64, kind: &str, segment: Option<&str>) -> Vec<Vec<String>> {
+        let mut records = Vec::new();
+        loop {
+            let record = self.next(PROCESS_TIMEOUT);
+            assert_eq!(record[0], generation.to_string(), "{records:?} {record:?}");
+            let found = record[1] == kind && segment.is_none_or(|name| record[2] == name);
+            records.push(record);
+            if found {
+                return records;
+            }
+        }
+    }
+}
+
+fn git_segments(records: &[Vec<String>]) -> Vec<String> {
+    records
+        .iter()
+        .filter(|record| record[1] == "segment" && record[2] == "git")
+        .map(|record| record.get(3).cloned().unwrap_or_default())
+        .collect()
+}
+
+#[test]
+fn client_emits_a_late_fresh_git_result_after_done_until_superseded() {
+    let sandbox = Sandbox::new();
+    install_scripted_gitstatusd(&sandbox);
+    let repository = git_repository(&sandbox);
+    let hold = sandbox.home.join("git-hold");
+    let instance = format!("git-late-{}", SEQUENCE.fetch_add(1, Ordering::Relaxed));
+    write_git_theme(&sandbox, "git-only");
+    let (server, socket) = spawn_server(&sandbox, &instance);
+    let hex = theme_hex(&sandbox, &instance, "git-only");
+    let (mut child, mut stdin, stdout) = spawn_client_daemon(&sandbox, &instance, &hex, &[]);
+    let records = RecordReader::new(stdout);
+    let cwd = repository.as_os_str().as_bytes().to_vec();
+
+    stdin.write_all(&client_request(1, &cwd)).unwrap();
+    let cold = git_segments(&records.until(1, "done", None));
+    assert!(cold.last().unwrap().contains("⇡1"), "{cold:?}");
+
+    // The covering query is held past the request deadline: the cached value
+    // comes first, `done` follows without a Git completion, and the fresh
+    // value still arrives for the same prompt once the query finishes.
+    fs::write(&hold, "").unwrap();
+    stdin.write_all(&client_request(2, &cwd)).unwrap();
+    let before_done = records.until(2, "done", None);
+    assert!(
+        !before_done
+            .iter()
+            .any(|record| record[1] == "complete" && record[2] == "git"),
+        "{before_done:?}"
+    );
+    let stale = git_segments(&before_done);
+    assert!(
+        stale.len() == 1 && stale[0].contains("⇡1"),
+        "{before_done:?}"
+    );
+    fs::remove_file(&hold).unwrap();
+    let late = records.until(2, "complete", Some("git"));
+    assert!(git_segments(&late)[0].contains("⇡2"), "{late:?}");
+
+    // A newer request supersedes the held continuation: nothing more is
+    // written for generation 3 once generation 4 has started.
+    fs::write(&hold, "").unwrap();
+    stdin.write_all(&client_request(3, &cwd)).unwrap();
+    records.until(3, "done", None);
+    stdin.write_all(&client_request(4, &cwd)).unwrap();
+    let first = records.until(4, "segment", Some("git"));
+    fs::remove_file(&hold).unwrap();
+    let rest = records.until(4, "complete", Some("git"));
+    assert!(
+        git_segments(&first).len() == 1 && git_segments(&rest).len() == 1,
+        "{rest:?}"
+    );
+
+    drop(stdin);
+    assert!(
+        wait_for_exit(&mut child, PROCESS_TIMEOUT)
+            .unwrap()
+            .success()
+    );
+    shutdown_server(server, &socket);
+}
+
+#[test]
+fn client_clears_git_immediately_when_the_repository_changes() {
+    let sandbox = Sandbox::new();
+    install_scripted_gitstatusd(&sandbox);
+    let first_repository = git_repository(&sandbox);
+    let second_repository = sandbox.home.join("other");
+    fs::create_dir_all(second_repository.join(".git/objects")).unwrap();
+    fs::create_dir_all(second_repository.join(".git/refs")).unwrap();
+    fs::write(
+        second_repository.join(".git/HEAD"),
+        "ref: refs/heads/main\n",
+    )
+    .unwrap();
+    let hold = sandbox.home.join("git-hold");
+    let instance = format!(
+        "git-repo-change-{}",
+        SEQUENCE.fetch_add(1, Ordering::Relaxed)
+    );
+    write_git_theme(&sandbox, "git-only");
+    let (server, socket) = spawn_server(&sandbox, &instance);
+    let hex = theme_hex(&sandbox, &instance, "git-only");
+    let (mut child, mut stdin, stdout) = spawn_client_daemon(&sandbox, &instance, &hex, &[]);
+    let records = RecordReader::new(stdout);
+
+    stdin
+        .write_all(&client_request(1, first_repository.as_os_str().as_bytes()))
+        .unwrap();
+    records.until(1, "done", None);
+
+    // The new repository has no cached result and its query is held, so the
+    // old repository's branch must be withdrawn before the fresh value.
+    fs::write(&hold, "").unwrap();
+    stdin
+        .write_all(&client_request(2, second_repository.as_os_str().as_bytes()))
+        .unwrap();
+    let first = records.until(2, "clear", Some("git"));
+    assert!(git_segments(&first).is_empty(), "{first:?}");
+    fs::remove_file(&hold).unwrap();
+    let fresh = records.until(2, "complete", Some("git"));
+    assert!(git_segments(&fresh)[0].contains("main"), "{fresh:?}");
+
+    drop(stdin);
+    assert!(
+        wait_for_exit(&mut child, PROCESS_TIMEOUT)
+            .unwrap()
+            .success()
+    );
+    shutdown_server(server, &socket);
+}
+
+#[test]
+fn client_withdraws_a_git_value_it_did_not_send_when_discovery_fails() {
+    let sandbox = Sandbox::new();
+    install_scripted_gitstatusd(&sandbox);
+    let repository = git_repository(&sandbox);
+    let instance = format!("git-unknown-{}", SEQUENCE.fetch_add(1, Ordering::Relaxed));
+    write_git_theme(&sandbox, "git-only");
+    let (server, socket) = spawn_server(&sandbox, &instance);
+    let hex = theme_hex(&sandbox, &instance, "git-only");
+    let (mut child, mut stdin, stdout) = spawn_client_daemon(&sandbox, &instance, &hex, &[]);
+    let records = RecordReader::new(stdout);
+
+    // A new client cannot know what a shell that outlived its predecessor
+    // still shows, so a failing first request withdraws it.
+    let git_dir = repository.join(".git");
+    stdin
+        .write_all(&client_request_with_env(
+            1,
+            repository.as_os_str().as_bytes(),
+            &[
+                ("GIT_DIR", git_dir.to_str().unwrap()),
+                ("GIT_WORK_TREE", repository.to_str().unwrap()),
+            ],
+        ))
+        .unwrap();
+    let first = records.until(1, "done", None);
+    let kinds: Vec<_> = first
+        .iter()
+        .filter(|record| record[1] != "done")
+        .map(|record| format!("{} {}", record[1], record[2]))
+        .collect();
+    assert_eq!(
+        kinds,
+        ["clear git", "error git", "complete git"],
+        "{first:?}"
+    );
+
+    drop(stdin);
+    assert!(
+        wait_for_exit(&mut child, PROCESS_TIMEOUT)
+            .unwrap()
+            .success()
+    );
     shutdown_server(server, &socket);
 }

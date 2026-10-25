@@ -52,7 +52,6 @@ impl CompiledTheme {
         emit_sync_segments(&mut output, &self.layout);
 
         emit_segment_state(&mut output, &self.layout);
-        emit_clear_async(&mut output, &self.layout.asynchronous);
         emit_clear_async_group(&mut output, &self.layout.asynchronous);
         emit_assign_async(&mut output, &self.layout.asynchronous);
         emit_layout_renderer(&mut output, &self.layout, &theme.layout);
@@ -317,23 +316,10 @@ fn emit_segment_state(output: &mut String, layout: &ValidatedLayout) {
     }
 }
 
-fn emit_clear_async(output: &mut String, segments: &[SegmentId]) {
-    output.push_str("_ztheme_clear_async_segments() {\n    emulate -L zsh\n");
-    for segment in segments {
-        writeln!(
-            output,
-            "    {}=''",
-            segment_variable(&LayoutSegment::BuiltIn(*segment))
-        )
-        .expect("writing to a String cannot fail");
-    }
-    output.push_str("}\n");
-}
-
-/// Emits a group-scoped async clear dispatcher. The shell's error records carry
-/// a group name (`git` or `runtime`); clearing only that group keeps a
-/// successful unlocked group from being erased when another group reports an
-/// error.
+/// Emits a group-scoped async clear dispatcher (`git` or `runtime`). The shell
+/// clears a group only when the prompt context changes: always the runtime
+/// group, and Git in `async` mode; every other value stays until a newer one
+/// replaces it.
 fn emit_clear_async_group(output: &mut String, segments: &[SegmentId]) {
     output.push_str("_ztheme_clear_async_group() {\n    emulate -L zsh\n    case \"$1\" in\n");
     if segments.contains(&SegmentId::Git) {
@@ -382,7 +368,7 @@ fn emit_assign_async(output: &mut String, segments: &[SegmentId]) {
 
 fn emit_layout_renderer(output: &mut String, layout: &ValidatedLayout, source: &Layout) {
     output.push_str(
-        "_ztheme_render_layout(){\n    emulate -L zsh\n    (( ! ZTHEME_LOCKED_PENDING )) || return\n    local prompt='' right='' line='' separator=''\n",
+        "_ztheme_render_layout(){\n    emulate -L zsh\n    local prompt='' right='' line='' separator=''\n",
     );
     if source.blank_line_before {
         output.push_str("    prompt=$'\\n'\n");
