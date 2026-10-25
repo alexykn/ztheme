@@ -1,3 +1,4 @@
 /target
 .DS_Store
 ztheme-profiles/
+__pycache__/
