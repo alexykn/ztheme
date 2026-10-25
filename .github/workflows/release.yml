@@ -5,12 +5,22 @@ on:
     tags:
       - "v*"
   workflow_dispatch:
+  # The patch-release workflow calls this after pushing a tag: a tag pushed
+  # with the workflow token does not start other workflows by itself.
+  workflow_call:
+    inputs:
+      tag:
+        description: Release tag to verify, build and publish (vX.Y.Z)
+        required: true
+        type: string
 
 permissions:
   contents: read
 
 env:
   CARGO_TERM_COLOR: always
+  # Set for tag pushes and workflow calls; empty for a manual rehearsal.
+  RELEASE_TAG: ${{ inputs.tag || (github.ref_type == 'tag' && github.ref_name) || '' }}
 
 jobs:
   verify:
@@ -18,6 +28,8 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.tag || github.ref }}
       - name: Install Zsh
         run: |
           sudo apt-get update
@@ -31,9 +43,9 @@ jobs:
       - run: cargo package --locked
       - run: zsh -n shell/ztheme.zsh shell/defaults.zsh
       - name: Verify tag version
-        if: github.event_name == 'push'
+        if: env.RELEASE_TAG != ''
         run: |
-          tag_version="${GITHUB_REF_NAME#v}"
+          tag_version="${RELEASE_TAG#v}"
           package_version=$(awk -F '"' '/^version = / { print $2; exit }' Cargo.toml)
           test "$tag_version" = "$package_version"
 
@@ -59,6 +71,8 @@ jobs:
             asset: ztheme-aarch64-apple-darwin
     steps:
       - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.tag || github.ref }}
       - uses: dtolnay/rust-toolchain@1.99.1
         with:
           targets: ${{ matrix.target }}
@@ -77,7 +91,7 @@ jobs:
 
   rehearse-release-assets:
     name: Rehearse release assets
-    if: github.event_name == 'workflow_dispatch'
+    if: inputs.tag == '' && github.event_name == 'workflow_dispatch'
     needs: build
     runs-on: ubuntu-24.04
     steps:
@@ -93,13 +107,15 @@ jobs:
 
   publish:
     name: Publish release
-    if: github.event_name == 'push'
+    if: inputs.tag != '' || github.event_name == 'push'
     needs: build
     runs-on: ubuntu-24.04
     permissions:
       contents: write
     steps:
       - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.tag || github.ref }}
       - uses: dtolnay/rust-toolchain@1.99.1
       - name: Publish to crates.io
         env:
@@ -115,4 +131,4 @@ jobs:
       - name: Create GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "$GITHUB_REF_NAME" --verify-tag --generate-notes release/*
+        run: gh release create "$RELEASE_TAG" --verify-tag --generate-notes release/*
