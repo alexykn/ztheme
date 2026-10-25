@@ -140,6 +140,7 @@ mod tests {
                 enabled: enabled.iter().map(|value| (*value).to_owned()).collect(),
             },
             async_section: AsyncSection::default(),
+            git: crate::gitstatus::Options::default(),
         }
     }
 
@@ -224,7 +225,7 @@ mod tests {
         // nothing.
         assert!(resolve_custom_segments(&config(&["time"]), &["time".to_owned()], &root).is_err());
         let resolved = resolve_custom_segments(&config(&[]), &[], &root).unwrap();
-        assert!(resolved.is_empty());
+        assert_eq!(resolved.len(), 0);
     }
 
     #[test]

@@ -67,11 +67,11 @@ impl AsyncTheme {
             return Err(invalid("compiled async theme has an invalid length"));
         }
         let mut bytes = Vec::with_capacity(value.len() / 2);
-        for pair in value.as_bytes().chunks_exact(2) {
-            let high = hex_digit(pair[0])
+        for &[high, low] in value.as_bytes().as_chunks::<2>().0 {
+            let high = hex_digit(high)
                 .ok_or_else(|| invalid("compiled async theme is not hexadecimal"))?;
-            let low = hex_digit(pair[1])
-                .ok_or_else(|| invalid("compiled async theme is not hexadecimal"))?;
+            let low =
+                hex_digit(low).ok_or_else(|| invalid("compiled async theme is not hexadecimal"))?;
             bytes.push((high << 4) | low);
         }
 
@@ -578,7 +578,7 @@ mod tests {
             environment: None,
         };
         let rendered = theme.render_runtime(&runtime).unwrap();
-        assert!(!rendered.is_empty());
+        assert_ne!(rendered, "");
         assert!(rendered.contains("Python"));
         assert!(!rendered.contains('.'));
     }

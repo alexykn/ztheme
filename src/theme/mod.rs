@@ -6,13 +6,13 @@ mod validate;
 mod zsh;
 
 use std::collections::HashSet;
-use std::env;
 use std::fmt::Write as _;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
 use crate::runtime::Runtime;
+use crate::setup::install::config_root;
 
 pub use async_theme::AsyncTheme;
 pub(crate) use manage::{apply, edit, list, persist};
@@ -301,6 +301,7 @@ fn default_config() -> Config {
         theme: DEFAULT_THEME_SELECTOR.to_owned(),
         custom_segments: CustomSegmentsConfig::default(),
         async_section: AsyncSection::default(),
+        git: crate::gitstatus::Options::default(),
     }
 }
 
@@ -311,19 +312,6 @@ pub(crate) fn async_lock() -> io::Result<AsyncLock> {
     Ok(load_config()?
         .map(|config| config.async_section.lock)
         .unwrap_or_default())
-}
-
-fn config_root() -> Option<PathBuf> {
-    if let Some(root) = env::var_os("XDG_CONFIG_HOME") {
-        let root = PathBuf::from(root);
-        if root.is_absolute() {
-            return Some(root);
-        }
-    }
-    env::var_os("HOME")
-        .map(PathBuf::from)
-        .filter(|home| home.is_absolute())
-        .map(|home| home.join(".config"))
 }
 
 fn theme_path(selector: &str) -> io::Result<PathBuf> {
@@ -788,6 +776,21 @@ mod tests {
     }
 
     #[test]
+    fn config_validates_and_preserves_the_git_table() {
+        use crate::theme::schema::Config;
+
+        let source = "version = 1\ntheme = \"x\"\n\n[git]\nthreads = 3\n";
+        let config: Config = toml::from_str(source).unwrap();
+        let persisted = toml::to_string(&config).unwrap();
+        assert!(persisted.contains("[git]\nthreads = 3"), "{persisted}");
+        assert!(
+            toml::from_str::<Config>("version = 1\ntheme = \"x\"\n[git]\ntread = 3\n").is_err()
+        );
+        let plain: Config = toml::from_str("version = 1\ntheme = \"x\"\n").unwrap();
+        assert!(!toml::to_string(&plain).unwrap().contains("[git]"));
+    }
+
+    #[test]
     fn overlays_replace_only_explicit_values() {
         let theme = merged_theme(
             r##"
@@ -879,7 +882,7 @@ style = { foreground = "muted" }
         let layout = validate(&merged_theme(overlay).unwrap()).unwrap();
         assert_eq!(layout.lines[0][1].name(), "time");
         assert_eq!(layout.right[0].name(), "cpu");
-        assert!(layout.asynchronous.is_empty());
+        assert_eq!(layout.asynchronous.len(), 0);
     }
 
     #[test]

@@ -194,6 +194,24 @@ the locked groups are done. Lock both groups for one complete redraw. If
 you unlock a group, be aware the prompt's width can change when that segment
 later appears.
 
+### Git status in large repositories
+
+All shells share one background `gitstatusd`. Prompts that ask about the same
+repository while a status query runs share one follow-up query, so several
+shells, or Enter pressed repeatedly, do not queue a query each. Two
+`gitstatusd` settings can be tuned in `config.toml`; they apply when the
+background daemon next starts `gitstatusd` (`ztheme reset` restarts it):
+
+```toml
+[git]
+threads = 6                 # scan threads (default: available cores, at most 6)
+dirty_max_index_size = -1   # skip the unstaged/untracked scan above this many
+                            # index entries (default: -1, no limit)
+```
+
+A limited `dirty_max_index_size` makes huge repositories fast at the cost of
+not showing unstaged and untracked changes there.
+
 ## Syntax highlighting
 
 Syntax highlighting is part of the theme, not a separate color configuration.

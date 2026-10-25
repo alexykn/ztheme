@@ -42,9 +42,10 @@ long-lived capabilities:
 
 - a persistent runtime-value cache, so runtime version commands are not
   executed for every prompt;
-- a `gitstatusd` client started lazily on the first Git request, so Git status
-  queries reuse one optimized repository-status process instead of starting
-  Git tooling for every prompt.
+- a Git service owning a `gitstatusd` client started lazily on the first Git
+  request, so Git status queries reuse one optimized repository-status
+  process instead of starting Git tooling for every prompt, and concurrent
+  prompts for one repository share queries instead of queueing one each.
 
 The server daemon is not responsible for rendering. It returns structured Git
 data and opaque encoded per-runtime values; the client daemon renders those
@@ -74,9 +75,10 @@ Zsh precmd/chpwd
 ├── send a request to the per-shell client daemon
 │   └── ztheme __client-daemon (one per shell, reused across prompts)
 │       ├── start Git task first
-│       │   └── daemon::git_status
-│       │       └── persistent gitstatus::Client
-│       │           └── gitstatusd
+│       │   └── daemon::git_status (cached frame first, then fresh)
+│       │       └── server Git service (shared, coalescing queries)
+│       │           └── persistent gitstatus::Client
+│       │               └── gitstatusd
 │       └── start runtime task immediately after Git begins
 │           ├── bounded fresh detection, PATH, and selector planning
 │           └── one independent task per selected runtime
@@ -154,6 +156,7 @@ src/
 ├── filesystem.rs
 ├── daemon/
 │   ├── mod.rs
+│   ├── git.rs
 │   └── protocol.rs
 ├── cache/
 │   ├── mod.rs
@@ -184,7 +187,8 @@ The larger `mod.rs` files intentionally keep each subsystem's primary
 execution path local. New files are reserved for independent algorithms or
 compatibility boundaries such as wire and disk formats. `theme/segments.rs`
 holds the custom-segment id grammar, allowlist validation, and file/header
-resolution used only at init and reload time.
+resolution used only at init and reload time. `daemon/git.rs` holds the Git
+service's query scheduling, coalescing, and result cache.
 
 ## Subsystem ownership
 
@@ -214,7 +218,8 @@ help:
 - client operations and server request routing;
 - daemon idle shutdown;
 - the hosted `RuntimeCache`;
-- the hosted `gitstatus::Client`.
+- the hosted Git service (`daemon/git.rs`), the single owner of the
+  `gitstatus::Client`.
 
 The crate-private daemon client operations are deliberately explicit:
 
@@ -275,11 +280,14 @@ connections are closed. Completed tasks are reaped instead of accumulating
 until shutdown. A complete request frame must arrive within 500 ms, and each
 response write has its own 500 ms deadline. Boundary validation finishes before
 any cache or Git operation starts. Runtime-cache requests proceed concurrently;
-Git queries are serialized by the mutex around the single stateful
-`gitstatusd` client. A fully disconnected peer cancels a queued Git request
-before it acquires that owner; a write-half-closed peer may still receive its
-response. Once started, a Git query is drained despite peer disconnect so the
-shared subprocess protocol remains synchronized.
+Git requests go to the Git service, whose single owner task runs queries one
+at a time on the stateful `gitstatusd` pipe and shares them between requests
+(see [Git status](#git-status)). A fully disconnected peer withdraws only its
+own waiter, and a queued query whose waiters have all disconnected is dropped
+before it starts; a write-half-closed peer may still receive its response.
+Once started, a Git query always completes despite peer disconnect, so the
+shared subprocess protocol remains synchronized and its result still
+refreshes the cache.
 
 The daemon stops when:
 
@@ -312,8 +320,9 @@ old background process while preventing an older still-running shell client
 from downgrading the daemon.
 
 `reset` is deliberately different. When the daemon exists it sends `RESET`,
-which clears runtime cache state and restarts `gitstatusd` only when one is
-already running. When no daemon is available it deletes persistent
+which clears runtime cache state and the cached Git results and restarts
+`gitstatusd` (rereading `[git]`) only when one is already running; a query
+in flight finishes for its waiters first, and its result is not cached. When no daemon is available it deletes persistent
 runtime-cache files directly and does not start a process merely to clear
 state.
 
@@ -381,9 +390,9 @@ and Git ceiling directories.
 
 ### Git status
 
-`gitstatus` owns installation and the `gitstatusd` process implementation.
-The daemon owns one client instance, but the process protocol and query model
-remain inside `gitstatus`.
+`gitstatus` owns installation, the `gitstatusd` process implementation, and
+the `[git]` options. The daemon's Git service owns one client instance, but
+the process protocol and query model remain inside `gitstatus`.
 
 ztheme uses
 [`gitstatusd`](https://github.com/romkatv/gitstatus) because prompt Git status
@@ -402,7 +411,22 @@ without it.
 On the first Git request, the daemon lazily starts `gitstatus::Client`, which
 launches the managed binary with piped stdin and stdout, protocol
 compatibility restricted to `v1.5.*`, and its parent PID. The child is killed
-when its owning Rust process is dropped.
+when its owning Rust process is dropped. Exact staged and unstaged counts
+(`-s -1 -u -1`) are always requested, because separating deletions from other
+changes needs them. Two flags come from the `[git]` table of `config.toml`,
+read each time `gitstatusd` starts or is restarted by `RESET`:
+
+- `threads` (`-t`): working-tree scan threads; by default the number of
+  available cores capped at 6, where a 100k-file repository stopped getting
+  faster while CPU per query kept rising (see [Benchmarks](benchmarks.md));
+- `dirty_max_index_size` (`-m`): above this many index entries `gitstatusd`
+  skips the unstaged and untracked scan; unset or negative means no limit.
+
+The daemon parses only that table (`gitstatus::Options`), so it does not depend
+on the theme; the theme's config schema embeds the same type so `init` and
+`reload` report an invalid table and `theme apply` preserves it. An invalid
+table makes Git requests fail with an explicit error rather than silently
+using defaults.
 Repository-related environment variables are removed from the child; each
 request carries the intended directory or explicit `GIT_DIR`, rather than
 letting the daemon's own launch environment accidentally select a repository.
@@ -436,6 +460,33 @@ much shorter: it can stop waiting and keep the prompt responsive without
 discarding the daemon or its Git process merely because one prompt no longer
 needs the result.
 
+#### Git service
+
+One `gitstatusd` answers one query at a time, and a query in a large dirty
+repository costs about 200 ms. Serializing one query per request would make
+every concurrent or rapidly repeated prompt for that repository queue behind
+the others until it misses its deadline. The Git service in `daemon/git.rs`
+instead keys its state by `gitstatus::Query` (kind and path):
+
+- the last successful result (errors are never cached);
+- the in-flight query, if any, with its start time;
+- one pending follow-up query and its waiters.
+
+A request arriving at time `t` is satisfied only by a query that *started* at
+or after `t`, so a change made just before pressing Enter (`git add`, a branch
+switch) is never hidden by an older in-flight query. A request for a key whose
+query is in flight and started earlier joins that key's single follow-up;
+every request arriving during the same in-flight query shares it. An idle key
+starts at once, and follow-ups for different keys start in arrival order. A
+request therefore waits at most for the remainder of the current query plus
+its own, however many shells ask. Each request also immediately receives the
+key's cached result, if any, as a stale frame before the fresh one.
+
+A requester that disconnects drops only its waiter; a started query always
+completes and refreshes the cache, while a follow-up whose waiters have all
+gone is dropped before it starts. At most 64 keys are retained, evicting the
+least recently requested key that has no work in flight or queued.
+
 ### Prompt
 
 `prompt/mod.rs` is the application-level coordinator. Its `snapshot` function
@@ -446,6 +497,9 @@ is the per-request engine used by the client daemon:
 - applies one shared 550 ms deadline;
 - writes each completed runtime or Git segment immediately; runtime values
   are independent events, not a single aggregate snapshot;
+- writes the daemon's cached Git result, when one arrives first, as an early
+  `git` segment record, then waits for the fresh result within the Git
+  exchange's 500 ms deadline and writes it with the group's `complete`;
 - writes a group's `complete` marker once all its tasks finish so the shell
   can release that rendering lock;
 - cancels unfinished work;
@@ -506,7 +560,8 @@ and Zsh generation. Runtime segment configuration remains a flattened map
 keyed by canonical runtime name.
 
 `setup` owns installation of managed shell integrations. Installation logic
-does not live in CLI dispatch.
+does not live in CLI dispatch. `setup::install` also resolves the XDG config
+and data roots shared by the theme configuration and `gitstatus`.
 
 `utils.rs` contains only the deterministic `HashBuilder` used for daemon
 instance naming. Runtime cache keys use their own SHA-256 field builder.
@@ -539,8 +594,13 @@ runtime
 ├── environment
 └── filesystem
 
+gitstatus
+└── setup (XDG roots)
+
 theme
-└── runtime
+├── gitstatus (snapshots, [git] options)
+├── runtime
+└── setup (XDG roots)
 ```
 
 In particular:
@@ -560,7 +620,8 @@ ztheme has three unrelated protocols.
 
 `daemon/protocol.rs` defines the versioned binary protocol used between
 ztheme processes and the server daemon. Each operation opens one Unix
-stream connection, writes one request, reads one response, and drops the
+stream connection, writes one request, reads its response, and drops the
+connection; only Git status responds with up to two frames on that
 connection. There is no multiplexing or connection pool: state is held by the
 daemon services, while per-request connections keep client cancellation and
 failure isolation straightforward.
@@ -574,7 +635,7 @@ u8         operation
 ...        operation-specific payload
 ```
 
-Protocol version 2 defines these operation bytes:
+Protocol version 3 defines these operation bytes:
 
 | Byte | Operation | Request payload | Response |
 | ---: | --- | --- | --- |
@@ -582,8 +643,21 @@ Protocol version 2 defines these operation bytes:
 | `2` | runtime cache put owned | 32-byte key, token, value | OK or rejected |
 | `3` | runtime cache release | 32-byte key plus token | OK or rejected |
 | `4` | reset | none | OK |
-| `5` | Git status | query kind plus length-prefixed path bytes | none, snapshot, or error |
+| `5` | Git status | query kind plus length-prefixed path bytes | optional stale frame, then fresh frame |
 | `6` | runtime cache remove | 32-byte key | OK |
+
+A Git status response is one or two frames, after which the daemon closes the
+connection:
+
+```text
+stale frame   u8 3, then u8 0 (not a repository) or u8 1 plus snapshot
+fresh frame   u8 0 (not a repository), u8 1 plus snapshot, or u8 2 plus error text
+```
+
+The stale frame is written immediately when the daemon has a cached result
+for the query; the fresh frame follows once a query that started after the
+request arrived completes. Version 3 replaced version 2's single Git result,
+which is the fresh frame alone.
 
 Integers use Tokio's big-endian wire methods. Variable data is prefixed with a
 `u32` length and validated before allocation or use. Runtime values are limited
@@ -593,8 +667,13 @@ without lossy conversion. Human-readable Git fields must be UTF-8.
 
 The normal mutation/reset exchange deadline is 25 ms. Cache acquire uses
 500 ms because it may wait for the daemon-side 400 ms singleflight lease. Git
-uses 500 ms because it may require repository work, while still fitting
-beneath the request's 550 ms overall deadline in the usual case.
+status takes its deadlines from the caller: `daemon::git_status` bounds the
+first frame and returns either the fresh result or the stale value with a
+`PendingGit` whose `fresh(deadline)` awaits the rest. The prompt uses one
+500 ms deadline from the start of the exchange for both, which may require
+repository work while still fitting beneath the request's 550 ms overall
+deadline in the usual case. On the daemon side each frame write has its own
+500 ms deadline.
 
 Compatibility is negotiated before reading an operation:
 
@@ -630,7 +709,10 @@ bounded before output.
 A `complete` record is written immediately after a group's segment records
 (`git` or `runtime`) by the client. It lets the shell release that group's
 rendering barrier as soon as the group is done, rather than holding the prompt
-blank until every asynchronous group finishes.
+blank until every asynchronous group finishes. The Git group may carry two
+`git` segment records in one generation: the daemon's cached value first,
+then the fresh value immediately before `complete`; the later record replaces
+the earlier one, and a Git error clears the group as before.
 
 By default the Git group is *locked* and the runtime group is *unlocked*: the
 shell stores Git segment and error records without redrawing until Git's

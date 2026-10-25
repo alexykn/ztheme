@@ -24,6 +24,9 @@ use crate::{daemon, gitstatus, setup, theme};
 pub(crate) use protocol::prompt_text;
 
 const REQUEST_TIMEOUT: Duration = Duration::from_millis(550);
+/// Bounds one Git exchange from its start, leaving room beneath the request
+/// deadline to report a timeout as a Git error record.
+const GIT_TIMEOUT: Duration = Duration::from_millis(500);
 const ZSH_DEFAULTS: &str = include_str!("../../shell/defaults.zsh");
 const ZSH_INTEGRATION: &str = include_str!("../../shell/ztheme.zsh");
 const ZSH_DIRECTORY_SEGMENT: &str = include_str!("../../shell/segments/directory.zsh");
@@ -44,8 +47,9 @@ async fn snapshot(
     let deadline = Instant::now() + REQUEST_TIMEOUT;
     let mut tasks = JoinSet::new();
     // The coordinator owns the only receiver. At most one completion per
-    // selected runtime plus group markers can be buffered for this generation.
-    let (events, mut completions) = mpsc::channel(Runtime::ALL.len() + 3);
+    // selected runtime, a stale and a fresh Git result, and group markers can
+    // be buffered for this generation.
+    let (events, mut completions) = mpsc::channel(Runtime::ALL.len() + 4);
 
     let git_started = if git_enabled {
         let (started_tx, started_rx) = oneshot::channel();
@@ -57,7 +61,7 @@ async fn snapshot(
         tasks.spawn(async move {
             let _ = started_tx.send(());
             let result = match git_executor.git_query(git_cwd, git_environment).await {
-                Ok(Some(query)) => daemon::git_status(&git_instance, &query).await,
+                Ok(Some(query)) => git_status(&git_instance, &query, &git_events).await,
                 Ok(None) => Ok(None),
                 Err(error) => Err(error),
             };
@@ -120,6 +124,24 @@ async fn snapshot(
     protocol::write_done(&mut io::stdout().lock(), generation)
 }
 
+/// Requests Git status and returns the fresh result. A cached result the
+/// daemon sends first is forwarded as a `GitStale` event; the fresh one is
+/// still awaited within the same Git deadline.
+async fn git_status(
+    instance: &daemon::Instance,
+    query: &gitstatus::Query,
+    events: &mpsc::Sender<SnapshotResult>,
+) -> io::Result<Option<gitstatus::Snapshot>> {
+    let deadline = Instant::now() + GIT_TIMEOUT;
+    match daemon::git_status(instance, query, deadline).await? {
+        daemon::GitStatus::Fresh(snapshot) => Ok(snapshot),
+        daemon::GitStatus::Stale { cached, pending } => {
+            let _ = events.send(SnapshotResult::GitStale(cached)).await;
+            pending.fresh(deadline).await
+        }
+    }
+}
+
 /// Renders one typed completion immediately. Runtime group completion is a
 /// separate event, sent only after every independent runtime owner has finished.
 fn write_result(
@@ -130,6 +152,14 @@ fn write_result(
 ) -> io::Result<()> {
     let mut output = io::stdout().lock();
     match result {
+        // A cached value renders like any Git segment but leaves the group
+        // open: the fresh result follows with the group's `complete`.
+        SnapshotResult::GitStale(snapshot) => protocol::write_segment(
+            &mut output,
+            generation,
+            "git",
+            &theme.render_git(snapshot.as_ref()),
+        ),
         SnapshotResult::Git(Ok(snapshot)) => {
             protocol::write_segment(
                 &mut output,
@@ -304,6 +334,7 @@ pub fn theme_zsh(instance: &daemon::Instance, selector: &str, persist: bool) -> 
 }
 
 enum SnapshotResult {
+    GitStale(Option<gitstatus::Snapshot>),
     Git(io::Result<Option<gitstatus::Snapshot>>),
     Runtime {
         runtime: Runtime,

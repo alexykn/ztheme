@@ -19,6 +19,12 @@ pub(super) struct Config {
     #[serde(rename = "async")]
     #[serde(skip_serializing_if = "AsyncSection::is_default")]
     pub(super) async_section: AsyncSection,
+
+    /// `[git]` gitstatusd tuning. Validated here at init and reload so a typo
+    /// is reported, and preserved by `theme apply`; the daemon reads it.
+    #[serde(default)]
+    #[serde(skip_serializing_if = "crate::gitstatus::Options::is_default")]
+    pub(super) git: crate::gitstatus::Options,
 }
 
 #[derive(Clone, Default, Deserialize, Serialize)]

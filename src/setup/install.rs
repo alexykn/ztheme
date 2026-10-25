@@ -119,6 +119,21 @@ impl Drop for TemporaryDirectory {
     }
 }
 
+/// The XDG config root holding `ztheme/config.toml`, shared by the theme
+/// configuration and the daemon's `[git]` options.
+pub fn config_root() -> Option<PathBuf> {
+    if let Some(root) = env::var_os("XDG_CONFIG_HOME") {
+        let root = PathBuf::from(root);
+        if root.is_absolute() {
+            return Some(root);
+        }
+    }
+    env::var_os("HOME")
+        .map(PathBuf::from)
+        .filter(|home| home.is_absolute())
+        .map(|home| home.join(".config"))
+}
+
 pub fn data_root() -> PathBuf {
     if let Some(root) = env::var_os("XDG_DATA_HOME") {
         let root = PathBuf::from(root);
